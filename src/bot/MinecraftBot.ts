@@ -20,6 +20,17 @@ export type ScreenPlacementHit = {
   distance: number;
 };
 
+export type PlacementSummary = {
+  target: Vec3Like;
+  reference: Vec3Like;
+  face: Vec3Like;
+  item: string;
+  before?: string;
+  after?: string;
+  attempts: number;
+  verified: boolean;
+};
+
 export type BuildSummary = {
   blueprint: string;
   attempted: number;
@@ -94,6 +105,121 @@ export type RecipeCatalogSummary = {
   recipes: RecipeSummary[];
 };
 
+export type CombatEntitySummary = {
+  id: number;
+  name: string;
+  type: string;
+  username?: string;
+  hostile: boolean;
+  player: boolean;
+  distance: number;
+  position: Vec3Like;
+  health?: number;
+};
+
+export type CombatScanSummary = {
+  health: number;
+  food: number;
+  held: string;
+  pveEnabled: boolean;
+  pvpEnabled: boolean;
+  scanRange: number;
+  threats: CombatEntitySummary[];
+  nearbyEntities: CombatEntitySummary[];
+};
+
+export type CombatPulseSummary = {
+  ok: boolean;
+  mode: "pve" | "pvp";
+  durationMs: number;
+  attacks: number;
+  retreats: number;
+  foodUses: number;
+  steps: Array<{ action: string; ok: boolean; text: string }>;
+  finalScan: CombatScanSummary;
+};
+
+export type NavigationStatus = "idle" | "running" | "arrived" | "stopped" | "timeout" | "reset" | "skipped";
+
+export type NavigationSummary = {
+  id: string;
+  type: "goto" | "follow";
+  status: NavigationStatus;
+  target?: Vec3Like;
+  range: number;
+  startedAt: string;
+  updatedAt: string;
+  elapsedMs: number;
+  timeoutMs: number;
+  distance?: number;
+  moving: boolean;
+  reason?: string;
+};
+
+const HOSTILE_ENTITY_TERMS = [
+  "blaze",
+  "bogged",
+  "breeze",
+  "cave_spider",
+  "creeper",
+  "drowned",
+  "elder_guardian",
+  "endermite",
+  "evoker",
+  "ghast",
+  "guardian",
+  "hoglin",
+  "husk",
+  "magma_cube",
+  "phantom",
+  "piglin_brute",
+  "pillager",
+  "ravager",
+  "shulker",
+  "silverfish",
+  "skeleton",
+  "slime",
+  "spider",
+  "stray",
+  "vex",
+  "vindicator",
+  "warden",
+  "witch",
+  "wither",
+  "zoglin",
+  "zombie",
+];
+
+const WEAPON_SCORES: Array<[RegExp, number]> = [
+  [/netherite_sword$/, 90],
+  [/diamond_sword$/, 82],
+  [/iron_sword$/, 70],
+  [/stone_sword$/, 55],
+  [/golden_sword$/, 45],
+  [/wooden_sword$/, 35],
+  [/netherite_axe$/, 78],
+  [/diamond_axe$/, 72],
+  [/iron_axe$/, 62],
+  [/stone_axe$/, 50],
+  [/golden_axe$/, 38],
+  [/wooden_axe$/, 30],
+  [/trident$/, 60],
+  [/crossbow$/, 42],
+  [/bow$/, 38],
+];
+
+const FOOD_SCORES: Array<[RegExp, number]> = [
+  [/enchanted_golden_apple$/, 100],
+  [/golden_apple$/, 90],
+  [/cooked_beef$|steak$/, 75],
+  [/cooked_porkchop$/, 72],
+  [/golden_carrot$/, 70],
+  [/cooked_mutton$|cooked_chicken$|cooked_cod$|cooked_salmon$/, 62],
+  [/bread$|baked_potato$/, 45],
+  [/apple$|carrot$/, 35],
+  [/potato$|beef$|porkchop$|chicken$|mutton$|cod$|salmon$/, 20],
+];
+
 function toVec3(pos: Vec3Like): Vec3 {
   return new Vec3(pos.x, pos.y, pos.z);
 }
@@ -112,6 +238,31 @@ function addVec(a: Vec3Like, b: Vec3Like): Vec3Like {
 
 function isAirName(name: string | undefined): boolean {
   return !name || AIR_NAMES.has(name);
+}
+
+function blockSignature(block: ReturnType<Bot["blockAt"]>): string {
+  if (!block) {
+    return "none";
+  }
+  const stateId = "stateId" in block ? String((block as unknown as { stateId?: unknown }).stateId ?? "") : "";
+  return `${block.name}:${block.type}:${block.metadata ?? ""}:${stateId}`;
+}
+
+function entityBaseName(entity: any): string {
+  return String(entity.username ?? entity.mobType ?? entity.name ?? entity.displayName ?? entity.type ?? "unknown");
+}
+
+function isPlayerEntity(entity: any): boolean {
+  return entity.type === "player" || typeof entity.username === "string";
+}
+
+function isHostileEntityName(name: string): boolean {
+  const normalized = name.toLowerCase();
+  return HOSTILE_ENTITY_TERMS.some((term) => normalized.includes(term));
+}
+
+function scoreNamedItem(name: string, scores: Array<[RegExp, number]>): number {
+  return scores.find(([pattern]) => pattern.test(name))?.[1] ?? 0;
 }
 
 function itemSummary(item: unknown): ItemStackSummary | null {
@@ -164,6 +315,10 @@ export class MinecraftBot {
   private lastKeepAliveAt = 0;
   private keepAliveReplies = 0;
   private keepAliveTimeouts = 0;
+  private activeNavigation?: Omit<NavigationSummary, "elapsedMs" | "moving" | "distance"> & {
+    startedAtMs: number;
+    timeout?: NodeJS.Timeout;
+  };
 
   constructor(private readonly config: AgentConfig) {}
 
@@ -214,6 +369,7 @@ export class MinecraftBot {
     this.attachLenientKeepAlive(bot);
     this.attachRecipeCapture(bot);
     bot.loadPlugin(pathfinder);
+    this.attachNavigationMonitor(bot);
 
     try {
       await new Promise<void>((resolve, reject) => {
@@ -406,6 +562,51 @@ export class MinecraftBot {
     configureSocket();
   }
 
+  private attachNavigationMonitor(bot: Bot): void {
+    bot.on("goal_reached", () => {
+      if (this.activeNavigation?.type === "follow" && this.activeNavigation.status === "running") {
+        this.activeNavigation = {
+          ...this.activeNavigation,
+          updatedAt: new Date().toISOString(),
+          reason: "following within range",
+        };
+        return;
+      }
+      this.finishNavigation("arrived", "goal reached");
+    });
+    bot.on("path_reset", (reason: string) => {
+      const nav = this.activeNavigation;
+      if (!nav || nav.status !== "running") {
+        return;
+      }
+      if (nav.type === "follow") {
+        this.activeNavigation = {
+          ...nav,
+          updatedAt: new Date().toISOString(),
+          reason: typeof reason === "string" ? `follow path reset: ${reason}` : "follow path reset",
+        };
+        return;
+      }
+      this.finishNavigation("reset", typeof reason === "string" ? reason : "path reset");
+    });
+  }
+
+  private finishNavigation(status: NavigationStatus, reason?: string): void {
+    if (!this.activeNavigation) {
+      return;
+    }
+    if (this.activeNavigation.timeout) {
+      clearTimeout(this.activeNavigation.timeout);
+    }
+    this.activeNavigation = {
+      ...this.activeNavigation,
+      status,
+      reason,
+      updatedAt: new Date().toISOString(),
+      timeout: undefined,
+    };
+  }
+
   private keepAliveSummary(): string {
     const now = Date.now();
     const packetIdleMs = this.lastPacketAt > 0 ? now - this.lastPacketAt : -1;
@@ -432,6 +633,50 @@ export class MinecraftBot {
       `held=${held}`,
       `connection=${this.keepAliveSummary()}`,
     ].join(" ");
+  }
+
+  combatScan(params: { range?: number; includePlayers?: boolean } = {}): CombatScanSummary {
+    this.ensureConnected();
+    const bot = this.raw;
+    const range = Math.max(2, Math.min(64, params.range ?? this.config.combat.scanRange));
+    const includePlayers = params.includePlayers === true && this.config.combat.allowPvp;
+    const nearbyEntities = Object.values(bot.entities)
+      .filter((entity: any) => entity && entity !== bot.entity && entity.position)
+      .map((entity: any): CombatEntitySummary => {
+        const name = entityBaseName(entity);
+        const distance = Number(entity.position.distanceTo(bot.entity.position).toFixed(2));
+        const player = isPlayerEntity(entity);
+        return {
+          id: Number(entity.id),
+          name,
+          type: String(entity.type ?? "unknown"),
+          username: typeof entity.username === "string" ? entity.username : undefined,
+          hostile: !player && isHostileEntityName(name),
+          player,
+          distance,
+          position: {
+            x: Number(entity.position.x.toFixed(2)),
+            y: Number(entity.position.y.toFixed(2)),
+            z: Number(entity.position.z.toFixed(2)),
+          },
+          health: typeof entity.health === "number" ? entity.health : undefined,
+        };
+      })
+      .filter((entity) => entity.distance <= range)
+      .sort((a, b) => Number(b.hostile) - Number(a.hostile) || a.distance - b.distance);
+    const threats = nearbyEntities
+      .filter((entity) => entity.hostile || (includePlayers && entity.player))
+      .sort((a, b) => a.distance - b.distance);
+    return {
+      health: bot.health,
+      food: bot.food,
+      held: bot.heldItem?.name ?? "empty hand",
+      pveEnabled: this.config.combat.pveEnabled,
+      pvpEnabled: this.config.combat.allowPvp,
+      scanRange: range,
+      threats,
+      nearbyEntities,
+    };
   }
 
   feetBlock(): Vec3Like {
@@ -591,11 +836,134 @@ export class MinecraftBot {
       this.raw.setControlState(control, false);
     }
     this.raw.pathfinder.stop();
+    this.finishNavigation("stopped", "movement stopped");
   }
 
-  async gotoNear(pos: Vec3Like, range = 2): Promise<void> {
+  async gotoNear(pos: Vec3Like, range = 2): Promise<boolean> {
     this.ensureConnected();
-    await this.raw.pathfinder.goto(new GoalNear(pos.x, pos.y, pos.z, range));
+    const target = toVec3(pos).offset(0.5, 0, 0.5);
+    const clampedRange = Math.max(0.5, range);
+    if (this.raw.entity.position.distanceTo(target) <= clampedRange) {
+      return false;
+    }
+    const timeoutMs = Math.max(1_000, this.config.minecraft.pathfindTimeoutMs);
+    await Promise.race([
+      this.raw.pathfinder.goto(new GoalNear(pos.x, pos.y, pos.z, clampedRange)),
+      sleep(timeoutMs).then(() => {
+        this.raw.pathfinder.stop();
+        throw new Error(`Pathfind timed out after ${timeoutMs}ms to ${pos.x},${pos.y},${pos.z}`);
+      }),
+    ]);
+    return true;
+  }
+
+  startGotoNear(pos: Vec3Like, range = 2, timeoutMs = this.config.minecraft.pathfindTimeoutMs): NavigationSummary {
+    this.ensureConnected();
+    const target = toVec3(pos).offset(0.5, 0, 0.5);
+    const clampedRange = Math.max(0.5, range);
+    const clampedTimeout = Math.max(1_000, Math.min(120_000, timeoutMs));
+    if (this.raw.entity.position.distanceTo(target) <= clampedRange) {
+      const now = new Date().toISOString();
+      this.activeNavigation = {
+        id: `nav_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+        type: "goto",
+        status: "skipped",
+        target: { x: pos.x, y: pos.y, z: pos.z },
+        range: clampedRange,
+        startedAt: now,
+        updatedAt: now,
+        startedAtMs: Date.now(),
+        timeoutMs: clampedTimeout,
+        reason: "already within range",
+      };
+      return this.navigationStatus();
+    }
+    this.stopNavigation("replaced by new navigation");
+    const id = `nav_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    const now = new Date().toISOString();
+    const timeout = setTimeout(() => {
+      const nav = this.activeNavigation;
+      if (!nav || nav.id !== id || nav.status !== "running") {
+        return;
+      }
+      try {
+        this.raw.pathfinder.stop();
+      } catch {
+        // The bot may have disconnected.
+      }
+      this.finishNavigation("timeout", `navigation timed out after ${clampedTimeout}ms`);
+    }, clampedTimeout);
+    timeout.unref?.();
+    this.activeNavigation = {
+      id,
+      type: "goto",
+      status: "running",
+      target: { x: pos.x, y: pos.y, z: pos.z },
+      range: clampedRange,
+      startedAt: now,
+      updatedAt: now,
+      startedAtMs: Date.now(),
+      timeoutMs: clampedTimeout,
+      timeout,
+    };
+    this.raw.pathfinder.setGoal(new GoalNear(pos.x, pos.y, pos.z, clampedRange));
+    return this.navigationStatus();
+  }
+
+  navigationStatus(): NavigationSummary {
+    this.ensureConnected();
+    const nav = this.activeNavigation;
+    if (!nav) {
+      const now = new Date().toISOString();
+      return {
+        id: "none",
+        type: "goto",
+        status: "idle",
+        range: 0,
+        startedAt: now,
+        updatedAt: now,
+        elapsedMs: 0,
+        timeoutMs: 0,
+        moving: this.raw.pathfinder.isMoving(),
+      };
+    }
+    if (nav.status === "running" && nav.timeoutMs > 0 && Date.now() - nav.startedAtMs > nav.timeoutMs) {
+      try {
+        this.raw.pathfinder.stop();
+      } catch {
+        // The bot may have disconnected.
+      }
+      this.finishNavigation("timeout", `navigation timed out after ${nav.timeoutMs}ms`);
+    }
+    const current = this.activeNavigation ?? nav;
+    const distance = current.target
+      ? Number(this.raw.entity.position.distanceTo(toVec3(current.target).offset(0.5, 0, 0.5)).toFixed(2))
+      : undefined;
+    return {
+      id: current.id,
+      type: current.type,
+      status: current.status,
+      target: current.target,
+      range: current.range,
+      startedAt: current.startedAt,
+      updatedAt: current.updatedAt,
+      elapsedMs: Date.now() - current.startedAtMs,
+      timeoutMs: current.timeoutMs,
+      distance,
+      moving: this.raw.pathfinder.isMoving(),
+      reason: current.reason,
+    };
+  }
+
+  stopNavigation(reason = "navigation stopped"): NavigationSummary {
+    this.ensureConnected();
+    try {
+      this.raw.pathfinder.stop();
+    } catch {
+      // The pathfinder may already be stopped.
+    }
+    this.finishNavigation("stopped", reason);
+    return this.navigationStatus();
   }
 
   followPlayer(username?: string, range = 3): string {
@@ -614,6 +982,23 @@ export class MinecraftBot {
     }
 
     bot.pathfinder.setGoal(new GoalFollow(target, Math.max(1, Math.min(8, range))), true);
+    const now = new Date().toISOString();
+    this.activeNavigation = {
+      id: `nav_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+      type: "follow",
+      status: "running",
+      target: {
+        x: Number(target.position.x.toFixed(2)),
+        y: Number(target.position.y.toFixed(2)),
+        z: Number(target.position.z.toFixed(2)),
+      },
+      range: Math.max(1, Math.min(8, range)),
+      startedAt: now,
+      updatedAt: now,
+      startedAtMs: Date.now(),
+      timeoutMs: 0,
+      reason: `following ${target.username ?? username ?? "nearest player"}`,
+    };
     return `following ${target.username ?? username ?? "nearest player"} within ${range} blocks`;
   }
 
@@ -623,6 +1008,173 @@ export class MinecraftBot {
       throw new Error(`Item not found in inventory: ${name}`);
     }
     await this.raw.equip(item, "hand");
+  }
+
+  async equipBestWeapon(): Promise<string> {
+    this.ensureConnected();
+    const best = this.raw
+      .inventory
+      .items()
+      .map((item) => ({ item, score: scoreNamedItem(item.name, WEAPON_SCORES) }))
+      .filter((entry) => entry.score > 0)
+      .sort((a, b) => b.score - a.score || b.item.count - a.item.count)[0];
+    if (!best) {
+      return "no weapon found; keeping current held item";
+    }
+    await this.raw.equip(best.item, "hand");
+    return `equipped best weapon ${best.item.name}`;
+  }
+
+  async eatBestFood(force = false): Promise<string> {
+    this.ensureConnected();
+    if (!force && this.raw.food >= 18 && this.raw.health > this.config.combat.lowHealth) {
+      return `food/health acceptable: health=${this.raw.health} food=${this.raw.food}`;
+    }
+    const best = this.raw
+      .inventory
+      .items()
+      .map((item) => ({ item, score: scoreNamedItem(item.name, FOOD_SCORES) }))
+      .filter((entry) => entry.score > 0)
+      .sort((a, b) => b.score - a.score || b.item.count - a.item.count)[0];
+    if (!best) {
+      return "no food item found";
+    }
+    await this.raw.equip(best.item, "hand");
+    await this.raw.consume();
+    return `ate ${best.item.name}`;
+  }
+
+  async attackEntityById(entityId: number, params: { range?: number; equipBestWeapon?: boolean } = {}): Promise<string> {
+    this.ensureConnected();
+    const entity = this.raw.entities[entityId];
+    if (!entity?.position) {
+      throw new Error(`No attackable entity with id ${entityId}.`);
+    }
+    if (isPlayerEntity(entity) && !this.config.combat.allowPvp) {
+      throw new Error("Refusing to attack player because COMBAT_ALLOW_PVP=false.");
+    }
+    if (params.equipBestWeapon !== false) {
+      await this.equipBestWeapon();
+    }
+    const range = Math.max(1.8, Math.min(6, params.range ?? this.config.combat.attackRange));
+    const distance = entity.position.distanceTo(this.raw.entity.position);
+    if (distance > range) {
+      await this.gotoNear(
+        {
+          x: entity.position.x,
+          y: entity.position.y,
+          z: entity.position.z,
+        },
+        Math.max(1, range - 0.5),
+      );
+    }
+    await this.raw.lookAt(entity.position.offset(0, 0.8, 0), true);
+    this.raw.attack(entity);
+    return `attacked ${entityBaseName(entity)}#${entityId}`;
+  }
+
+  async retreatFromEntity(entityId: number, durationMs = 900): Promise<string> {
+    this.ensureConnected();
+    const entity = this.raw.entities[entityId];
+    if (entity?.position) {
+      await this.raw.lookAt(entity.position.offset(0, 0.8, 0), true);
+    }
+    await this.move({ direction: "back", durationMs: Math.max(100, Math.min(2500, durationMs)), sprint: true, jump: true });
+    return entity?.position ? `retreated from ${entityBaseName(entity)}#${entityId}` : "retreated from last known threat";
+  }
+
+  async combatPulse(params: {
+    durationMs?: number;
+    includePlayers?: boolean;
+    range?: number;
+    attack?: boolean;
+    retreatHealth?: number;
+  } = {}): Promise<CombatPulseSummary> {
+    this.ensureConnected();
+    const includePlayers = params.includePlayers === true;
+    if (includePlayers && !this.config.combat.allowPvp) {
+      throw new Error("PVP combat pulse requires COMBAT_ALLOW_PVP=true.");
+    }
+    if (!includePlayers && !this.config.combat.pveEnabled) {
+      throw new Error("PVE combat is disabled by COMBAT_PVE_ENABLED=false.");
+    }
+    const durationMs = Math.max(250, Math.min(30_000, params.durationMs ?? 3500));
+    const range = Math.max(2, Math.min(64, params.range ?? this.config.combat.scanRange));
+    const attack = params.attack !== false;
+    const retreatHealth = params.retreatHealth ?? this.config.combat.criticalHealth;
+    const started = Date.now();
+    const steps: CombatPulseSummary["steps"] = [];
+    let attacks = 0;
+    let retreats = 0;
+    let foodUses = 0;
+    await this.equipBestWeapon().then((text) => steps.push({ action: "equip_best_weapon", ok: true, text }));
+    while (Date.now() - started < durationMs) {
+      const scan = this.combatScan({ range, includePlayers });
+      const target = scan.threats[0];
+      if (this.raw.health <= retreatHealth) {
+        try {
+          const text = await this.eatBestFood(false);
+          steps.push({ action: "eat_best_food", ok: !text.includes("no food"), text });
+          if (!text.includes("no food") && !text.includes("acceptable")) {
+            foodUses += 1;
+          }
+        } catch (error) {
+          steps.push({ action: "eat_best_food", ok: false, text: error instanceof Error ? error.message : String(error) });
+        }
+        if (target) {
+          const text = await this.retreatFromEntity(target.id, 900);
+          retreats += 1;
+          steps.push({ action: "retreat", ok: true, text });
+        }
+        await sleep(250);
+        continue;
+      }
+      if (!target) {
+        steps.push({ action: "scan", ok: true, text: "no threats in range" });
+        await sleep(300);
+        break;
+      }
+      if (target.name.toLowerCase().includes("creeper") && target.distance < 4) {
+        const text = await this.retreatFromEntity(target.id, 800);
+        retreats += 1;
+        steps.push({ action: "retreat", ok: true, text: `${text}; creeper spacing` });
+        await sleep(250);
+        continue;
+      }
+      if (!attack) {
+        steps.push({ action: "track", ok: true, text: `tracked ${target.name}#${target.id} at d=${target.distance}` });
+        await sleep(300);
+        continue;
+      }
+      try {
+        const text = await this.attackEntityById(target.id, { range: this.config.combat.attackRange });
+        attacks += 1;
+        steps.push({ action: "attack", ok: true, text });
+      } catch (error) {
+        steps.push({ action: "attack", ok: false, text: error instanceof Error ? error.message : String(error) });
+        if (target) {
+          try {
+            const text = await this.retreatFromEntity(target.id, 600);
+            retreats += 1;
+            steps.push({ action: "retreat", ok: true, text });
+          } catch {
+            // Keep the combat loop moving.
+          }
+        }
+      }
+      await sleep(650);
+    }
+    const finalScan = this.combatScan({ range, includePlayers });
+    return {
+      ok: finalScan.threats.length === 0 || this.raw.health > this.config.combat.criticalHealth,
+      mode: includePlayers ? "pvp" : "pve",
+      durationMs,
+      attacks,
+      retreats,
+      foodUses,
+      steps,
+      finalScan,
+    };
   }
 
   async digAt(pos: Vec3Like): Promise<string> {
@@ -768,7 +1320,7 @@ export class MinecraftBot {
     return `used held item for ${durationMs}ms`;
   }
 
-  async placeOnScreenHit(hit: ScreenPlacementHit, itemName?: string): Promise<Vec3Like> {
+  async placeOnScreenHit(hit: ScreenPlacementHit, itemName?: string): Promise<PlacementSummary> {
     if (itemName) {
       await this.equipItem(itemName);
     }
@@ -789,9 +1341,11 @@ export class MinecraftBot {
       target.z - hit.blockPosition.z,
     );
     await this.gotoNear(hit.blockPosition, 4);
-    await this.raw.lookAt(toVec3(target).offset(0.5, 0.5, 0.5), true);
-    await this.raw.placeBlock(referenceBlock, face);
-    return target;
+    return this.placeBlockVerified({
+      referencePosition: hit.blockPosition,
+      target,
+      face,
+    });
   }
 
   async craftItem(name: string, count: number): Promise<string> {
@@ -879,7 +1433,7 @@ export class MinecraftBot {
     return summary;
   }
 
-  async placeBlockAt(target: Vec3Like): Promise<void> {
+  async placeBlockAt(target: Vec3Like): Promise<PlacementSummary> {
     if (!this.raw.heldItem) {
       throw new Error("Cannot place: hand is empty.");
     }
@@ -888,8 +1442,117 @@ export class MinecraftBot {
       throw new Error(`No solid neighbor for placement at ${target.x},${target.y},${target.z}`);
     }
     await this.gotoNear(target, 4);
-    await this.raw.lookAt(toVec3(target).offset(0.5, 0.5, 0.5), true);
-    await this.raw.placeBlock(neighbor.block, neighbor.face);
+    return this.placeBlockVerified({
+      referencePosition: {
+        x: neighbor.block.position.x,
+        y: neighbor.block.position.y,
+        z: neighbor.block.position.z,
+      },
+      target,
+      face: neighbor.face,
+    });
+  }
+
+  private async placeBlockVerified(params: {
+    referencePosition: Vec3Like;
+    target: Vec3Like;
+    face: Vec3;
+  }): Promise<PlacementSummary> {
+    this.ensureConnected();
+    const heldItem = this.raw.heldItem;
+    if (!heldItem) {
+      throw new Error("Cannot place: hand is empty.");
+    }
+
+    const targetVec = toVec3(params.target);
+    const beforeBlock = this.raw.blockAt(targetVec);
+    const beforeName = beforeBlock?.name;
+    const beforeSignature = blockSignature(beforeBlock);
+    const maxAttempts = Math.max(1, this.config.minecraft.placementRetries + 1);
+    let lastError: string | undefined;
+    let afterName = beforeName;
+
+    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+      const referenceBlock = this.raw.blockAt(toVec3(params.referencePosition));
+      if (!referenceBlock || isAirName(referenceBlock.name)) {
+        throw new Error(
+          `Placement reference vanished at ${params.referencePosition.x},${params.referencePosition.y},${params.referencePosition.z}`,
+        );
+      }
+      try {
+        await this.sendPlacePacket(referenceBlock, params.face);
+      } catch (error) {
+        lastError = error instanceof Error ? error.message : String(error);
+      }
+
+      const verified = await this.waitForPlacedBlock(targetVec, beforeSignature, this.config.minecraft.placementTimeoutMs);
+      const afterBlock = this.raw.blockAt(targetVec);
+      afterName = afterBlock?.name;
+      if (verified) {
+        return {
+          target: params.target,
+          reference: params.referencePosition,
+          face: { x: params.face.x, y: params.face.y, z: params.face.z },
+          item: heldItem.name,
+          before: beforeName,
+          after: afterName,
+          attempts: attempt,
+          verified: true,
+        };
+      }
+      await sleep(150);
+    }
+
+    throw new Error(
+      [
+        `Placement at ${params.target.x},${params.target.y},${params.target.z} was not verified after ${maxAttempts} attempt(s).`,
+        `before=${beforeName ?? "none"} after=${afterName ?? "none"} item=${heldItem.name}`,
+        lastError ? `last_error=${lastError}` : "",
+      ]
+        .filter(Boolean)
+        .join(" "),
+    );
+  }
+
+  private async sendPlacePacket(referenceBlock: NonNullable<ReturnType<Bot["blockAt"]>>, face: Vec3): Promise<void> {
+    const botWithGenericPlace = this.raw as Bot & {
+      _genericPlace?: (
+        referenceBlock: NonNullable<ReturnType<Bot["blockAt"]>>,
+        faceVector: Vec3,
+        options: Record<string, unknown>,
+      ) => Promise<unknown>;
+    };
+    if (botWithGenericPlace._genericPlace) {
+      await botWithGenericPlace._genericPlace(referenceBlock, face, {
+        swingArm: "right",
+        forceLook: true,
+      });
+      return;
+    }
+    try {
+      await this.raw.placeBlock(referenceBlock, face);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (!message.includes("did not fire within timeout")) {
+        throw error;
+      }
+      // Older mineflayer builds can throw before local chunk state catches up.
+      // The caller verifies the actual target block after this.
+    }
+  }
+
+  private async waitForPlacedBlock(target: Vec3, beforeSignature: string, timeoutMs: number): Promise<boolean> {
+    const deadline = Date.now() + Math.max(500, timeoutMs);
+    while (Date.now() <= deadline) {
+      const block = this.raw.blockAt(target);
+      const signature = blockSignature(block);
+      if (block && !isAirName(block.name) && signature !== beforeSignature) {
+        return true;
+      }
+      await sleep(100);
+    }
+    const block = this.raw.blockAt(target);
+    return Boolean(block && !isAirName(block.name) && blockSignature(block) !== beforeSignature);
   }
 
   private findInventoryItem(name: string) {

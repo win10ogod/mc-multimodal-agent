@@ -7,7 +7,13 @@ import type { SkillLibrary } from "../skills/SkillLibrary";
 import type { JsonObject, SessionLoopState, ToolResult } from "../types";
 import { listBlueprints } from "../blueprint/Blueprint";
 import { readTextFile } from "../utils/fs";
-import { createModelProvider, type ModelProvider, type ProviderTurn } from "../openai/ModelProvider";
+import {
+  createModelProvider,
+  formatModelProviderError,
+  isRetryableModelProviderError,
+  type ModelProvider,
+  type ProviderTurn,
+} from "../openai/ModelProvider";
 import type { MinecraftToolContext } from "../tools/MinecraftTools";
 import type { ToolRegistry } from "../tools/ToolRegistry";
 import { compactText, digest, parseJsonObject } from "../utils/misc";
@@ -43,6 +49,40 @@ type ExecutedToolStep = {
   ok: boolean;
   result: string;
 };
+
+const AUTO_OBSERVE_AFTER_TOOLS = new Set([
+  "look_screen",
+  "turn",
+  "move",
+  "stop",
+  "wait",
+  "follow_player",
+  "dig_screen",
+  "place_screen",
+  "pathfind_screen",
+  "pathfind_to_block",
+  "navigation_start",
+  "navigation_stop",
+  "dig_block",
+  "harvest_nearby_blocks",
+  "activate_block",
+  "open_block_window",
+  "click_window_slot",
+  "transfer_window_item",
+  "close_window",
+  "select_hotbar_slot",
+  "use_held_item",
+  "equip_item",
+  "equip_best_weapon",
+  "eat_best_food",
+  "attack_entity",
+  "retreat_from_entity",
+  "combat_pulse",
+  "craft_item",
+  "build_blueprint",
+  "execute_steps",
+  "execute_skill",
+]);
 
 export class AgentLoop {
   private readonly provider: ModelProvider;
@@ -117,22 +157,41 @@ export class AgentLoop {
         checkpoint: checkpoint ? compactText(checkpoint, 800) : "",
       });
       const vision = await this.captureVisionContext();
-      const response = await this.provider.start({
-        instructions: await this.buildInstructions(effectiveTask),
-        tools: this.deps.tools.definitions(),
-        imageDataUrls: vision.frames.map((frame) => frame.dataUrl),
-        text: this.buildSegmentPrompt({
-          task: effectiveTask,
+      let currentResponse: ProviderTurn;
+      try {
+        currentResponse = await this.provider.start({
+          instructions: await this.buildInstructions(effectiveTask),
+          tools: this.deps.tools.definitions(),
+          imageDataUrls: vision.frames.map((frame) => frame.dataUrl),
+          text: this.buildSegmentPrompt({
+            task: effectiveTask,
+            segment,
+            maxSegments,
+            checkpoint,
+            frameText: vision.text,
+            overallStartedAt,
+            overallDeadline,
+            totalToolCallCount,
+          }),
+        });
+      } catch (error) {
+        stopReason = this.modelProviderStopReason(error, "start");
+        this.logFlow("model_provider_error", {
+          phase: "start",
           segment,
-          maxSegments,
-          checkpoint,
-          frameText: vision.text,
-          overallStartedAt,
-          overallDeadline,
+          retryable: isRetryableModelProviderError(error),
+          error: formatModelProviderError(error),
+        });
+        checkpoint = await this.writeLongTaskCheckpoint({
+          task: effectiveTask,
+          reason: stopReason,
+          segment,
           totalToolCallCount,
-        }),
-      });
-      let currentResponse = response;
+          executedSteps,
+        });
+        lastCheckpointToolCount = totalToolCallCount;
+        break;
+      }
       let toolCalls = currentResponse.toolCalls;
       let segmentToolCallCount = 0;
       let modelTurnCount = 1;
@@ -201,7 +260,8 @@ export class AgentLoop {
             await this.deps.transcript.append({ role: "system", text: loop.message });
             this.logFlow("tool_loop_warning", { tool: name, callId, message: loop.message });
           }
-          const result = await this.deps.tools.execute(name, args as JsonObject, this.toolContext());
+          const rawResult = await this.deps.tools.execute(name, args as JsonObject, this.toolContext());
+          const result = this.enrichActionToolResult(name, rawResult);
           recordToolOutcome(this.state, name, args, callId, result);
           this.logToolResult(segment, segmentToolCallCount, totalToolCallCount, callId, name, result);
           executedSteps.push(...this.recordedStepsForToolResult(name, args as JsonObject, result));
@@ -242,11 +302,23 @@ export class AgentLoop {
           break;
         }
         modelTurnCount += 1;
-        currentResponse = await this.provider.continue({
-          instructions: await this.buildInstructions(effectiveTask),
-          tools: this.deps.tools.definitions(),
-          toolOutputs: outputs,
-        });
+        try {
+          currentResponse = await this.provider.continue({
+            instructions: await this.buildInstructions(effectiveTask),
+            tools: this.deps.tools.definitions(),
+            toolOutputs: outputs,
+          });
+        } catch (error) {
+          fatalStopReason = this.modelProviderStopReason(error, "continue");
+          this.logFlow("model_provider_error", {
+            phase: "continue",
+            segment,
+            turn: modelTurnCount,
+            retryable: isRetryableModelProviderError(error),
+            error: formatModelProviderError(error),
+          });
+          break;
+        }
         toolCalls = currentResponse.toolCalls;
         this.logModelTurn("continue", segment, modelTurnCount, currentResponse);
       }
@@ -364,11 +436,13 @@ export class AgentLoop {
     const requestedFrames = Math.max(1, Math.min(3, Math.floor(this.deps.config.vision.contextFrames)));
     const yaw = Math.max(5, Math.min(75, this.deps.config.vision.contextYawDeg));
     const center = this.deps.vision.capture();
-    if (requestedFrames === 1) {
+    if (requestedFrames === 1 || !this.deps.config.vision.contextSweep) {
       return {
         frames: [center],
         text: [
-          "Vision context: 1 image. Screen-coordinate tools refer to this current center view.",
+          requestedFrames === 1
+            ? "Vision context: 1 image. Screen-coordinate tools refer to this current center view."
+            : "Vision context: smooth mode uses 1 current image. Multi-image sweep is available by setting VISION_CONTEXT_SWEEP=true, but it physically turns the bot camera.",
           "",
           "<image_1_center_current>",
           center.text,
@@ -421,6 +495,61 @@ export class AgentLoop {
           "</image_1_center_current>",
         ].join("\n"),
       };
+    }
+  }
+
+  private enrichActionToolResult(toolName: string, result: ToolResult): ToolResult {
+    if (!this.deps.config.loop.autoObserveAfterActions || !AUTO_OBSERVE_AFTER_TOOLS.has(toolName)) {
+      return result;
+    }
+    if (!this.deps.bot.isConnected()) {
+      return result;
+    }
+    try {
+      const frame = this.deps.vision.capture();
+      const status = this.deps.bot.statusSummary();
+      const navigation = this.deps.bot.navigationStatus();
+      const postStateText = [
+        "<post_tool_state>",
+        status,
+        `navigation=${JSON.stringify(navigation)}`,
+        "",
+        "<post_tool_visual_observation>",
+        frame.text,
+        "</post_tool_visual_observation>",
+        "</post_tool_state>",
+      ].join("\n");
+      const existingData =
+        result.data && typeof result.data === "object" && !Array.isArray(result.data)
+          ? (result.data as JsonObject)
+          : undefined;
+      return {
+        ...result,
+        text: [result.text, "", postStateText].join("\n"),
+        content: [
+          ...(result.content ?? []),
+          { type: "text", text: postStateText },
+          { type: "image", dataUrl: frame.dataUrl, detail: "low" },
+        ],
+        data: {
+          ...(existingData ?? {}),
+          postToolState: {
+            status,
+            navigation: navigation as unknown as JsonObject,
+            visual: {
+              width: frame.width,
+              height: frame.height,
+              capturedAt: frame.capturedAt,
+            },
+          },
+        },
+      };
+    } catch (error) {
+      this.logFlow("post_tool_observe_failed", {
+        tool: toolName,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return result;
     }
   }
 
@@ -532,6 +661,12 @@ export class AgentLoop {
         arguments: this.deps.config.observability.logToolArgs ? compactText(call.arguments, 1200) : "[hidden]",
       })),
     });
+  }
+
+  private modelProviderStopReason(error: unknown, phase: "start" | "continue"): string {
+    const retryable = isRetryableModelProviderError(error);
+    const retryText = retryable ? " after configured retries" : "";
+    return `Stopped: model provider ${phase} failed${retryText}: ${formatModelProviderError(error)}`;
   }
 
   private logToolCall(
@@ -648,6 +783,10 @@ export class AgentLoop {
         `mc_version=${this.deps.bot.raw.version}`,
         `auth=${this.deps.config.minecraft.auth}`,
         `modded_tolerant=${this.deps.config.minecraft.moddedTolerant}`,
+        `combat_pve_enabled=${this.deps.config.combat.pveEnabled}`,
+        `combat_pvp_enabled=${this.deps.config.combat.allowPvp}`,
+        `combat_auto_defense=${this.deps.config.combat.autoDefense}`,
+        `navigation=${JSON.stringify(this.deps.bot.navigationStatus())}`,
         `recipe_source=${recipeStatus.source}`,
         `server_recipes=${recipeStatus.serverRecipeCount}`,
         `recipe_packets_skipped=${recipeStatus.skippedByConfig}`,

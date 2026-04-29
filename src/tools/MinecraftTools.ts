@@ -465,7 +465,7 @@ export function createMinecraftToolRegistry(): ToolRegistry<MinecraftToolContext
   registry.register({
     name: "place_screen",
     description:
-      "Place the held or named item onto the visible face at a screen coordinate from the latest visual frame.",
+      "Place the held or named item onto the visible face at a screen coordinate from the latest visual frame. The tool verifies the target block after sending the place action, so retry with a different face/position if it reports not verified.",
     parameters: {
       type: "object",
       properties: {
@@ -483,20 +483,26 @@ export function createMinecraftToolRegistry(): ToolRegistry<MinecraftToolContext
         throw new Error(`No visible placement target at screen (${x}, ${y}).`);
       }
       const item = typeof args.item === "string" ? args.item : undefined;
-      const placedAt = await ctx.bot.placeOnScreenHit(hit, item);
-      return ok(`placed ${item ?? "held item"} from screen (${x}, ${y})`, placedAt as unknown as JsonValue);
+      const placement = await ctx.bot.placeOnScreenHit(hit, item);
+      return ok(
+        `placed ${placement.item} from screen (${x}, ${y}) at ${placement.target.x},${placement.target.y},${placement.target.z} after ${placement.attempts} attempt(s)`,
+        placement as unknown as JsonValue,
+      );
     },
   });
 
   registry.register({
     name: "pathfind_screen",
-    description: "Walk near the visible block at a screen coordinate.",
+    description:
+      "Walk near the visible block at a screen coordinate. Use background=true for non-blocking navigation so the agent can keep observing while walking.",
     parameters: {
       type: "object",
       properties: {
         x: { type: "number" },
         y: { type: "number" },
         range: { type: "number", minimum: 1, maximum: 8 },
+        background: { type: "boolean" },
+        timeoutMs: { type: "number", minimum: 1000, maximum: 120000 },
       },
       required: ["x", "y"],
       additionalProperties: false,
@@ -507,8 +513,13 @@ export function createMinecraftToolRegistry(): ToolRegistry<MinecraftToolContext
       if (!hit) {
         throw new Error(`No visible path target at screen (${x}, ${y}).`);
       }
-      await ctx.bot.gotoNear(hit.blockPosition, optionalNumber(args, "range", 2));
-      return ok(`walked near visible target at screen (${x}, ${y})`);
+      const range = optionalNumber(args, "range", 2);
+      if (args.background === true) {
+        const status = ctx.bot.startGotoNear(hit.blockPosition, range, optionalNumber(args, "timeoutMs", ctx.config.minecraft.pathfindTimeoutMs));
+        return ok(`started background navigation to visible target at screen (${x}, ${y})`, status as unknown as JsonValue);
+      }
+      const moved = await ctx.bot.gotoNear(hit.blockPosition, range);
+      return ok(`${moved ? "walked near" : "already near"} visible target at screen (${x}, ${y})`);
     },
   });
 
@@ -559,7 +570,7 @@ export function createMinecraftToolRegistry(): ToolRegistry<MinecraftToolContext
   registry.register({
     name: "pathfind_to_block",
     description:
-      "Walk near a block position returned by find_nearby_blocks. This is a generic navigation primitive for learned procedures.",
+      "Walk near a block position returned by find_nearby_blocks. Use background=true for non-blocking navigation, then call navigation_status while the bot walks.",
     parameters: {
       type: "object",
       properties: {
@@ -570,15 +581,81 @@ export function createMinecraftToolRegistry(): ToolRegistry<MinecraftToolContext
           maxItems: 3,
         },
         range: { type: "number", minimum: 1, maximum: 8 },
+        background: { type: "boolean" },
+        timeoutMs: { type: "number", minimum: 1000, maximum: 120000 },
       },
       required: ["position"],
       additionalProperties: false,
     },
     execute: async (args, ctx) => {
       const pos = vecFromArray(args.position);
-      await ctx.bot.gotoNear(pos, optionalNumber(args, "range", 3));
-      return ok(`walked near block ${pos.x},${pos.y},${pos.z}`);
+      const range = optionalNumber(args, "range", 3);
+      if (args.background === true) {
+        const status = ctx.bot.startGotoNear(pos, range, optionalNumber(args, "timeoutMs", ctx.config.minecraft.pathfindTimeoutMs));
+        return ok(`started background navigation to block ${pos.x},${pos.y},${pos.z}`, status as unknown as JsonValue);
+      }
+      const moved = await ctx.bot.gotoNear(pos, range);
+      return ok(`${moved ? "walked near" : "already near"} block ${pos.x},${pos.y},${pos.z}`);
     },
+  });
+
+  registry.register({
+    name: "navigation_start",
+    description:
+      "Start non-blocking navigation to an explicit block position and return immediately. Use navigation_status to monitor progress while the bot keeps walking.",
+    parameters: {
+      type: "object",
+      properties: {
+        position: {
+          type: "array",
+          items: { type: "number" },
+          minItems: 3,
+          maxItems: 3,
+        },
+        range: { type: "number", minimum: 1, maximum: 8 },
+        timeoutMs: { type: "number", minimum: 1000, maximum: 120000 },
+      },
+      required: ["position"],
+      additionalProperties: false,
+    },
+    execute: async (args, ctx) => {
+      const pos = vecFromArray(args.position);
+      const status = ctx.bot.startGotoNear(
+        pos,
+        optionalNumber(args, "range", 3),
+        optionalNumber(args, "timeoutMs", ctx.config.minecraft.pathfindTimeoutMs),
+      );
+      return ok(`started navigation ${status.id}`, status as unknown as JsonValue);
+    },
+  });
+
+  registry.register({
+    name: "navigation_status",
+    description:
+      "Inspect current non-blocking navigation/follow status, including distance, moving flag, timeout, and completion state.",
+    parameters: {
+      type: "object",
+      properties: {},
+      additionalProperties: false,
+    },
+    execute: async (_args, ctx) => ok("navigation status", ctx.bot.navigationStatus() as unknown as JsonValue),
+  });
+
+  registry.register({
+    name: "navigation_stop",
+    description: "Stop current non-blocking navigation or follow movement.",
+    parameters: {
+      type: "object",
+      properties: {
+        reason: { type: "string" },
+      },
+      additionalProperties: false,
+    },
+    execute: async (args, ctx) =>
+      ok(
+        "navigation stopped",
+        ctx.bot.stopNavigation(typeof args.reason === "string" ? args.reason : "navigation_stop tool") as unknown as JsonValue,
+      ),
   });
 
   registry.register({
@@ -953,6 +1030,135 @@ export function createMinecraftToolRegistry(): ToolRegistry<MinecraftToolContext
       const name = requiredString(args, "name");
       await ctx.bot.equipItem(name);
       return ok(`equipped ${name}`);
+    },
+  });
+
+  registry.register({
+    name: "combat_scan",
+    description:
+      "Scan nearby entities and classify immediate PVE/PVP threats. Use before combat decisions and after taking damage.",
+    parameters: {
+      type: "object",
+      properties: {
+        range: { type: "number", minimum: 2, maximum: 64 },
+        includePlayers: {
+          type: "boolean",
+          description: "Include players as threats only when COMBAT_ALLOW_PVP=true.",
+        },
+      },
+      additionalProperties: false,
+    },
+    execute: async (args, ctx) =>
+      ok(
+        "combat scan",
+        ctx.bot.combatScan({
+          range: optionalNumber(args, "range", ctx.config.combat.scanRange),
+          includePlayers: args.includePlayers === true,
+        }) as unknown as JsonValue,
+      ),
+  });
+
+  registry.register({
+    name: "equip_best_weapon",
+    description: "Equip the best detected melee/ranged weapon from inventory for PVE/PVP.",
+    parameters: {
+      type: "object",
+      properties: {},
+      additionalProperties: false,
+    },
+    execute: async (_args, ctx) => ok(await ctx.bot.equipBestWeapon()),
+  });
+
+  registry.register({
+    name: "eat_best_food",
+    description:
+      "Eat the best available food when health/food is low. Set force=true to eat even if current status looks acceptable.",
+    parameters: {
+      type: "object",
+      properties: {
+        force: { type: "boolean" },
+      },
+      additionalProperties: false,
+    },
+    execute: async (args, ctx) => ok(await ctx.bot.eatBestFood(args.force === true)),
+  });
+
+  registry.register({
+    name: "attack_entity",
+    description:
+      "Attack one entity id returned by combat_scan. Refuses player targets unless COMBAT_ALLOW_PVP=true.",
+    parameters: {
+      type: "object",
+      properties: {
+        entityId: { type: "number" },
+        range: { type: "number", minimum: 1.8, maximum: 6 },
+        equipBestWeapon: { type: "boolean" },
+      },
+      required: ["entityId"],
+      additionalProperties: false,
+    },
+    execute: async (args, ctx) =>
+      ok(
+        await ctx.bot.attackEntityById(Math.floor(optionalNumber(args, "entityId", -1)), {
+          range: optionalNumber(args, "range", ctx.config.combat.attackRange),
+          equipBestWeapon: args.equipBestWeapon !== false,
+        }),
+      ),
+  });
+
+  registry.register({
+    name: "retreat_from_entity",
+    description: "Fast defensive retreat away from one entity id returned by combat_scan.",
+    parameters: {
+      type: "object",
+      properties: {
+        entityId: { type: "number" },
+        durationMs: { type: "number", minimum: 100, maximum: 2500 },
+      },
+      required: ["entityId"],
+      additionalProperties: false,
+    },
+    execute: async (args, ctx) =>
+      ok(await ctx.bot.retreatFromEntity(Math.floor(optionalNumber(args, "entityId", -1)), optionalNumber(args, "durationMs", 900))),
+  });
+
+  registry.register({
+    name: "combat_pulse",
+    description:
+      "Run a local low-latency combat/reflex loop for a short duration. Handles scanning, weapon equip, attacking, eating, and retreating without waiting for model turns between each tick. PVP requires COMBAT_ALLOW_PVP=true.",
+    parameters: {
+      type: "object",
+      properties: {
+        durationMs: { type: "number", minimum: 250, maximum: 30000 },
+        includePlayers: { type: "boolean" },
+        range: { type: "number", minimum: 2, maximum: 64 },
+        attack: { type: "boolean" },
+        retreatHealth: { type: "number", minimum: 1, maximum: 20 },
+      },
+      additionalProperties: false,
+    },
+    execute: async (args, ctx) => {
+      const summary = await ctx.bot.combatPulse({
+        durationMs: optionalNumber(args, "durationMs", 3500),
+        includePlayers: args.includePlayers === true,
+        range: optionalNumber(args, "range", ctx.config.combat.scanRange),
+        attack: args.attack !== false,
+        retreatHealth: optionalNumber(args, "retreatHealth", ctx.config.combat.criticalHealth),
+      });
+      return {
+        ok: summary.ok,
+        text: `${summary.mode} combat pulse: attacks=${summary.attacks} retreats=${summary.retreats} food=${summary.foodUses} threats_left=${summary.finalScan.threats.length}`,
+        data: {
+          ...summary,
+          executedSteps: summary.steps.map((step, index) => ({
+            step: index + 1,
+            tool: step.action,
+            arguments: {},
+            ok: step.ok,
+            text: step.text,
+          })),
+        } as unknown as JsonValue,
+      };
     },
   });
 

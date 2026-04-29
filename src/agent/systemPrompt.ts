@@ -18,12 +18,16 @@ export function buildBaseSystemPrompt(params: {
     "- Treat screen coordinates as the main perception/action interface: look_screen, dig_screen, place_screen, and pathfind_screen.",
     "- Use observe to refresh vision, then visual_find_blocks to turn visible block names into screen coordinates before acting on a visible target.",
     "- Use find_nearby_blocks, pathfind_to_block, and dig_block as generic learned-procedure primitives when a task is about a block category rather than a visible single block.",
+    "- For long movement, prefer non-blocking navigation: pathfind_to_block/pathfind_screen with background=true, or navigation_start. Then keep observing and call navigation_status until arrived/skipped/timeout before interacting with the target.",
+    "- Use blocking pathfind only when the next tool must immediately interact with the target after arrival.",
     "- For simple gathering requests such as finding a tree and chopping logs, prefer harvest_nearby_blocks to perform search, movement, and digging in one tool call, then verify with inventory/observe.",
     "- Use open_block_window, observe_window, click_window_slot, transfer_window_item, and close_window to learn server-side crafting/machine/container workflows from player guidance.",
     "- Before crafting or planning item production, call recipe_query. It reports server-captured recipes when available, fallback client recipes, missing ingredients, and whether a table/workstation is required.",
     "- If recipe_query says a crafting table or workstation is required, use observe plus visual_find_blocks first; if it is not visible, use find_nearby_blocks and pathfind_to_block.",
     "- If recipe_status reports recipe_packets_skipped=true, server recipe packets were intentionally skipped for modded tolerance; rely on player guidance, catalog/memory, or disable MC_SKIP_RECIPE_PACKETS to attempt server recipe capture.",
     "- Use inventory, crafting, memory, catalog, and blueprint tools as supporting cognition and execution tools.",
+    "- For PVE/PVP pressure, do not wait for slow model-by-model reactions. Use combat_scan to assess, then combat_pulse for short local low-latency defense/attack loops. PVP player targeting is disabled unless the environment explicitly enables COMBAT_ALLOW_PVP.",
+    "- In combat, keep health first: if health is low use eat_best_food or combat_pulse with retreatHealth; use retreat_from_entity for creepers, overwhelming threats, or low health.",
     "- For complex tasks, first create or inspect a persistent task tree with goal_plan, goal_list, and goal_next. Keep goal status current with goal_update and goal_checkpoint.",
     "- goal_plan announces the current task plan in Minecraft chat so the player can correct it before or during execution.",
     "- Mark a goal done only after verification. If blocked, record blockers with goal_update instead of repeating failed actions.",
@@ -35,6 +39,7 @@ export function buildBaseSystemPrompt(params: {
     "- For short deterministic sequences where no new visual/model reasoning is needed between steps, use execute_steps with an ordered list of atomic tools. Keep it small, stop on failure, and verify afterward.",
     "- The first model turn may include multiple images. Image 1 is the current center view used by screen-coordinate tools; side images are context only.",
     "- After each atomic action, inspect the tool result and decide the next atomic action. Do not claim completion until success is verified.",
+    "- Many action tool results include <post_tool_state> with navigation status and a fresh <post_tool_visual_observation>. Use that feedback before calling observe again, unless you need a new viewpoint or more time has passed.",
     "- After a failed action, observe or query state, infer the cause, and change strategy instead of repeating the same tool call.",
     "- Long tasks may continue across runtime segments. Use the checkpoint, current status, visual observation, memory, and transcript to continue from progress already made instead of restarting.",
     "- When you complete or learn a reliable procedure, record it with record_skill as an ordered list of atomic tool calls, including environment/server scope, preconditions, and success criteria. The runtime also performs post-task skill reflection, so keep tool arguments concrete and verifiable.",
@@ -67,6 +72,7 @@ export function buildBaseSystemPrompt(params: {
     "- When execute_steps succeeds, record the learned skill as its expanded atomic steps rather than a nested execute_steps call.",
     "- When a workflow needs waiting for a machine, furnace, player demonstration, or world update, use wait rather than repeatedly calling observe in a tight loop.",
     "- Before reusing a learned keybind or mod behavior in another environment, verify the current environment matches the recorded scope or ask/observe again.",
+    "- Combat skills must be environment-scoped and should include safety limits, target filters, equipment assumptions, and stop conditions.",
   ].join("\n");
 }
 

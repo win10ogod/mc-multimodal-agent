@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 import {
   buildQwenExtraBody,
+  formatModelProviderError,
+  isRetryableModelProviderError,
   parseSkillDraft,
   parseStructuredAgentTurn,
   parseTextToolCalls,
@@ -201,5 +203,15 @@ describe("model provider text tool parsing", () => {
       temperature: 0.7,
       presence_penalty: 1.5,
     });
+  });
+
+  it("classifies transient model transport errors as retryable", () => {
+    expect(isRetryableModelProviderError(new Error("Connection error."))).toBe(true);
+    expect(isRetryableModelProviderError({ status: 429, message: "rate limited" })).toBe(true);
+    expect(isRetryableModelProviderError({ status: 502, message: "bad gateway" })).toBe(true);
+    expect(isRetryableModelProviderError({ status: 400, message: "bad request" })).toBe(false);
+    expect(formatModelProviderError({ name: "APIConnectionError", message: "Connection error." })).toContain(
+      "APIConnectionError",
+    );
   });
 });

@@ -62,7 +62,181 @@ function createClient(config: AgentConfig): OpenAI {
   return new OpenAI({
     apiKey: config.openai.apiKey,
     baseURL: config.openai.baseURL,
+    timeout: Math.max(1_000, config.openai.requestTimeoutMs),
+    maxRetries: 0,
   });
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function errorValue(error: unknown, key: string): unknown {
+  return error && typeof error === "object" ? (error as Record<string, unknown>)[key] : undefined;
+}
+
+function errorStatus(error: unknown): number | undefined {
+  const status = errorValue(error, "status");
+  return typeof status === "number" ? status : undefined;
+}
+
+function errorCode(error: unknown): string {
+  const code = errorValue(error, "code");
+  return typeof code === "string" ? code : "";
+}
+
+function errorName(error: unknown): string {
+  const name = errorValue(error, "name");
+  if (typeof name === "string") {
+    return name;
+  }
+  return error instanceof Error ? error.name : "";
+}
+
+function errorMessage(error: unknown): string {
+  const message = errorValue(error, "message");
+  if (typeof message === "string") {
+    return message;
+  }
+  return error instanceof Error ? error.message : String(error);
+}
+
+function collectErrorMessages(error: unknown, seen = new Set<unknown>()): string[] {
+  if (!error || seen.has(error)) {
+    return [];
+  }
+  seen.add(error);
+  const messages = [errorMessage(error)];
+  const cause = errorValue(error, "cause");
+  if (cause) {
+    messages.push(...collectErrorMessages(cause, seen));
+  }
+  return messages.filter((message) => message.trim().length > 0);
+}
+
+export function formatModelProviderError(error: unknown): string {
+  const status = errorStatus(error);
+  const code = errorCode(error);
+  const name = errorName(error);
+  const messages = [...new Set(collectErrorMessages(error))].slice(0, 3).join(" | ");
+  const parts = [];
+  if (name) {
+    parts.push(name);
+  }
+  if (status !== undefined) {
+    parts.push(`status=${status}`);
+  }
+  if (code) {
+    parts.push(`code=${code}`);
+  }
+  if (messages) {
+    parts.push(messages);
+  }
+  return parts.join(": ") || String(error);
+}
+
+function retryableMessage(error: unknown): string {
+  return collectErrorMessages(error).join("\n").toLowerCase();
+}
+
+function isUnsupportedToolCallOptionError(error: unknown): boolean {
+  if (errorStatus(error) !== 400) {
+    return false;
+  }
+  const message = retryableMessage(error);
+  return (
+    message.includes("parallel_tool_calls") ||
+    message.includes("max_tool_calls") ||
+    message.includes("extra_forbidden") ||
+    message.includes("unknown field") ||
+    message.includes("unrecognized") ||
+    message.includes("unexpected")
+  );
+}
+
+export function isRetryableModelProviderError(error: unknown): boolean {
+  const status = errorStatus(error);
+  if (status !== undefined) {
+    return status === 408 || status === 409 || status === 425 || status === 429 || status >= 500;
+  }
+  const name = errorName(error).toLowerCase();
+  const code = errorCode(error).toLowerCase();
+  const message = retryableMessage(error);
+  return (
+    name.includes("connection") ||
+    name.includes("timeout") ||
+    code.includes("timeout") ||
+    code.includes("econn") ||
+    code.includes("enet") ||
+    code.includes("eai_again") ||
+    message.includes("connection error") ||
+    message.includes("fetch failed") ||
+    message.includes("socket") ||
+    message.includes("timeout") ||
+    message.includes("timed out") ||
+    message.includes("econnrefused") ||
+    message.includes("econnreset") ||
+    message.includes("und_err")
+  );
+}
+
+async function withModelProviderRetry<T>(
+  config: AgentConfig,
+  operation: string,
+  request: () => Promise<T>,
+): Promise<T> {
+  const attempts = Math.max(1, config.openai.maxRetries + 1);
+  const initialDelayMs = Math.max(100, config.openai.retryInitialDelayMs);
+  let lastError: unknown;
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try {
+      return await request();
+    } catch (error) {
+      lastError = error;
+      if (attempt >= attempts || !isRetryableModelProviderError(error)) {
+        break;
+      }
+      const jitter = Math.floor(Math.random() * 250);
+      const delayMs = Math.min(30_000, initialDelayMs * 2 ** (attempt - 1)) + jitter;
+      console.warn(
+        `[openai] ${operation} failed (${attempt}/${attempts}): ${formatModelProviderError(error)}. Retrying in ${delayMs}ms.`,
+      );
+      await sleep(delayMs);
+    }
+  }
+  throw lastError;
+}
+
+function toolCallCompatibilityFallbackBody(body: Record<string, unknown>): Record<string, unknown> | undefined {
+  if (!("parallel_tool_calls" in body) && !("max_tool_calls" in body)) {
+    return undefined;
+  }
+  const fallback = { ...body };
+  delete fallback.parallel_tool_calls;
+  delete fallback.max_tool_calls;
+  return fallback;
+}
+
+async function withProviderBodyRequest<T>(
+  config: AgentConfig,
+  operation: string,
+  body: Record<string, unknown>,
+  request: (body: Record<string, unknown>) => Promise<T>,
+): Promise<T> {
+  try {
+    return await withModelProviderRetry(config, operation, () => request(body));
+  } catch (error) {
+    const fallbackBody = toolCallCompatibilityFallbackBody(body);
+    if (!fallbackBody || !isUnsupportedToolCallOptionError(error)) {
+      throw error;
+    }
+    console.warn(
+      `[openai] ${operation} rejected native multi-tool options: ${formatModelProviderError(
+        error,
+      )}. Retrying without parallel_tool_calls/max_tool_calls.`,
+    );
+    return withModelProviderRetry(config, `${operation}.compat`, () => request(fallbackBody));
+  }
 }
 
 function resultText(result: ToolResult): string {
@@ -778,14 +952,16 @@ export class ResponsesModelProvider implements ModelProvider {
       body.text = responsesTextFormat("minecraft_agent_turn", AGENT_TURN_SCHEMA);
     } else {
       body.tools = input.tools;
-      body.parallel_tool_calls = false;
+      body.parallel_tool_calls = this.config.openai.parallelToolCalls;
       body.max_tool_calls = Math.max(1, this.config.loop.maxToolCallsPerTurn);
     }
     if (this.config.openai.reasoningEffort) {
       body.reasoning = { effort: this.config.openai.reasoningEffort };
     }
     applyProviderExtraBody(body, this.config);
-    const response = await this.client.responses.create(body as never);
+    const response = await withProviderBodyRequest(this.config, "responses.start", body, (requestBody) =>
+      this.client.responses.create(requestBody as never),
+    );
     this.previousResponseId = response.id;
     const nativeToolCalls = extractResponsesToolCalls(response);
     this.previousTurnUsedNativeToolCalls = nativeToolCalls.length > 0;
@@ -829,7 +1005,7 @@ export class ResponsesModelProvider implements ModelProvider {
       body.text = responsesTextFormat("minecraft_agent_turn", AGENT_TURN_SCHEMA);
     } else {
       body.tools = input.tools;
-      body.parallel_tool_calls = false;
+      body.parallel_tool_calls = this.config.openai.parallelToolCalls;
       body.max_tool_calls = Math.max(1, this.config.loop.maxToolCallsPerTurn);
     }
     if (this.previousResponseId) {
@@ -839,7 +1015,9 @@ export class ResponsesModelProvider implements ModelProvider {
       body.reasoning = { effort: this.config.openai.reasoningEffort };
     }
     applyProviderExtraBody(body, this.config);
-    const response = await this.client.responses.create(body as never);
+    const response = await withProviderBodyRequest(this.config, "responses.continue", body, (requestBody) =>
+      this.client.responses.create(requestBody as never),
+    );
     this.previousResponseId = response.id;
     const nativeToolCalls = extractResponsesToolCalls(response);
     this.previousTurnUsedNativeToolCalls = nativeToolCalls.length > 0;
@@ -857,7 +1035,9 @@ export class ResponsesModelProvider implements ModelProvider {
       body.text = responsesTextFormat("minecraft_agent_summary", SUMMARY_SCHEMA);
     }
     applyProviderExtraBody(body, this.config);
-    const response = await this.client.responses.create(body as never);
+    const response = await withProviderBodyRequest(this.config, "responses.summarize", body, (requestBody) =>
+      this.client.responses.create(requestBody as never),
+    );
     return parseStructuredSummary(extractResponsesText(response));
   }
 
@@ -875,7 +1055,9 @@ export class ResponsesModelProvider implements ModelProvider {
       body.reasoning = { effort: this.config.openai.reasoningEffort };
     }
     applyProviderExtraBody(body, this.config);
-    const response = await this.client.responses.create(body as never);
+    const response = await withProviderBodyRequest(this.config, "responses.draftSkill", body, (requestBody) =>
+      this.client.responses.create(requestBody as never),
+    );
     return parseSkillDraft(extractResponsesText(response));
   }
 }
@@ -971,7 +1153,9 @@ export class ChatCompletionsModelProvider implements ModelProvider {
       body.response_format = chatResponseFormat("minecraft_agent_summary", SUMMARY_SCHEMA);
     }
     applyProviderExtraBody(body, this.config);
-    const completion = await this.client.chat.completions.create(body as never);
+    const completion = await withProviderBodyRequest(this.config, "chat.summarize", body, (requestBody) =>
+      this.client.chat.completions.create(requestBody as never),
+    );
     return parseStructuredSummary(extractChatText(completion));
   }
 
@@ -988,7 +1172,9 @@ export class ChatCompletionsModelProvider implements ModelProvider {
       body.response_format = chatResponseFormat("minecraft_skill_draft", SKILL_DRAFT_SCHEMA);
     }
     applyProviderExtraBody(body, this.config);
-    const completion = await this.client.chat.completions.create(body as never);
+    const completion = await withProviderBodyRequest(this.config, "chat.draftSkill", body, (requestBody) =>
+      this.client.chat.completions.create(requestBody as never),
+    );
     return parseSkillDraft(extractChatText(completion));
   }
 
@@ -1001,11 +1187,13 @@ export class ChatCompletionsModelProvider implements ModelProvider {
       body.response_format = chatResponseFormat("minecraft_agent_turn", AGENT_TURN_SCHEMA);
     } else {
       body.tools = toChatTools(tools);
-      body.parallel_tool_calls = false;
+      body.parallel_tool_calls = this.config.openai.parallelToolCalls;
       body.tool_choice = "auto";
     }
     applyProviderExtraBody(body, this.config);
-    const completion = await this.client.chat.completions.create(body as never);
+    const completion = await withProviderBodyRequest(this.config, "chat.turn", body, (requestBody) =>
+      this.client.chat.completions.create(requestBody as never),
+    );
     const message = completion.choices?.[0]?.message;
     const nativeToolCalls = extractChatToolCalls(completion);
     const rawText = extractChatRawText(completion);

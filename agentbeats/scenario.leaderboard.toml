@@ -1,0 +1,19 @@
+[green_agent]
+agentbeats_id = "019ca14a-10e7-70b2-8463-ca8c7e723735"
+env = { OPENAI_API_KEY = "${OPENAI_API_KEY}" }
+
+[[participants]]
+# Replace after registering this project's amber-manifest-purple.json5 on AgentBeats.
+agentbeats_id = "YOUR_PURPLE_AGENT_ID"
+name = "agent"
+env = {
+  API_KEY = "${API_KEY}",
+}
+# If you need an OpenAI-compatible endpoint, add these and set matching GitHub
+# Secrets in your fork:
+# OPENAI_BASE_URL = "${OPENAI_BASE_URL}"
+# OPENAI_MODEL = "${OPENAI_MODEL}"
+
+[config]
+task_category = "mining_and_collecting"
+max_steps = 600

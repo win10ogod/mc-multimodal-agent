@@ -187,7 +187,7 @@ async function commandStart(args: string[]): Promise<void> {
   const runScheduler = hasFlag(args, "--scheduler");
   const task = takeOption(args, "--task") ?? args.join(" ").trim();
   const session = await makeAgent();
-  const { bot, loop, tasks } = session;
+  const { bot, loop, tasks, config } = session;
   try {
     if (listenChat || runScheduler) {
       console.log("Background mode active. Press Ctrl+C to stop.");
@@ -196,6 +196,18 @@ async function commandStart(args: string[]): Promise<void> {
       }
       while (true) {
         await ensureBotInGame(session, "background loop");
+        if (config.combat.autoDefense) {
+          try {
+            const defense = await bot.combatPulse({ durationMs: 750, includePlayers: false, attack: true });
+            if (defense.attacks > 0 || defense.retreats > 0 || defense.foodUses > 0) {
+              console.log(
+                `auto defense: attacks=${defense.attacks} retreats=${defense.retreats} food=${defense.foodUses} threats_left=${defense.finalScan.threats.length}`,
+              );
+            }
+          } catch (error) {
+            console.error(`auto defense failed: ${errorMessage(error)}`);
+          }
+        }
         if (listenChat) {
           const guidance = bot.drainGuidance();
           for (const item of guidance) {
@@ -363,11 +375,33 @@ async function commandPing(): Promise<void> {
   console.log(JSON.stringify(result, null, 2));
 }
 
+async function commandAgentBeats(args: string[]): Promise<void> {
+  const { startAgentBeatsServer } = await import("./agentbeats/A2AServer");
+  const config = loadConfig();
+  const host = takeOption(args, "--host") ?? process.env.AGENTBEATS_HOST ?? "0.0.0.0";
+  const portRaw = takeOption(args, "--port") ?? process.env.AGENTBEATS_PORT ?? "9019";
+  const cardUrl = (takeOption(args, "--card-url") ?? process.env.AGENTBEATS_CARD_URL?.trim()) || undefined;
+  const port = Number.parseInt(portRaw, 10);
+  if (!Number.isFinite(port)) {
+    throw new Error(`Invalid agentbeats port: ${portRaw}`);
+  }
+  const server = await startAgentBeatsServer(config, { host, port, cardUrl });
+  await new Promise<void>((resolve) => {
+    const shutdown = () => {
+      console.log("[agentbeats] shutting down.");
+      server.close(() => resolve());
+    };
+    process.once("SIGINT", shutdown);
+    process.once("SIGTERM", shutdown);
+  });
+}
+
 function printHelp(): void {
   console.log(`Usage:
   mc-agent start --task "Collect wood and build a shelter"
   mc-agent start --interactive
   mc-agent start --listen-chat --scheduler
+  mc-agent agentbeats --host 0.0.0.0 --port 9019
   mc-agent blueprint list
   mc-agent catalog query oak
 	  mc-agent catalog upsert oak_planks visual=tan structural=true
@@ -406,6 +440,10 @@ async function main(): Promise<void> {
   }
   if (command === "ping") {
     await commandPing();
+    return;
+  }
+  if (command === "agentbeats") {
+    await commandAgentBeats(args);
     return;
   }
   throw new Error(`Unknown command: ${command}`);

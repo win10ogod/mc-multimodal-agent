@@ -16,6 +16,9 @@ export type AgentConfig = {
     captureRecipes: boolean;
     skipRecipePackets: boolean;
     keepAliveTimeoutMs: number;
+    pathfindTimeoutMs: number;
+    placementTimeoutMs: number;
+    placementRetries: number;
     autoReconnect: boolean;
     reconnectAttempts: number;
     reconnectDelayMs: number;
@@ -25,6 +28,10 @@ export type AgentConfig = {
     baseURL?: string;
     apiMode: "responses" | "chat";
     model: string;
+    requestTimeoutMs: number;
+    maxRetries: number;
+    retryInitialDelayMs: number;
+    parallelToolCalls: boolean;
     reasoningEffort?: "none" | "low" | "medium" | "high" | "xhigh";
     structuredOutputs: boolean;
     extraBody?: Record<string, unknown>;
@@ -39,6 +46,15 @@ export type AgentConfig = {
   chatGuidance: {
     enabled: boolean;
     trigger: string;
+  };
+  combat: {
+    pveEnabled: boolean;
+    allowPvp: boolean;
+    autoDefense: boolean;
+    scanRange: number;
+    attackRange: number;
+    lowHealth: number;
+    criticalHealth: number;
   };
   observability: {
     announcePlansInChat: boolean;
@@ -73,6 +89,7 @@ export type AgentConfig = {
     horizontalFovDeg: number;
     contextFrames: number;
     contextYawDeg: number;
+    contextSweep: boolean;
   };
   loop: {
     maxToolCalls: number;
@@ -84,10 +101,16 @@ export type AgentConfig = {
     checkpointEveryToolCalls: number;
     maxToolSequenceSteps: number;
     compactAfterMessages: number;
+    autoObserveAfterActions: boolean;
   };
   skillLearning: {
     autoRecord: boolean;
     minToolCalls: number;
+  };
+  agentbeats: {
+    modelEveryNSteps: number;
+    defaultHoldSteps: number;
+    maxHoldSteps: number;
   };
 };
 
@@ -131,7 +154,7 @@ function envJsonObject(name: string): Record<string, unknown> | undefined {
 export function loadConfig(projectRoot = process.cwd()): AgentConfig {
   const root = path.resolve(projectRoot);
   const stateDir = path.resolve(root, process.env.AGENT_STATE_DIR ?? "state");
-  const apiKey = process.env.OPENAI_API_KEY?.trim() ?? "";
+  const apiKey = process.env.OPENAI_API_KEY?.trim() || process.env.API_KEY?.trim() || "";
   const model = process.env.OPENAI_MODEL?.trim() || "gpt-5.4";
   const qwenDetected = /\bqwen(?:\/|-|3\.6)/i.test(model);
   const segmentTimeoutMs = envInt("AGENT_TASK_TIMEOUT_MS", 600_000);
@@ -150,6 +173,9 @@ export function loadConfig(projectRoot = process.cwd()): AgentConfig {
       captureRecipes: envBool("MC_CAPTURE_RECIPES", true),
       skipRecipePackets: envBool("MC_SKIP_RECIPE_PACKETS", envBool("MC_MODDED_TOLERANT", false)),
       keepAliveTimeoutMs: envInt("MC_KEEP_ALIVE_TIMEOUT_MS", 600_000),
+      pathfindTimeoutMs: envInt("MC_PATHFIND_TIMEOUT_MS", 15_000),
+      placementTimeoutMs: envInt("MC_PLACEMENT_TIMEOUT_MS", 15_000),
+      placementRetries: envInt("MC_PLACEMENT_RETRIES", 2),
       autoReconnect: envBool("MC_AUTO_RECONNECT", true),
       reconnectAttempts: envInt("MC_RECONNECT_ATTEMPTS", 8),
       reconnectDelayMs: envInt("MC_RECONNECT_DELAY_MS", 5_000),
@@ -162,6 +188,10 @@ export function loadConfig(projectRoot = process.cwd()): AgentConfig {
         undefined,
       apiMode: process.env.OPENAI_API_MODE === "chat" ? "chat" : "responses",
       model,
+      requestTimeoutMs: envInt("OPENAI_REQUEST_TIMEOUT_MS", 120_000),
+      maxRetries: envInt("OPENAI_MAX_RETRIES", 5),
+      retryInitialDelayMs: envInt("OPENAI_RETRY_INITIAL_DELAY_MS", 1_000),
+      parallelToolCalls: envBool("OPENAI_PARALLEL_TOOL_CALLS", true),
       reasoningEffort:
         (process.env.OPENAI_REASONING_EFFORT?.trim() as AgentConfig["openai"]["reasoningEffort"]) ||
         "medium",
@@ -186,6 +216,15 @@ export function loadConfig(projectRoot = process.cwd()): AgentConfig {
     chatGuidance: {
       enabled: envBool("AGENT_CHAT_GUIDANCE", true),
       trigger: process.env.AGENT_CHAT_TRIGGER?.trim() || "!agent",
+    },
+    combat: {
+      pveEnabled: envBool("COMBAT_PVE_ENABLED", true),
+      allowPvp: envBool("COMBAT_ALLOW_PVP", false),
+      autoDefense: envBool("COMBAT_AUTO_DEFENSE", false),
+      scanRange: envFloat("COMBAT_SCAN_RANGE", 16),
+      attackRange: envFloat("COMBAT_ATTACK_RANGE", 3.2),
+      lowHealth: envFloat("COMBAT_LOW_HEALTH", 12),
+      criticalHealth: envFloat("COMBAT_CRITICAL_HEALTH", 6),
     },
     observability: {
       announcePlansInChat: envBool("AGENT_ANNOUNCE_PLANS_IN_CHAT", true),
@@ -220,6 +259,7 @@ export function loadConfig(projectRoot = process.cwd()): AgentConfig {
       horizontalFovDeg: envFloat("VISION_HORIZONTAL_FOV_DEG", 90),
       contextFrames: envInt("VISION_CONTEXT_FRAMES", 3),
       contextYawDeg: envFloat("VISION_CONTEXT_YAW_DEG", 42),
+      contextSweep: envBool("VISION_CONTEXT_SWEEP", true),
     },
     loop: {
       maxToolCalls: envInt("AGENT_MAX_TOOL_CALLS", 96),
@@ -231,16 +271,22 @@ export function loadConfig(projectRoot = process.cwd()): AgentConfig {
       checkpointEveryToolCalls: envInt("AGENT_CHECKPOINT_EVERY_TOOL_CALLS", 24),
       maxToolSequenceSteps: envInt("AGENT_MAX_TOOL_SEQUENCE_STEPS", 16),
       compactAfterMessages: envInt("AGENT_COMPACT_AFTER_MESSAGES", 120),
+      autoObserveAfterActions: envBool("AGENT_AUTO_OBSERVE_AFTER_ACTIONS", true),
     },
     skillLearning: {
       autoRecord: envBool("AGENT_AUTO_RECORD_SKILLS", true),
       minToolCalls: envInt("AGENT_AUTO_SKILL_MIN_TOOL_CALLS", 2),
+    },
+    agentbeats: {
+      modelEveryNSteps: envInt("AGENTBEATS_MODEL_EVERY_N_STEPS", 4),
+      defaultHoldSteps: envInt("AGENTBEATS_DEFAULT_HOLD_STEPS", 3),
+      maxHoldSteps: envInt("AGENTBEATS_MAX_HOLD_STEPS", 12),
     },
   };
 }
 
 export function assertRunnableConfig(config: AgentConfig): void {
   if (!config.openai.apiKey) {
-    throw new Error("OPENAI_API_KEY is required. Copy .env.example to .env and set it.");
+    throw new Error("OPENAI_API_KEY or API_KEY is required. Copy .env.example to .env and set it.");
   }
 }

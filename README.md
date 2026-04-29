@@ -40,7 +40,16 @@ OPENAI_API_MODE=chat
 OPENAI_BASE_URL=http://localhost:8000/v1
 OPENAI_MODEL=your-vision-tool-model
 OPENAI_STRUCTURED_OUTPUTS=true
+OPENAI_REQUEST_TIMEOUT_MS=120000
+OPENAI_MAX_RETRIES=5
+OPENAI_RETRY_INITIAL_DELAY_MS=1000
+OPENAI_PARALLEL_TOOL_CALLS=true
 ```
+
+Transient model transport failures such as local server restarts, socket resets,
+timeouts, `429`, and `5xx` responses are retried with exponential backoff. If
+the provider is still unavailable after retries, the current task is stopped
+with a checkpoint instead of crashing the background chat loop.
 
 When structured outputs are enabled, each agent turn is constrained to this shape. Use `tool_call` to execute one tool, or `final` for a user-facing answer:
 
@@ -102,6 +111,7 @@ This skips parsing server recipe payloads that often contain modded item compone
 npm run dev -- start --task "Collect wood and build a small shelter"
 npm run dev -- start --interactive
 npm run dev -- start --listen-chat --scheduler
+npm run dev -- agentbeats --host 0.0.0.0 --port 9019
 npm run dev -- blueprint list
 npm run dev -- catalog query oak
 npm run dev -- catalog upsert oak_planks visual=tan structural=true
@@ -185,13 +195,106 @@ Use these to control batching and visual context:
 
 ```env
 AGENT_MAX_TOOL_CALLS_PER_TURN=8
+AGENT_AUTO_OBSERVE_AFTER_ACTIONS=true
 VISION_CONTEXT_FRAMES=3
 VISION_CONTEXT_YAW_DEG=42
+VISION_CONTEXT_SWEEP=true
 ```
+
+`OPENAI_PARALLEL_TOOL_CALLS=true` allows compatible Chat Completions and
+Responses models to return multiple native tool calls in one model turn. The
+runtime still executes them in order and feeds each result back to the model.
+`AGENT_AUTO_OBSERVE_AFTER_ACTIONS=true` appends post-action status, navigation
+state, and a fresh visual frame to movement, digging, placing, combat, crafting,
+and skill-execution tool results, so the next model turn does not have to guess
+what changed.
 
 `VISION_CONTEXT_FRAMES=3` sends center, left, and right images on the first model
 turn of each segment. Screen-coordinate tools still target the restored center
-view.
+view. `VISION_CONTEXT_SWEEP=true` means the bot physically turns for those side
+images; set it to `false` if you want smoother movement and only the current
+center image during active tasks.
+
+Pathfinding skips work when the bot is already close enough to the target, and
+`MC_PATHFIND_TIMEOUT_MS=15000` prevents unreachable goals from freezing a task.
+Placement tools do not trust mineflayer's fixed 5 second `blockUpdate` wait;
+they send the place action, then verify the target block through world state.
+Tune this with `MC_PLACEMENT_TIMEOUT_MS=15000` and `MC_PLACEMENT_RETRIES=2`.
+
+For long movement, prefer non-blocking navigation so the agent can keep seeing
+and deciding while the bot walks:
+
+- `pathfind_to_block` / `pathfind_screen` with `background=true` starts walking
+  and returns immediately.
+- `navigation_start` starts walking to an explicit position and returns
+  immediately.
+- `navigation_status` reports `running`, `arrived`, `skipped`, `timeout`,
+  `reset`, or `stopped`, plus distance and movement state.
+- `navigation_stop` cancels the current background path or follow goal.
+
+Use blocking pathfinding only when the next tool must act immediately after
+arrival, such as digging one exact target or placing against one exact face.
+
+## AgentBeats Leaderboard
+
+The Minecraft AgentBeats leaderboard expects a Purple Agent A2A service, not a
+mineflayer bot joining your own server. This project now includes an adapter:
+
+```bash
+npm run dev -- agentbeats --host 0.0.0.0 --port 9019
+curl http://127.0.0.1:9019/.well-known/agent-card.json
+```
+
+The adapter receives MCU `init` and `obs` JSON messages, sends the base64 frame
+to your multimodal OpenAI-compatible model, and returns the leaderboard's env
+action format: `forward`, `attack`, `use`, `hotbar.*`, and `camera`.
+
+Useful settings:
+
+```env
+OPENAI_API_KEY=...
+# API_KEY=... is also accepted for AgentBeats scenario/Amber configs.
+OPENAI_API_MODE=chat
+OPENAI_MODEL=your-vision-model
+OPENAI_BASE_URL=
+OPENAI_STRUCTURED_OUTPUTS=true
+AGENTBEATS_MODEL_EVERY_N_STEPS=4
+AGENTBEATS_DEFAULT_HOLD_STEPS=3
+AGENTBEATS_MAX_HOLD_STEPS=12
+```
+
+`AGENTBEATS_MODEL_EVERY_N_STEPS` lets one model decision drive several simulator
+frames, which makes movement less twitchy and reduces repeated API calls. If the
+model/API is unavailable, the adapter returns a simple heuristic fallback action
+instead of timing out the evaluator.
+
+For submission packaging, use the included `Dockerfile` and edit
+`agentbeats/amber-manifest-purple.json5` to point at your published container
+image. After registering that manifest on AgentBeats, put the returned purple
+agent ID into `agentbeats/scenario.leaderboard.toml` and choose the task
+category. For local checks with the green agent repository, use
+`agentbeats/scenario.local.toml`.
+
+## Combat
+
+Combat is split into fast local reflex tools and slower LLM strategy. The model
+should use `combat_scan` to inspect threats, then `combat_pulse` for short
+low-latency PVE/PVP action loops. `combat_pulse` can equip a weapon, attack,
+eat food, and retreat without waiting for a model turn between each tick.
+
+```env
+COMBAT_PVE_ENABLED=true
+COMBAT_ALLOW_PVP=false
+COMBAT_AUTO_DEFENSE=false
+COMBAT_SCAN_RANGE=16
+COMBAT_ATTACK_RANGE=3.2
+COMBAT_LOW_HEALTH=12
+COMBAT_CRITICAL_HEALTH=6
+```
+
+PVP player targeting is disabled unless `COMBAT_ALLOW_PVP=true`. Optional
+`COMBAT_AUTO_DEFENSE=true` runs short PVE defense pulses during background idle
+loops, but it is still a baseline survival system, not competitive PVP AI.
 
 ## Memory
 

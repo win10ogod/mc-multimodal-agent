@@ -1,0 +1,52 @@
+{
+  manifest_version: "0.1.0",
+  program: {
+    image: "ghcr.io/win10ogod/mc-multimodal-agent:latest",
+    entrypoint: [
+      "node",
+      "dist/index.js",
+      "agentbeats",
+      "--host",
+      "0.0.0.0",
+      "--port",
+      "9019"
+    ],
+    env: {
+      OPENAI_API_KEY: "${config.api_key}",
+      API_KEY: "${config.api_key}",
+      OPENAI_BASE_URL: "${config.openai_base_url}",
+      OPENAI_MODEL: "${config.openai_model}",
+      OPENAI_API_MODE: "chat",
+      OPENAI_STRUCTURED_OUTPUTS: "true",
+      OPENAI_REQUEST_TIMEOUT_MS: "180000",
+      OPENAI_MAX_RETRIES: "6",
+      AGENTBEATS_MODEL_EVERY_N_STEPS: "${config.model_every_n_steps}",
+      AGENTBEATS_DEFAULT_HOLD_STEPS: "${config.default_hold_steps}",
+      AGENTBEATS_MAX_HOLD_STEPS: "${config.max_hold_steps}"
+    },
+    network: {
+      endpoints: [
+        { name: "endpoint", port: 9019 }
+      ]
+    }
+  },
+  config_schema: {
+    type: "object",
+    properties: {
+      api_key: { type: "string", secret: true },
+      openai_base_url: { type: "string", default: "" },
+      openai_model: { type: "string", default: "gpt-5.4" },
+      model_every_n_steps: { type: "string", default: "4" },
+      default_hold_steps: { type: "string", default: "3" },
+      max_hold_steps: { type: "string", default: "12" }
+    },
+    required: ["api_key"],
+    additionalProperties: false
+  },
+  provides: {
+    a2a: { kind: "a2a", endpoint: "endpoint" }
+  },
+  exports: {
+    a2a: "a2a"
+  }
+}
