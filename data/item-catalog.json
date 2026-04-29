@@ -1,0 +1,32 @@
+{
+  "schemaVersion": 1,
+  "records": {
+    "crafting_table": {
+      "name": "crafting_table",
+      "kind": "item",
+      "aliases": [
+        "工作檯"
+      ],
+      "fields": {
+        "recipe": "2x2 oak_planks",
+        "requires": "oak_planks"
+      },
+      "createdAt": "2026-04-29T09:46:20.244Z",
+      "updatedAt": "2026-04-29T09:46:20.244Z"
+    },
+    "oak_planks": {
+      "name": "oak_planks",
+      "kind": "item",
+      "aliases": [
+        "oak_plank",
+        "橡木木板"
+      ],
+      "fields": {
+        "recipe": "crafting from oak_log",
+        "requires": "oak_log"
+      },
+      "createdAt": "2026-04-29T09:46:24.852Z",
+      "updatedAt": "2026-04-29T09:46:24.852Z"
+    }
+  }
+}
