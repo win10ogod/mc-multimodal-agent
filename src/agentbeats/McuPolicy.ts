@@ -35,6 +35,7 @@ type McuContextState = {
   lastAction: McuEnvAction;
   holdUntilStep: number;
   recentActions: McuEnvAction[];
+  recentObservationImages: string[];
 };
 
 const ACTION_PAYLOAD_PREFIX = {
@@ -91,6 +92,14 @@ function chatResponseFormat(name: string, schema: Record<string, unknown>): Reco
       schema,
     },
   };
+}
+
+function chatBodySignature(body: Record<string, unknown>): string {
+  return [
+    "max_tokens" in body ? "max_tokens" : "",
+    "max_completion_tokens" in body ? "max_completion_tokens" : "",
+    "response_format" in body ? "response_format" : "",
+  ].join("|");
 }
 
 function extractChatRawText(completion: unknown): string {
@@ -274,24 +283,151 @@ function shouldUseModelOnStep(step: number, modelEveryNSteps: number): boolean {
   return step <= 0 || step % Math.max(1, modelEveryNSteps) === 0;
 }
 
+function taskKind(taskText: string): string {
+  const task = taskText.toLowerCase();
+  if (/horizontal/.test(task)) {
+    return "mine_horizontally";
+  }
+  if (/obsidian/.test(task)) {
+    return "mine_obsidian";
+  }
+  if (/diamond/.test(task) && /ore|mine|find/.test(task)) {
+    return "mine_diamond_ore";
+  }
+  if (/grass/.test(task)) {
+    return "collect_grass";
+  }
+  if (/wool|shear|sheep/.test(task)) {
+    return "collect_wool";
+  }
+  if (/stone/.test(task)) {
+    return "cut_stone";
+  }
+  return "";
+}
+
+export function taskSpecificGuidance(taskText: string): string {
+  switch (taskKind(taskText)) {
+    case "mine_horizontally":
+      return [
+        "Task strategy: mine a straight horizontal tunnel.",
+        "Keep yaw steady, center reachable block faces, hold attack until blocks break, then advance cautiously.",
+      ].join(" ");
+    case "mine_obsidian":
+      return [
+        "Task strategy: obsidian takes a long continuous mine action with the correct pickaxe.",
+        "Center visible obsidian or likely dark floor-level block faces and hold attack instead of wandering.",
+      ].join(" ");
+    case "mine_diamond_ore":
+      return [
+        "Task strategy: diamond ore requires a suitable pickaxe.",
+        "Search with small camera changes, center visible diamond ore, then hold attack until it breaks.",
+      ].join(" ");
+    case "collect_grass":
+      return "Task strategy: move through visible tall grass patches and break them with the equipped tool.";
+    case "collect_wool":
+      return "Task strategy: move close to visible sheep, center the sheep, and use rather than attack.";
+    case "cut_stone":
+      return "Task strategy: center reachable stone block faces and hold attack repeatedly until stone breaks.";
+    default:
+      return "";
+  }
+}
+
+function isMiningLikeTask(taskText: string): boolean {
+  return /mine|mining|dig|stone|cobble|diamond|iron|coal|ore|obsidian|dirt|wood|log|tree|grass|挖|礦|石|木|樹|草/.test(
+    taskText.toLowerCase(),
+  );
+}
+
+function isWoolTask(taskText: string): boolean {
+  return /wool|shear|sheep|羊毛|剪羊|綿羊/.test(taskText.toLowerCase());
+}
+
+function isBuildingLikeTask(taskText: string): boolean {
+  return /build|place|house|hut|tower|bridge|造|建|放置/.test(taskText.toLowerCase());
+}
+
+function hasPhysicalIntent(action: McuEnvAction): boolean {
+  return (
+    MCU_BUTTON_KEYS.some((key) => action[key] === 1) ||
+    Math.abs(action.camera[0]) >= 0.1 ||
+    Math.abs(action.camera[1]) >= 0.1
+  );
+}
+
+function repairDecisionForTask(decision: McuPolicyDecision, taskText: string, step: number): McuPolicyDecision {
+  const action = normalizeMcuAction(decision.action);
+  action.drop = 0;
+  action.inventory = 0;
+
+  const woolTask = isWoolTask(taskText);
+  const miningLikeTask = isMiningLikeTask(taskText);
+  const buildingLikeTask = isBuildingLikeTask(taskText);
+
+  if (woolTask && action.attack && !action.use) {
+    action.attack = 0;
+    action.use = 1;
+  }
+
+  if (miningLikeTask && !woolTask && !buildingLikeTask && action.use && !action.attack) {
+    action.use = 0;
+    action.attack = 1;
+  }
+
+  if (!hasPhysicalIntent(action)) {
+    action.forward = miningLikeTask || woolTask ? 1 : 0;
+    action.sprint = 0;
+    action.camera = [0, step % 32 < 16 ? 8 : -8];
+  }
+
+  let holdSteps = decision.hold_steps;
+  if (!holdSteps || holdSteps < 1) {
+    holdSteps = action.attack ? 6 : action.use ? 2 : 3;
+  }
+  if (action.attack && /obsidian/.test(taskText.toLowerCase())) {
+    holdSteps = Math.max(holdSteps, 10);
+  }
+
+  return {
+    ...ACTION_PAYLOAD_PREFIX,
+    hold_steps: holdSteps,
+    action,
+  };
+}
+
 function heuristicAction(taskText: string, step: number): McuPolicyDecision {
   const task = taskText.toLowerCase();
   const action = defaultMcuAction();
   const scanYaw = step % 32 < 16 ? 8 : -8;
 
+  if (/wool|shear|sheep|羊毛|剪羊|綿羊/.test(task)) {
+    action.forward = step % 18 < 12 ? 1 : 0;
+    action.use = step % 18 >= 8 ? 1 : 0;
+    action.camera = [step % 30 < 10 ? 0 : 2, scanYaw];
+    return { ...ACTION_PAYLOAD_PREFIX, hold_steps: action.use ? 2 : 3, action };
+  }
+
+  if (/grass|草/.test(task)) {
+    action.forward = 1;
+    action.attack = step % 20 >= 4 ? 1 : 0;
+    action.camera = [step % 20 >= 4 ? 5 : 0, scanYaw];
+    return { ...ACTION_PAYLOAD_PREFIX, hold_steps: action.attack ? 4 : 2, action };
+  }
+
   if (/tree|wood|log|oak|spruce|birch|jungle|acacia|dark oak|mangrove|cherry|木|樹|砍/.test(task)) {
     action.forward = 1;
-    action.sprint = 1;
+    action.sprint = step % 30 < 10 ? 1 : 0;
     action.attack = step % 24 >= 12 ? 1 : 0;
-    action.camera = [step % 24 >= 12 ? 4 : 0, step % 24 >= 12 ? 0 : scanYaw];
+    action.camera = [step % 24 >= 12 ? 2 : -2, step % 24 >= 12 ? 0 : scanYaw];
     return { ...ACTION_PAYLOAD_PREFIX, hold_steps: action.attack ? 6 : 3, action };
   }
 
   if (/mine|mining|stone|cobble|diamond|iron|coal|ore|dig|挖|礦|石/.test(task)) {
-    action.forward = step % 20 < 8 ? 1 : 0;
+    action.forward = step % 24 < 8 ? 1 : 0;
     action.attack = 1;
-    action.camera = [step % 20 < 8 ? 8 : 10, step % 28 < 14 ? 8 : -8];
-    return { ...ACTION_PAYLOAD_PREFIX, hold_steps: 5, action };
+    action.camera = [step % 24 < 8 ? 6 : 2, step % 40 < 20 ? 6 : -6];
+    return { ...ACTION_PAYLOAD_PREFIX, hold_steps: /obsidian/.test(task) ? 10 : 5, action };
   }
 
   if (/build|place|house|hut|tower|bridge|造|建|放置/.test(task)) {
@@ -377,6 +513,7 @@ export class McuVisualPolicy {
       lastAction: defaultMcuAction(),
       holdUntilStep: -1,
       recentActions: [],
+      recentObservationImages: [],
     });
     console.log(`[agentbeats] init context=${contextId} task=${JSON.stringify(taskText)}`);
     return JSON.stringify({
@@ -393,10 +530,16 @@ export class McuVisualPolicy {
       lastAction: defaultMcuAction(),
       holdUntilStep: -1,
       recentActions: [],
+      recentObservationImages: [],
     };
     this.contexts.set(contextId, state);
 
     const step = Math.max(0, Number.isFinite(payload.step) ? Number(payload.step) : 0);
+    if (payload.obs) {
+      state.recentObservationImages.push(payload.obs);
+      state.recentObservationImages = state.recentObservationImages.slice(-3);
+    }
+
     if (step <= state.holdUntilStep && !shouldUseModelOnStep(step, this.config.agentbeats.modelEveryNSteps)) {
       return { ...ACTION_PAYLOAD_PREFIX, action: state.lastAction, hold_steps: 1 };
     }
@@ -404,12 +547,13 @@ export class McuVisualPolicy {
     let decision: McuPolicyDecision | undefined;
     if (this.config.openai.apiKey && payload.obs) {
       try {
-        decision = await this.modelDecision(state, step, payload.obs);
+        decision = await this.modelDecision(state, step);
       } catch (error) {
         console.warn(`[agentbeats] model decision failed: ${formatModelProviderError(error)}. Using heuristic action.`);
       }
     }
     decision ??= heuristicAction(state.taskText, step);
+    decision = repairDecisionForTask(decision, state.taskText, step);
 
     const holdSteps = Math.max(
       1,
@@ -429,8 +573,24 @@ export class McuVisualPolicy {
     return { ...decision, hold_steps: holdSteps };
   }
 
-  private async modelDecision(state: McuContextState, step: number, obsBase64: string): Promise<McuPolicyDecision> {
-    const imageDataUrl = obsBase64.startsWith("data:image/") ? obsBase64 : `data:image/jpeg;base64,${obsBase64}`;
+  private async modelDecision(state: McuContextState, step: number): Promise<McuPolicyDecision> {
+    const imageParts = state.recentObservationImages.flatMap((obsBase64, index, images) => {
+      const imageDataUrl = obsBase64.startsWith("data:image/") ? obsBase64 : `data:image/jpeg;base64,${obsBase64}`;
+      const label = index === images.length - 1 ? "current frame" : `previous frame ${images.length - index - 1}`;
+      return [
+        {
+          type: "text",
+          text: `Image: ${label}.`,
+        },
+        {
+          type: "image_url",
+          image_url: {
+            url: imageDataUrl,
+            detail: "high",
+          },
+        },
+      ];
+    });
     const body: Record<string, unknown> = {
       model: this.config.openai.model,
       messages: [
@@ -448,22 +608,18 @@ export class McuVisualPolicy {
               type: "text",
               text: [
                 `Task: ${state.taskText || "(no task text provided)"}`,
+                taskSpecificGuidance(state.taskText),
                 `Step: ${step}`,
                 `Recent actions:\n${compactRecentActions(state.recentActions) || "none"}`,
-                "Choose the next action from the current image. Output only the strict JSON action payload.",
+                "Use visual evidence from the recent frames. Do not assume hidden map coordinates or benchmark-specific spawn layouts.",
+                "Choose the next action from the image sequence. Output only the strict JSON action payload.",
               ].join("\n\n"),
             },
-            {
-              type: "image_url",
-              image_url: {
-                url: imageDataUrl,
-                detail: "low",
-              },
-            },
+            ...imageParts,
           ],
         },
       ],
-      max_tokens: 700,
+      max_completion_tokens: 1_200,
     };
     if (this.config.openai.structuredOutputs) {
       body.response_format = chatResponseFormat("mcu_env_action", MCU_ACTION_SCHEMA as unknown as Record<string, unknown>);
@@ -483,20 +639,60 @@ export class McuVisualPolicy {
   }
 
   private async createChatCompletionWithFallback(body: Record<string, unknown>): Promise<unknown> {
+    let current = body;
+    const seen = new Set<string>();
+
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+      seen.add(chatBodySignature(current));
+      try {
+        return await withRetry(this.config, "agentbeats.chat", () =>
+          this.client.chat.completions.create(current as never),
+        );
+      } catch (error) {
+        const message = formatModelProviderError(error).toLowerCase();
+        const fallback = { ...current };
+
+        if (
+          message.includes("unsupported_parameter") &&
+          message.includes("max_completion_tokens") &&
+          "max_completion_tokens" in fallback
+        ) {
+          fallback.max_tokens = fallback.max_completion_tokens;
+          delete fallback.max_completion_tokens;
+          console.warn("[agentbeats] provider rejected max_completion_tokens; retrying with max_tokens.");
+        } else if (
+          message.includes("unsupported_parameter") &&
+          message.includes("max_tokens") &&
+          "max_tokens" in fallback
+        ) {
+          fallback.max_completion_tokens = fallback.max_tokens;
+          delete fallback.max_tokens;
+          console.warn("[agentbeats] provider rejected max_tokens; retrying with max_completion_tokens.");
+        } else if (
+          "response_format" in fallback &&
+          (message.includes("response_format") || message.includes("schema") || message.includes("structured"))
+        ) {
+          delete fallback.response_format;
+          console.warn("[agentbeats] provider rejected structured output; retrying MCU action request without response_format.");
+        } else {
+          throw error;
+        }
+
+        const signature = chatBodySignature(fallback);
+        if (seen.has(signature)) {
+          throw error;
+        }
+        current = fallback;
+      }
+    }
+
     try {
-      return await withRetry(this.config, "agentbeats.chat", () => this.client.chat.completions.create(body as never));
+      return await withRetry(this.config, "agentbeats.chat.final", () =>
+        this.client.chat.completions.create(current as never),
+      );
     } catch (error) {
-      if (!("response_format" in body)) {
-        throw error;
-      }
       const message = formatModelProviderError(error).toLowerCase();
-      if (!message.includes("response_format") && !message.includes("schema") && !message.includes("structured")) {
-        throw error;
-      }
-      const fallback = { ...body };
-      delete fallback.response_format;
-      console.warn("[agentbeats] provider rejected structured output; retrying MCU action request without response_format.");
-      return withRetry(this.config, "agentbeats.chat.compat", () => this.client.chat.completions.create(fallback as never));
+      throw new Error(`AgentBeats chat completion failed after compatibility retries: ${message}`);
     }
   }
 }

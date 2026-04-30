@@ -4,6 +4,7 @@ import {
   McuVisualPolicy,
   normalizeMcuAction,
   parseMcuActionText,
+  taskSpecificGuidance,
   toCompactMcuAgentActionPayload,
 } from "../src/agentbeats/McuPolicy";
 
@@ -51,6 +52,15 @@ aim at the block
     expect(payload.buttons).toHaveLength(1);
     expect(payload.camera).toEqual([64]);
     expect(payload.buttons[0]).toBeGreaterThan(0);
+  });
+
+  it("adds task strategy guidance without leaking benchmark layout assumptions", () => {
+    expect(taskSpecificGuidance("Mine horizontally")).toContain("horizontal tunnel");
+    expect(taskSpecificGuidance("Mine obsidian blocks for various crafting or building purposes.")).toContain(
+      "long continuous mine action",
+    );
+    expect(taskSpecificGuidance("Find and mine the diamond ore.")).toContain("suitable pickaxe");
+    expect(taskSpecificGuidance("Find and mine the diamond ore.")).not.toContain("already");
   });
 
   it("handles init and obs without an API key by falling back to heuristic actions", async () => {
