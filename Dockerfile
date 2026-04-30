@@ -29,4 +29,5 @@ COPY --from=build /app/blueprints ./blueprints
 COPY soul.md README.md ./
 
 EXPOSE 9019
-CMD ["node", "dist/index.js", "agentbeats", "--host", "0.0.0.0", "--port", "9019"]
+ENTRYPOINT ["node", "dist/index.js", "agentbeats"]
+CMD ["--host", "0.0.0.0", "--port", "9019"]

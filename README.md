@@ -270,10 +270,15 @@ instead of timing out the evaluator.
 
 For submission packaging, use the included `Dockerfile` and edit
 `agentbeats/amber-manifest-purple.json5` to point at your published container
-image. After registering that manifest on AgentBeats, put the returned purple
-agent ID into `agentbeats/scenario.leaderboard.toml` and choose the task
-category. For local checks with the green agent repository, use
-`agentbeats/scenario.local.toml`.
+image. The AgentBeats registration page only needs the Amber manifest URL; model
+API values are provided later by the leaderboard scenario, not on that page.
+
+For the official Minecraft leaderboard path, fork the leaderboard repo, add
+GitHub Actions secrets such as `API_KEY`, `OPENAI_BASE_URL`, `OPENAI_MODEL`, and
+`OPENAI_API_KEY` for the green agent, then put the returned purple agent ID into
+`agentbeats/scenario.leaderboard.toml`. The scenario's `env = { ... }` block is
+what passes those secrets into the container during the official run. For local
+checks with the green agent repository, use `agentbeats/scenario.local.toml`.
 
 ## Combat
 
