@@ -1,11 +1,14 @@
 [green_agent]
 agentbeats_id = "019ca14a-10e7-70b2-8463-ca8c7e723735"
-env = { OPENAI_API_KEY = "${OPENAI_API_KEY}" }
+
+[green_agent.env]
+OPENAI_API_KEY = "${OPENAI_API_KEY}"
+
+[[participants]]
+agentbeats_id = "019ca14a-10e7-70b2-8463-ca8c7e723735"
+name = "agent"
 
 [participants.env]
-# Replace after registering this project's amber-manifest-purple.json5 on AgentBeats.
-agentbeats_id = "YOUR_PURPLE_AGENT_ID"
-name = "agent"
 API_KEY = "${API_KEY}"
 OPENAI_API_KEY = "${API_KEY}"
 OPENAI_BASE_URL = "${OPENAI_BASE_URL}"
