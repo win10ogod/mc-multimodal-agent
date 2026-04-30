@@ -1,6 +1,11 @@
 import { describe, expect, it } from "vitest";
 import { loadConfig } from "../src/config";
-import { McuVisualPolicy, normalizeMcuAction, parseMcuActionText } from "../src/agentbeats/McuPolicy";
+import {
+  McuVisualPolicy,
+  normalizeMcuAction,
+  parseMcuActionText,
+  toCompactMcuAgentActionPayload,
+} from "../src/agentbeats/McuPolicy";
 
 describe("AgentBeats MCU policy", () => {
   it("parses action JSON after thinking markup", () => {
@@ -12,7 +17,7 @@ aim at the block
     expect(parsed?.action.forward).toBe(1);
     expect(parsed?.action.back).toBe(0);
     expect(parsed?.action.sprint).toBe(1);
-    expect(parsed?.action.camera).toEqual([3, 90]);
+    expect(parsed?.action.camera).toEqual([3, 10]);
   });
 
   it("normalizes invalid or conflicting action fields", () => {
@@ -32,7 +37,20 @@ aim at the block
     expect(action.right).toBe(0);
     expect(action["hotbar.1"]).toBe(1);
     expect(action["hotbar.2"]).toBe(0);
-    expect(action.camera).toEqual([0, -90]);
+    expect(action.camera).toEqual([0, -10]);
+  });
+
+  it("converts env actions to compact AgentBeats actions", () => {
+    const action = normalizeMcuAction({
+      forward: 1,
+      sprint: 1,
+      camera: [0, 8],
+    });
+    const payload = toCompactMcuAgentActionPayload(action);
+    expect(payload.action_type).toBe("agent");
+    expect(payload.buttons).toHaveLength(1);
+    expect(payload.camera).toEqual([64]);
+    expect(payload.buttons[0]).toBeGreaterThan(0);
   });
 
   it("handles init and obs without an API key by falling back to heuristic actions", async () => {
@@ -45,7 +63,8 @@ aim at the block
 
     const action = JSON.parse(await policy.handleText(JSON.stringify({ type: "obs", step: 0, obs: "" }), "ctx"));
     expect(action.type).toBe("action");
-    expect(action.action_type).toBe("env");
-    expect(action.action.forward).toBe(1);
+    expect(action.action_type).toBe("agent");
+    expect(action.buttons).toHaveLength(1);
+    expect(action.camera).toHaveLength(1);
   });
 });

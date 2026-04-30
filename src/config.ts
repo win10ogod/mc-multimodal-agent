@@ -151,11 +151,18 @@ function envJsonObject(name: string): Record<string, unknown> | undefined {
   return parsed as Record<string, unknown>;
 }
 
+function normalizeModelName(model: string): string {
+  if (/^gpt-/i.test(model) || /^o\d/i.test(model)) {
+    return model.toLowerCase();
+  }
+  return model;
+}
+
 export function loadConfig(projectRoot = process.cwd()): AgentConfig {
   const root = path.resolve(projectRoot);
   const stateDir = path.resolve(root, process.env.AGENT_STATE_DIR ?? "state");
   const apiKey = process.env.OPENAI_API_KEY?.trim() || process.env.API_KEY?.trim() || "";
-  const model = process.env.OPENAI_MODEL?.trim() || "gpt-5.4";
+  const model = normalizeModelName(process.env.OPENAI_MODEL?.trim() || "gpt-5.4");
   const qwenDetected = /\bqwen(?:\/|-|3\.6)/i.test(model);
   const segmentTimeoutMs = envInt("AGENT_TASK_TIMEOUT_MS", 600_000);
   const maxSegments = envInt("AGENT_MAX_TASK_SEGMENTS", 8);

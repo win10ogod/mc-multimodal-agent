@@ -11,7 +11,7 @@ import {
   MCU_ACTION_SCHEMA,
   MCU_BUTTON_KEYS,
   MCU_SYSTEM_PROMPT,
-  type McuActionPayload,
+  type McuCompactAgentActionPayload,
   type McuButtonKey,
   type McuEnvAction,
   type McuPolicyDecision,
@@ -37,10 +37,29 @@ type McuContextState = {
   recentActions: McuEnvAction[];
 };
 
-const ACTION_PAYLOAD_PREFIX: Pick<McuActionPayload, "type" | "action_type"> = {
+const ACTION_PAYLOAD_PREFIX = {
   type: "action",
   action_type: "env",
-};
+} as const;
+
+const MCU_CAMERA_BINS = 11;
+const MCU_CAMERA_NULL_BIN = Math.floor(MCU_CAMERA_BINS / 2);
+const MCU_CAMERA_MAX_DEG = 10;
+const MCU_CAMERA_BIN_SIZE_DEG = 2;
+
+const HOTBAR_GROUP = ["none", ...Array.from({ length: 9 }, (_, index) => `hotbar.${index + 1}`)];
+const BUTTON_GROUPS = [
+  HOTBAR_GROUP,
+  ["none", "forward", "back"],
+  ["none", "left", "right"],
+  ["none", "sprint", "sneak"],
+  ["none", "use"],
+  ["none", "drop"],
+  ["none", "attack"],
+  ["none", "jump"],
+  ["none", "camera"],
+] as const;
+const MCU_INVENTORY_BUTTON_INDEX = BUTTON_GROUPS.reduce((total, group) => total * group.length, 1);
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -177,7 +196,10 @@ export function normalizeMcuAction(value: unknown): McuEnvAction {
   }
 
   const camera = Array.isArray(source.camera) ? source.camera : [];
-  action.camera = [clampNumber(camera[0], -90, 90), clampNumber(camera[1], -90, 90)];
+  action.camera = [
+    clampNumber(camera[0], -MCU_CAMERA_MAX_DEG, MCU_CAMERA_MAX_DEG),
+    clampNumber(camera[1], -MCU_CAMERA_MAX_DEG, MCU_CAMERA_MAX_DEG),
+  ];
   return action;
 }
 
@@ -202,10 +224,49 @@ export function parseMcuActionText(text: string): McuPolicyDecision | undefined 
   return undefined;
 }
 
-function actionPayload(action: McuEnvAction): McuActionPayload {
+function cameraBin(value: number): number {
+  const clipped = Math.max(-MCU_CAMERA_MAX_DEG, Math.min(MCU_CAMERA_MAX_DEG, value));
+  return Math.max(
+    0,
+    Math.min(MCU_CAMERA_BINS - 1, Math.round((clipped + MCU_CAMERA_MAX_DEG) / MCU_CAMERA_BIN_SIZE_DEG)),
+  );
+}
+
+function chooseGroup(action: McuEnvAction, group: readonly string[]): string {
+  for (let index = group.length - 1; index >= 1; index -= 1) {
+    const key = group[index] as McuButtonKey;
+    if (action[key] === 1) {
+      return group[index];
+    }
+  }
+  return "none";
+}
+
+export function toCompactMcuAgentActionPayload(action: McuEnvAction): McuCompactAgentActionPayload {
+  const cameraX = cameraBin(action.camera[0]);
+  const cameraY = cameraBin(action.camera[1]);
+  const cameraIndex = cameraX * MCU_CAMERA_BINS + cameraY;
+
+  let buttonsIndex = 0;
+  if (action.inventory) {
+    buttonsIndex = MCU_INVENTORY_BUTTON_INDEX;
+  } else {
+    for (const group of BUTTON_GROUPS) {
+      const choice =
+        group === BUTTON_GROUPS[BUTTON_GROUPS.length - 1]
+          ? cameraIndex === MCU_CAMERA_NULL_BIN * MCU_CAMERA_BINS + MCU_CAMERA_NULL_BIN
+            ? "none"
+            : "camera"
+          : chooseGroup(action, group);
+      buttonsIndex = buttonsIndex * group.length + (group as readonly string[]).indexOf(choice);
+    }
+  }
+
   return {
-    ...ACTION_PAYLOAD_PREFIX,
-    action,
+    type: "action",
+    action_type: "agent",
+    buttons: [buttonsIndex],
+    camera: [cameraIndex],
   };
 }
 
@@ -216,7 +277,7 @@ function shouldUseModelOnStep(step: number, modelEveryNSteps: number): boolean {
 function heuristicAction(taskText: string, step: number): McuPolicyDecision {
   const task = taskText.toLowerCase();
   const action = defaultMcuAction();
-  const scanYaw = step % 32 < 16 ? 18 : -18;
+  const scanYaw = step % 32 < 16 ? 8 : -8;
 
   if (/tree|wood|log|oak|spruce|birch|jungle|acacia|dark oak|mangrove|cherry|木|樹|砍/.test(task)) {
     action.forward = 1;
@@ -229,7 +290,7 @@ function heuristicAction(taskText: string, step: number): McuPolicyDecision {
   if (/mine|mining|stone|cobble|diamond|iron|coal|ore|dig|挖|礦|石/.test(task)) {
     action.forward = step % 20 < 8 ? 1 : 0;
     action.attack = 1;
-    action.camera = [step % 20 < 8 ? 8 : 18, step % 28 < 14 ? 8 : -8];
+    action.camera = [step % 20 < 8 ? 8 : 10, step % 28 < 14 ? 8 : -8];
     return { ...ACTION_PAYLOAD_PREFIX, hold_steps: 5, action };
   }
 
@@ -238,7 +299,7 @@ function heuristicAction(taskText: string, step: number): McuPolicyDecision {
     action.use = step % 12 >= 8 ? 1 : 0;
     action.forward = step % 12 < 5 ? 1 : 0;
     action.jump = action.use;
-    action.camera = [action.use ? 32 : 8, step % 24 < 12 ? 10 : -10];
+    action.camera = [action.use ? 10 : 8, step % 24 < 12 ? 8 : -8];
     return { ...ACTION_PAYLOAD_PREFIX, hold_steps: action.use ? 2 : 3, action };
   }
 
@@ -297,7 +358,7 @@ export class McuVisualPolicy {
     }
     if (payload.type === "obs") {
       const decision = await this.handleObservation(contextId, payload as McuObservationPayload);
-      return JSON.stringify(actionPayload(decision.action));
+      return JSON.stringify(toCompactMcuAgentActionPayload(decision.action));
     }
 
     return JSON.stringify({

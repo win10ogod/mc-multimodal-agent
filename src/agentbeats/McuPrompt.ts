@@ -27,13 +27,22 @@ export type McuEnvAction = Record<McuButtonKey, 0 | 1> & {
   camera: [number, number];
 };
 
-export type McuActionPayload = {
+export type McuEnvActionPayload = {
   type: "action";
   action_type: "env";
   action: McuEnvAction;
 };
 
-export type McuPolicyDecision = McuActionPayload & {
+export type McuCompactAgentActionPayload = {
+  type: "action";
+  action_type: "agent";
+  buttons: [number];
+  camera: [number];
+};
+
+export type McuActionPayload = McuEnvActionPayload | McuCompactAgentActionPayload;
+
+export type McuPolicyDecision = McuEnvActionPayload & {
   hold_steps?: number;
 };
 
@@ -103,7 +112,7 @@ export const MCU_ACTION_SCHEMA = {
           type: "array",
           minItems: 2,
           maxItems: 2,
-          items: { type: "number", minimum: -90, maximum: 90 },
+          items: { type: "number", minimum: -10, maximum: 10 },
         },
       },
       required: [...MCU_BUTTON_KEYS, "camera"],
@@ -121,14 +130,14 @@ Action keys:
 - Movement: forward, back, left, right, jump, sneak, sprint. Values are 0 or 1.
 - Interaction: attack breaks blocks or hits enemies; use places or interacts; drop; inventory.
 - Hotbar: hotbar.1 through hotbar.9. Press at most one in a step.
-- camera is [delta_pitch, delta_yaw] in degrees. Negative pitch looks up, positive pitch looks down. Negative yaw turns left, positive yaw turns right.
+- camera is [delta_pitch, delta_yaw] in degrees, each between -10 and 10. Negative pitch looks up, positive pitch looks down. Negative yaw turns left, positive yaw turns right.
 
 Control rules:
 - Never press forward and back together.
 - Never press left and right together.
 - Sprint only with forward.
 - Hold attack across repeated steps when breaking a block.
-- Use small camera deltas for aim and medium deltas for searching.
+- Use small camera deltas for aim and search. Never output camera values outside -10..10.
 - If the target is not visible, scan with camera while moving cautiously.
 - For gathering wood/logs, search for trunks, center the crosshair on the log, move close, then hold attack.
 - For mining, look at reachable block faces and hold attack.
