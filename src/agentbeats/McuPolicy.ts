@@ -300,8 +300,29 @@ function taskKind(taskText: string): string {
   if (/wool|shear|sheep/.test(task)) {
     return "collect_wool";
   }
-  if (/stone/.test(task)) {
+  if (/stone/.test(task) && !/enchant|lapis|cobble.*craft/.test(task)) {
     return "cut_stone";
+  }
+  if (/craft|recipe|合成/.test(task)) {
+    return "crafting";
+  }
+  if (/smelt|furnace|熔/.test(task)) {
+    return "smelting";
+  }
+  if (/brew|potion|釀/.test(task)) {
+    return "brewing";
+  }
+  if (/enchant|附魔/.test(task)) {
+    return "enchanting";
+  }
+  if (/\bdrop\b|丟|扔/.test(task)) {
+    return "drop";
+  }
+  if (/throw|snowball/.test(task)) {
+    return "throw";
+  }
+  if (/sleep|bed/.test(task)) {
+    return "sleep";
   }
   return "";
 }
@@ -329,6 +350,39 @@ export function taskSpecificGuidance(taskText: string): string {
       return "Task strategy: move close to visible sheep, center the sheep, and use rather than attack.";
     case "cut_stone":
       return "Task strategy: center reachable stone block faces and hold attack repeatedly until stone breaks.";
+    case "crafting":
+      return [
+        "Task strategy: ingredients are already in your starting inventory.",
+        "First press inventory (E) to open the GUI. Inside the inventory, place ingredients in the 2x2 craft grid for simple recipes, or right-click (use) the crafting table for 3x3 recipes. Always start by setting inventory to 1 on step 0 unless you are clearly already inside the GUI.",
+      ].join(" ");
+    case "smelting":
+      return [
+        "Task strategy: a furnace and fuel are provided.",
+        "Approach the furnace (forward), then right-click it (use=1) to open the furnace GUI. Inside, place the raw item in the top slot and fuel in the bottom slot.",
+      ].join(" ");
+    case "brewing":
+      return [
+        "Task strategy: brewing requires a brewing stand, blaze powder, and ingredients.",
+        "Approach the brewing stand and right-click it (use=1) to open the GUI; place ingredients per the recipe.",
+      ].join(" ");
+    case "enchanting":
+      return [
+        "Task strategy: an enchanting table and lapis lazuli are provided.",
+        "Approach the table and right-click it (use=1) to open the enchant GUI; pick an enchantment slot.",
+      ].join(" ");
+    case "drop":
+      return [
+        "Task strategy: drop an item from your hotbar or inventory.",
+        "Press drop (Q, drop=1) directly to drop the held item; otherwise open inventory (E) first to select.",
+      ].join(" ");
+    case "throw":
+      return [
+        "Task strategy: select the throwable on the hotbar (e.g. hotbar.1), then right-click (use=1) to throw.",
+      ].join(" ");
+    case "sleep":
+      return [
+        "Task strategy: locate a bed, approach it, then right-click (use=1) on it. Only sleeps at night or in the Nether/End fails — assume night.",
+      ].join(" ");
     default:
       return "";
   }
@@ -356,21 +410,38 @@ function hasPhysicalIntent(action: McuEnvAction): boolean {
   );
 }
 
+function isCraftingLikeTask(taskText: string): boolean {
+  return /craft|recipe|smelt|brew|enchant|furnace|crafting[_ ]?table|enchanting[_ ]?table|inventory|物品欄|合成|熔煉|釀造|附魔/i.test(
+    taskText.toLowerCase(),
+  );
+}
+
+function isDropLikeTask(taskText: string): boolean {
+  return /\bdrop\b|throw|丟|扔|拋/i.test(taskText.toLowerCase());
+}
+
 function repairDecisionForTask(decision: McuPolicyDecision, taskText: string, step: number): McuPolicyDecision {
   const action = normalizeMcuAction(decision.action);
-  action.drop = 0;
-  action.inventory = 0;
 
   const woolTask = isWoolTask(taskText);
   const miningLikeTask = isMiningLikeTask(taskText);
   const buildingLikeTask = isBuildingLikeTask(taskText);
+  const craftingLikeTask = isCraftingLikeTask(taskText);
+  const dropLikeTask = isDropLikeTask(taskText);
+
+  if (!craftingLikeTask) {
+    action.inventory = 0;
+  }
+  if (!dropLikeTask) {
+    action.drop = 0;
+  }
 
   if (woolTask && action.attack && !action.use) {
     action.attack = 0;
     action.use = 1;
   }
 
-  if (miningLikeTask && !woolTask && !buildingLikeTask && action.use && !action.attack) {
+  if (miningLikeTask && !woolTask && !buildingLikeTask && !craftingLikeTask && action.use && !action.attack) {
     action.use = 0;
     action.attack = 1;
   }
@@ -400,6 +471,33 @@ function heuristicAction(taskText: string, step: number): McuPolicyDecision {
   const task = taskText.toLowerCase();
   const action = defaultMcuAction();
   const scanYaw = step % 32 < 16 ? 8 : -8;
+
+  if (isCraftingLikeTask(taskText)) {
+    if (step === 0 || step % 24 === 0) {
+      action.inventory = 1;
+      return { ...ACTION_PAYLOAD_PREFIX, hold_steps: 1, action };
+    }
+    action["hotbar.1"] = step % 24 === 4 ? 1 : 0;
+    action.use = step % 12 >= 6 ? 1 : 0;
+    action.camera = [0, scanYaw];
+    return { ...ACTION_PAYLOAD_PREFIX, hold_steps: 2, action };
+  }
+
+  if (/\bdrop\b|丟棄|丟掉|扔掉/.test(task)) {
+    if (step === 0 || step % 16 === 0) {
+      action.inventory = 1;
+      return { ...ACTION_PAYLOAD_PREFIX, hold_steps: 1, action };
+    }
+    action.drop = step % 8 === 4 ? 1 : 0;
+    return { ...ACTION_PAYLOAD_PREFIX, hold_steps: 1, action };
+  }
+
+  if (/throw|snowball|拋|扔/.test(task)) {
+    action["hotbar.1"] = step === 0 ? 1 : 0;
+    action.use = step % 6 >= 3 ? 1 : 0;
+    action.camera = [-2, scanYaw];
+    return { ...ACTION_PAYLOAD_PREFIX, hold_steps: 1, action };
+  }
 
   if (/wool|shear|sheep|羊毛|剪羊|綿羊/.test(task)) {
     action.forward = step % 18 < 12 ? 1 : 0;
