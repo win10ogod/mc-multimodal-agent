@@ -25,6 +25,7 @@ import {
   type McuEnvAction,
 } from "./McuPrompt";
 import { parseMcuActionText, normalizeMcuAction } from "./McuPolicy";
+import { McuIntentCompiler } from "./McuIntentCompiler";
 
 type ChatMessage = {
   role: "system" | "user" | "assistant" | "tool";
@@ -58,6 +59,8 @@ export class McuToolDriver {
   private taskText: string;
   private readonly promptText: string;
   private readonly recentIntents: McuActionIntent[] = [];
+  private readonly compiler = new McuIntentCompiler();
+  private lastDrainedIntents: McuActionIntent[] = [];
   private soul = "";
   private initialized = false;
 
@@ -114,10 +117,11 @@ export class McuToolDriver {
   }
 
   drainIntents(): McuActionIntent[] {
-    const fromBot = this.bot.drainIntents();
-    this.recentIntents.push(...fromBot);
-    if (this.recentIntents.length > 32) this.recentIntents.splice(0, this.recentIntents.length - 32);
-    return fromBot;
+    return this.lastDrainedIntents;
+  }
+
+  pendingButtonCount(): number {
+    return this.compiler.pendingCount();
   }
 
   /**
@@ -128,6 +132,14 @@ export class McuToolDriver {
    */
   async step(stepNumber: number): Promise<McuPolicyDecision> {
     await this.ensureInitialized();
+
+    // If button macros are queued from a previous tool-call turn, drain them
+    // one frame at a time before invoking the model again.
+    if (this.compiler.hasPending()) {
+      const next = this.compiler.next()!;
+      return { ...ACTION_PAYLOAD_PREFIX, action: next.action, hold_steps: next.holdSteps };
+    }
+
     const frame = this.bot.getLatestFrame();
     if (!frame) {
       return { ...ACTION_PAYLOAD_PREFIX, action: defaultMcuAction(), hold_steps: 1 };
@@ -217,6 +229,21 @@ export class McuToolDriver {
           content: JSON.stringify({ ok: result.ok, text: result.text, data: clampJson(result.data) }),
         });
       }
+    }
+
+    // Compile any queued intents from action tools called above into MCU
+    // button macros, drained one per frame on subsequent step() calls.
+    const drained = this.bot.drainIntents();
+    this.lastDrainedIntents = drained;
+    if (drained.length > 0) {
+      this.recentIntents.push(...drained);
+      if (this.recentIntents.length > 32) this.recentIntents.splice(0, this.recentIntents.length - 32);
+      this.compiler.enqueueIntents(drained);
+    }
+
+    if (this.compiler.hasPending()) {
+      const next = this.compiler.next()!;
+      return { ...ACTION_PAYLOAD_PREFIX, action: next.action, hold_steps: next.holdSteps };
     }
 
     const decision = parseMcuActionText(stripReasoningMarkup(finalText)) ?? {
