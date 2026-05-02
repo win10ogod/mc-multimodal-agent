@@ -132,6 +132,8 @@ export type AgentConfig = {
     modelEveryNSteps: number;
     defaultHoldSteps: number;
     maxHoldSteps: number;
+    useToolAgent: boolean;
+    toolAgentMaxToolCallsPerObs: number;
   };
 };
 
@@ -361,6 +363,8 @@ export function loadConfig(projectRoot = process.cwd()): AgentConfig {
       modelEveryNSteps: envInt("AGENTBEATS_MODEL_EVERY_N_STEPS", 4),
       defaultHoldSteps: envInt("AGENTBEATS_DEFAULT_HOLD_STEPS", 3),
       maxHoldSteps: envInt("AGENTBEATS_MAX_HOLD_STEPS", 12),
+      useToolAgent: envBool("AGENTBEATS_USE_TOOL_AGENT", false),
+      toolAgentMaxToolCallsPerObs: envInt("AGENTBEATS_TOOL_AGENT_MAX_CALLS", 6),
     },
   };
 }

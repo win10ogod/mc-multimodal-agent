@@ -1,5 +1,7 @@
 import type { AgentConfig } from "../config";
-import type { MinecraftBot } from "../bot/MinecraftBot";
+import minecraftData from "minecraft-data";
+import type { BotApi, VisionApi } from "../bot/BotApi";
+import { planCraft } from "../bot/CraftPlanner";
 import { resolveBlueprint } from "../blueprint/Blueprint";
 import { importBlueprintFromLibrary, listBlueprintLibrary } from "../blueprint/BlueprintLibrary";
 import type { ItemCatalog } from "../knowledge/ItemCatalog";
@@ -10,7 +12,6 @@ import type { ImitationObserver } from "../learning/ImitationObserver";
 import type { TaskStore } from "../tasks/TaskStore";
 import type { SubagentManager } from "../agents/SubagentManager";
 import type { JsonObject, JsonValue, ToolResult, Vec3Like } from "../types";
-import type { VisualPerception } from "../vision/VisualPerception";
 import { searchWithAgentBrowser, type AgentBrowserSearchParams, type WebSearchResponse } from "../web/AgentBrowserSearch";
 import { planMaterials } from "../planning/MaterialPlanner";
 import { ToolRegistry } from "./ToolRegistry";
@@ -19,8 +20,8 @@ import { Vec3 } from "vec3";
 
 export type MinecraftToolContext = {
   config: AgentConfig;
-  bot: MinecraftBot;
-  vision: VisualPerception;
+  bot: BotApi;
+  vision: VisionApi;
   catalog: ItemCatalog;
   memory: MemoryStore;
   goals?: GoalStore;
@@ -65,7 +66,7 @@ function screenHit(ctx: MinecraftToolContext, x: number, y: number, action: stri
   return ctx.vision.hitFromScreen(x, y);
 }
 
-function visualFrameData(frame: ReturnType<VisualPerception["capture"]>): JsonObject {
+function visualFrameData(frame: ReturnType<VisionApi["capture"]>): JsonObject {
   return {
     width: frame.width,
     height: frame.height,
@@ -1205,6 +1206,45 @@ export function createMinecraftToolRegistry(): ToolRegistry<MinecraftToolContext
         "recipe query",
         ctx.bot.recipeCatalog(requiredString(args, "item"), optionalNumber(args, "limit", 12)) as unknown as JsonValue,
       ),
+  });
+
+  registry.register({
+    name: "plan_craft",
+    description:
+      "Recursively plan how to craft a target item from current inventory down to gatherable resources. Returns an ordered list of steps (have/craft/smelt/gather) with table/furnace requirements. Use BEFORE multi-step crafting tasks (tools, armor, anything that needs ingots) to avoid chaining recipe_query calls.",
+    parameters: {
+      type: "object",
+      properties: {
+        item: { type: "string", description: "Target item name, e.g. iron_pickaxe, diamond_sword." },
+        count: { type: "number", minimum: 1, maximum: 64, description: "How many to plan for. Default 1." },
+        maxDepth: { type: "number", minimum: 1, maximum: 8 },
+        maxSteps: { type: "number", minimum: 4, maximum: 80 },
+      },
+      required: ["item"],
+      additionalProperties: false,
+    },
+    execute: async (args, ctx) => {
+      const item = requiredString(args, "item");
+      const count = optionalNumber(args, "count", 1);
+      const inventory: Record<string, number> = {};
+      for (const stack of ctx.bot.inventorySummary()) {
+        inventory[stack.name] = (inventory[stack.name] ?? 0) + stack.count;
+      }
+      const version = ctx.bot.raw.version;
+      const data = minecraftData(version);
+      if (!data) {
+        return { ok: false, text: `minecraft-data has no registry for version ${version}` };
+      }
+      const plan = planCraft({
+        data,
+        target: item,
+        count,
+        inventory,
+        maxDepth: optionalNumber(args, "maxDepth", 4),
+        maxSteps: optionalNumber(args, "maxSteps", 40),
+      });
+      return ok(`plan_craft ${item} x${count}`, plan as unknown as JsonValue);
+    },
   });
 
   registry.register({
