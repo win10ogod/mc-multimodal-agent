@@ -12,6 +12,17 @@ import { buildModdedTolerantCustomPackets } from "./moddedProtocol";
 
 const AIR_NAMES = new Set(["air", "cave_air", "void_air"]);
 const { GoalFollow, GoalNear } = goals;
+const PATHFINDER_HAZARD_BLOCKS = [
+  "fire",
+  "soul_fire",
+  "lava",
+  "cactus",
+  "magma_block",
+  "campfire",
+  "soul_campfire",
+  "sweet_berry_bush",
+  "powder_snow",
+];
 
 export type ScreenPlacementHit = {
   blockName: string;
@@ -156,6 +167,49 @@ export type NavigationSummary = {
   reason?: string;
 };
 
+export type LocalBlockSummary = {
+  name: string;
+  position: Vec3Like;
+};
+
+export type LocalizationSnapshot = {
+  position: Vec3Like;
+  blockPosition: Vec3Like;
+  eyePosition: Vec3Like;
+  yawDeg: number;
+  facing: string;
+  pitchDeg: number;
+  health: number;
+  food: number;
+  held: string;
+  feetBlock: LocalBlockSummary | null;
+  belowBlock: LocalBlockSummary | null;
+  navigation: NavigationSummary;
+};
+
+export type PathfinderMovementConfigurationSummary = {
+  hazardBlocks: string[];
+  entitiesToAvoid: string[];
+  scaffoldingBlocks: string[];
+};
+
+type MovementSettingsTarget = {
+  canDig?: boolean;
+  allow1by1towers?: boolean;
+  allowParkour?: boolean;
+  allowSprinting?: boolean;
+  allowEntityDetection?: boolean;
+  maxDropDown?: number;
+  blocksToAvoid?: Set<number>;
+  entitiesToAvoid?: Set<string>;
+  scafoldingBlocks?: number[];
+};
+
+type RegistryNameMaps = {
+  blocksByName?: Record<string, { id?: number } | undefined>;
+  itemsByName?: Record<string, { id?: number } | undefined>;
+};
+
 const HOSTILE_ENTITY_TERMS = [
   "blaze",
   "bogged",
@@ -236,6 +290,10 @@ function addVec(a: Vec3Like, b: Vec3Like): Vec3Like {
   return { x: a.x + b.x, y: a.y + b.y, z: a.z + b.z };
 }
 
+export function isFiniteVec3Like(pos: Vec3Like | undefined): pos is Vec3Like {
+  return Boolean(pos && Number.isFinite(pos.x) && Number.isFinite(pos.y) && Number.isFinite(pos.z));
+}
+
 function isAirName(name: string | undefined): boolean {
   return !name || AIR_NAMES.has(name);
 }
@@ -263,6 +321,54 @@ function isHostileEntityName(name: string): boolean {
 
 function scoreNamedItem(name: string, scores: Array<[RegExp, number]>): number {
   return scores.find(([pattern]) => pattern.test(name))?.[1] ?? 0;
+}
+
+export function configurePathfinderMovementsForAgent(
+  movements: MovementSettingsTarget,
+  registry: RegistryNameMaps,
+  config: AgentConfig,
+): PathfinderMovementConfigurationSummary {
+  movements.canDig = config.minecraft.pathfindCanDig;
+  movements.allow1by1towers = config.minecraft.pathfindAllow1by1Towers;
+  movements.allowParkour = config.minecraft.pathfindAllowParkour;
+  movements.allowSprinting = config.minecraft.pathfindAllowSprinting;
+  movements.allowEntityDetection = config.minecraft.pathfindAllowEntityDetection;
+  movements.maxDropDown = Math.max(1, Math.min(16, config.minecraft.pathfindMaxDropDown));
+
+  const hazardBlocks: string[] = [];
+  if (movements.blocksToAvoid) {
+    for (const name of PATHFINDER_HAZARD_BLOCKS) {
+      const id = registry.blocksByName?.[name]?.id;
+      if (typeof id !== "number") {
+        continue;
+      }
+      movements.blocksToAvoid.add(id);
+      hazardBlocks.push(name);
+    }
+  }
+
+  const entitiesToAvoid: string[] = [];
+  if (config.minecraft.pathfindAvoidHostiles && movements.entitiesToAvoid) {
+    for (const name of HOSTILE_ENTITY_TERMS) {
+      movements.entitiesToAvoid.add(name);
+      entitiesToAvoid.push(name);
+    }
+  }
+
+  const scaffoldingBlocks: string[] = [];
+  if (movements.scafoldingBlocks) {
+    movements.scafoldingBlocks.length = 0;
+    for (const name of config.minecraft.pathfindScaffoldBlocks) {
+      const id = registry.itemsByName?.[name]?.id;
+      if (typeof id !== "number") {
+        continue;
+      }
+      movements.scafoldingBlocks.push(id);
+      scaffoldingBlocks.push(name);
+    }
+  }
+
+  return { hazardBlocks, entitiesToAvoid, scaffoldingBlocks };
 }
 
 function itemSummary(item: unknown): ItemStackSummary | null {
@@ -300,6 +406,30 @@ function stringifyTitle(value: unknown): string {
   return value ? String(value) : "";
 }
 
+function normalizeDegrees(value: number): number {
+  let angle = value;
+  while (angle > 180) {
+    angle -= 360;
+  }
+  while (angle <= -180) {
+    angle += 360;
+  }
+  return angle;
+}
+
+function facingFromYawDegrees(yaw: number): string {
+  if (yaw >= -45 && yaw < 45) {
+    return "north";
+  }
+  if (yaw >= 45 && yaw < 135) {
+    return "west";
+  }
+  if (yaw >= -135 && yaw < -45) {
+    return "east";
+  }
+  return "south";
+}
+
 export class MinecraftBot {
   private bot?: Bot;
   private mcData?: ReturnType<typeof minecraftData>;
@@ -309,6 +439,8 @@ export class MinecraftBot {
   private recipesCapturedAt?: string;
   private recipesSkippedByConfig = false;
   private connected = false;
+  private connecting?: Promise<void>;
+  private connectionGeneration = 0;
   private disconnectRequested = false;
   private lastDisconnectReason = "";
   private lastPacketAt = 0;
@@ -337,11 +469,33 @@ export class MinecraftBot {
   }
 
   async connect(): Promise<void> {
-    if (this.connected && this.bot?.entity) {
+    if (this.isConnected()) {
       return;
     }
+    if (this.connecting) {
+      return this.connecting;
+    }
+    const connecting = this.connectFresh();
+    this.connecting = connecting;
+    try {
+      await connecting;
+    } finally {
+      if (this.connecting === connecting) {
+        this.connecting = undefined;
+      }
+    }
+  }
+
+  private async connectFresh(): Promise<void> {
+    if (this.isConnected()) {
+      return;
+    }
+    const connectionGeneration = this.connectionGeneration + 1;
+    this.connectionGeneration = connectionGeneration;
+    this.clearNavigationState();
     const previousBot = this.bot;
     if (previousBot) {
+      this.resetRuntimeStateForReconnect();
       try {
         previousBot.removeAllListeners();
         previousBot.end("reconnect");
@@ -366,10 +520,52 @@ export class MinecraftBot {
       closeTimeout: Math.max(30_000, this.config.minecraft.keepAliveTimeoutMs),
     });
     this.bot = bot;
+    const isCurrentConnection = (): boolean =>
+      this.bot === bot && this.connectionGeneration === connectionGeneration && !this.disconnectRequested;
     this.attachLenientKeepAlive(bot);
     this.attachRecipeCapture(bot);
     bot.loadPlugin(pathfinder);
     this.attachNavigationMonitor(bot);
+    bot.on("end", (reason) => {
+      if (!isCurrentConnection()) {
+        return;
+      }
+      this.connected = false;
+      this.lastDisconnectReason = `end: ${String(reason ?? "connection closed")}`;
+      this.clearNavigationState();
+    });
+    bot.on("kicked", (reason) => {
+      if (!isCurrentConnection()) {
+        return;
+      }
+      this.connected = false;
+      this.lastDisconnectReason = `kicked: ${String(reason)}`;
+      this.clearNavigationState();
+    });
+    bot.on("error", (error) => {
+      if (!isCurrentConnection()) {
+        return;
+      }
+      this.lastDisconnectReason = `error: ${error.message}`;
+      const client = bot._client as unknown as { ended?: boolean };
+      if (client.ended) {
+        this.connected = false;
+        this.clearNavigationState();
+      }
+    });
+    bot.on("chat", (username, message) => {
+      if (!isCurrentConnection() || username === bot.username) {
+        return;
+      }
+      const trigger = this.config.chatGuidance.trigger;
+      if (this.config.chatGuidance.enabled && message.startsWith(trigger)) {
+        this.guidanceQueue.push({
+          time: new Date().toISOString(),
+          username,
+          message: message.slice(trigger.length).trim() || message,
+        });
+      }
+    });
 
     try {
       await new Promise<void>((resolve, reject) => {
@@ -379,6 +575,11 @@ export class MinecraftBot {
           bot.removeListener("kicked", onKicked);
         };
         const onSpawn = (): void => {
+          if (!isCurrentConnection()) {
+            cleanup();
+            reject(new Error("Minecraft bot connection was superseded before spawn."));
+            return;
+          }
           this.connected = true;
           cleanup();
           resolve();
@@ -422,48 +623,46 @@ export class MinecraftBot {
       this.mcData = botAny.registry;
     }
     const movements = new Movements(bot);
+    configurePathfinderMovementsForAgent(
+      movements,
+      (bot as unknown as { registry: RegistryNameMaps }).registry,
+      this.config,
+    );
     bot.pathfinder.setMovements(movements);
-    bot.on("end", (reason) => {
-      this.connected = false;
-      this.lastDisconnectReason = `end: ${String(reason ?? "connection closed")}`;
-    });
-    bot.on("kicked", (reason) => {
-      this.connected = false;
-      this.lastDisconnectReason = `kicked: ${String(reason)}`;
-    });
-    bot.on("error", (error) => {
-      this.lastDisconnectReason = `error: ${error.message}`;
-      const client = bot._client as unknown as { ended?: boolean };
-      if (client.ended) {
-        this.connected = false;
-      }
-    });
-    bot.on("chat", (username, message) => {
-      if (username === bot.username) {
-        return;
-      }
-      const trigger = this.config.chatGuidance.trigger;
-      if (this.config.chatGuidance.enabled && message.startsWith(trigger)) {
-        this.guidanceQueue.push({
-          time: new Date().toISOString(),
-          username,
-          message: message.slice(trigger.length).trim() || message,
-        });
-      }
-    });
+    bot.pathfinder.thinkTimeout = Math.max(500, Math.min(60_000, this.config.minecraft.pathfindThinkTimeoutMs));
+    bot.pathfinder.tickTimeout = Math.max(10, Math.min(250, this.config.minecraft.pathfindTickTimeoutMs));
+    (bot.pathfinder as unknown as { searchRadius: number }).searchRadius = this.config.minecraft.pathfindSearchRadius <= 0
+      ? -1
+      : Math.max(8, Math.min(256, this.config.minecraft.pathfindSearchRadius));
   }
 
   disconnect(): void {
     this.disconnectRequested = true;
+    this.connectionGeneration += 1;
+    this.connecting = undefined;
     this.connected = false;
     this.bot?.quit("Agent stopped");
   }
 
+  resetRuntimeStateForReconnect(): void {
+    this.connected = false;
+    try {
+      this.bot?.pathfinder?.stop();
+    } catch {
+      // The previous pathfinder may already be disposed.
+    }
+    this.clearNavigationState();
+  }
+
   isConnected(): boolean {
-    return Boolean(this.bot && this.connected && this.bot.entity);
+    return Boolean(this.bot && this.connected && this.bot.entity && !this.invalidPositionReason());
   }
 
   connectionSummary(): string {
+    const invalidPosition = this.invalidPositionReason();
+    if (invalidPosition) {
+      return `${invalidPosition} ${this.keepAliveSummary()}`.trim();
+    }
     if (this.isConnected()) {
       return `connected ${this.keepAliveSummary()}`;
     }
@@ -478,6 +677,26 @@ export class MinecraftBot {
     if (!this.isConnected()) {
       throw new Error(`Minecraft bot is not in game: ${this.connectionSummary()}`);
     }
+  }
+
+  private invalidPositionReason(): string | undefined {
+    const pos = this.bot?.entity?.position;
+    if (!pos) {
+      return undefined;
+    }
+    if (isFiniteVec3Like(pos)) {
+      return undefined;
+    }
+    this.connected = false;
+    const rawPos = pos as unknown as { x?: unknown; y?: unknown; z?: unknown };
+    return `invalid bot position x=${String(rawPos.x)} y=${String(rawPos.y)} z=${String(rawPos.z)}`;
+  }
+
+  private clearNavigationState(): void {
+    if (this.activeNavigation?.timeout) {
+      clearTimeout(this.activeNavigation.timeout);
+    }
+    this.activeNavigation = undefined;
   }
 
   private attachLenientKeepAlive(bot: Bot): void {
@@ -624,15 +843,59 @@ export class MinecraftBot {
     const bot = this.raw;
     const pos = bot.entity.position;
     const held = bot.heldItem?.name ?? "empty hand";
+    const yawDeg = normalizeDegrees((bot.entity.yaw * 180) / Math.PI);
     return [
       `position=(${pos.x.toFixed(1)}, ${pos.y.toFixed(1)}, ${pos.z.toFixed(1)})`,
-      `yaw=${((bot.entity.yaw * 180) / Math.PI).toFixed(1)}`,
+      `yaw=${yawDeg.toFixed(1)}`,
+      `facing=${facingFromYawDegrees(yawDeg)}`,
       `pitch=${((bot.entity.pitch * 180) / Math.PI).toFixed(1)}`,
       `health=${bot.health}`,
       `food=${bot.food}`,
       `held=${held}`,
       `connection=${this.keepAliveSummary()}`,
     ].join(" ");
+  }
+
+  localizationSnapshot(): LocalizationSnapshot {
+    this.ensureConnected();
+    const bot = this.raw;
+    const pos = bot.entity.position;
+    const blockPosition = floorVec(pos);
+    const eye = this.eyePosition();
+    const yawDeg = normalizeDegrees((bot.entity.yaw * 180) / Math.PI);
+    return {
+      position: {
+        x: Number(pos.x.toFixed(2)),
+        y: Number(pos.y.toFixed(2)),
+        z: Number(pos.z.toFixed(2)),
+      },
+      blockPosition,
+      eyePosition: {
+        x: Number(eye.x.toFixed(2)),
+        y: Number(eye.y.toFixed(2)),
+        z: Number(eye.z.toFixed(2)),
+      },
+      yawDeg: Number(yawDeg.toFixed(1)),
+      facing: facingFromYawDegrees(yawDeg),
+      pitchDeg: Number(((bot.entity.pitch * 180) / Math.PI).toFixed(1)),
+      health: bot.health,
+      food: bot.food,
+      held: bot.heldItem?.name ?? "empty hand",
+      feetBlock: this.localBlockAt(blockPosition),
+      belowBlock: this.localBlockAt({ x: blockPosition.x, y: blockPosition.y - 1, z: blockPosition.z }),
+      navigation: this.navigationStatus(),
+    };
+  }
+
+  private localBlockAt(position: Vec3Like): LocalBlockSummary | null {
+    const block = this.raw.blockAt(toVec3(position));
+    if (!block) {
+      return null;
+    }
+    return {
+      name: block.name,
+      position,
+    };
   }
 
   combatScan(params: { range?: number; includePlayers?: boolean } = {}): CombatScanSummary {
@@ -1179,11 +1442,27 @@ export class MinecraftBot {
 
   async digAt(pos: Vec3Like): Promise<string> {
     this.ensureConnected();
-    const block = this.raw.blockAt(toVec3(pos));
+    let block = this.raw.blockAt(toVec3(pos));
     if (!block || isAirName(block.name)) {
       throw new Error(`No diggable block at ${pos.x},${pos.y},${pos.z}`);
     }
-    await this.gotoNear(pos, 4);
+    const canDig = (target: NonNullable<ReturnType<Bot["blockAt"]>>): boolean => {
+      const digger = this.raw as unknown as { canDigBlock?: (block: NonNullable<ReturnType<Bot["blockAt"]>>) => boolean };
+      if (typeof digger.canDigBlock !== "function") {
+        return this.raw.entity.position.distanceTo(toVec3(pos).offset(0.5, 0.5, 0.5)) <= 5;
+      }
+      return digger.canDigBlock(target);
+    };
+    if (!canDig(block)) {
+      await this.gotoNear(pos, 4);
+      block = this.raw.blockAt(toVec3(pos));
+      if (!block || isAirName(block.name)) {
+        throw new Error(`No diggable block at ${pos.x},${pos.y},${pos.z}`);
+      }
+      if (!canDig(block)) {
+        throw new Error(`Block at ${pos.x},${pos.y},${pos.z} is still out of dig reach after pathfinding.`);
+      }
+    }
     await this.lookAtBlock(pos);
     await this.raw.dig(block);
     return block.name;

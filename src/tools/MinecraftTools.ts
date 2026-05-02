@@ -1,14 +1,18 @@
 import type { AgentConfig } from "../config";
 import type { MinecraftBot } from "../bot/MinecraftBot";
 import { resolveBlueprint } from "../blueprint/Blueprint";
+import { importBlueprintFromLibrary, listBlueprintLibrary } from "../blueprint/BlueprintLibrary";
 import type { ItemCatalog } from "../knowledge/ItemCatalog";
 import type { MemoryStore } from "../memory/MemoryStore";
 import type { GoalNode, GoalStore, GoalStatus } from "../goals/GoalStore";
 import type { SkillLibrary } from "../skills/SkillLibrary";
 import type { ImitationObserver } from "../learning/ImitationObserver";
 import type { TaskStore } from "../tasks/TaskStore";
+import type { SubagentManager } from "../agents/SubagentManager";
 import type { JsonObject, JsonValue, ToolResult, Vec3Like } from "../types";
 import type { VisualPerception } from "../vision/VisualPerception";
+import { searchWithAgentBrowser, type AgentBrowserSearchParams, type WebSearchResponse } from "../web/AgentBrowserSearch";
+import { planMaterials } from "../planning/MaterialPlanner";
 import { ToolRegistry } from "./ToolRegistry";
 import { compactText, sleep } from "../utils/misc";
 import { Vec3 } from "vec3";
@@ -23,6 +27,8 @@ export type MinecraftToolContext = {
   skills: SkillLibrary;
   imitation?: ImitationObserver;
   tasks?: TaskStore;
+  webSearch?: (params: AgentBrowserSearchParams) => Promise<WebSearchResponse>;
+  subagents?: SubagentManager;
 };
 
 function ok(text: string, data?: JsonValue): ToolResult {
@@ -46,6 +52,27 @@ function screenXY(args: JsonObject): { x: number; y: number } {
   return {
     x: optionalNumber(args, "x", 160),
     y: optionalNumber(args, "y", 90),
+  };
+}
+
+function screenHit(ctx: MinecraftToolContext, x: number, y: number, action: string) {
+  const staleReason = ctx.vision.screenFrameStaleReason();
+  if (staleReason) {
+    throw new Error(
+      `Visual frame is stale for ${action}: ${staleReason}. Call observe or visual_find_blocks with refresh=true before using screen-coordinate action tools.`,
+    );
+  }
+  return ctx.vision.hitFromScreen(x, y);
+}
+
+function visualFrameData(frame: ReturnType<VisualPerception["capture"]>): JsonObject {
+  return {
+    width: frame.width,
+    height: frame.height,
+    capturedAt: frame.capturedAt,
+    visibleBlocks: frame.visibleBlocks,
+    visibleTargets: frame.visibleTargets as unknown as JsonValue,
+    text: frame.text,
   };
 }
 
@@ -151,6 +178,26 @@ function skillStepFromValue(value: JsonValue): { tool: string; arguments: JsonOb
   };
 }
 
+function directionFromRelative(relative: Vec3Like): string {
+  const parts: string[] = [];
+  if (relative.x > 0) {
+    parts.push(`east ${relative.x}`);
+  } else if (relative.x < 0) {
+    parts.push(`west ${Math.abs(relative.x)}`);
+  }
+  if (relative.z > 0) {
+    parts.push(`south ${relative.z}`);
+  } else if (relative.z < 0) {
+    parts.push(`north ${Math.abs(relative.z)}`);
+  }
+  if (relative.y > 0) {
+    parts.push(`up ${relative.y}`);
+  } else if (relative.y < 0) {
+    parts.push(`down ${Math.abs(relative.y)}`);
+  }
+  return parts.join(", ") || "here";
+}
+
 const SKILL_META_TOOLS = new Set([
   "execute_steps",
   "execute_skill",
@@ -171,8 +218,41 @@ const SKILL_META_TOOLS = new Set([
   "goal_next",
   "goal_update",
   "goal_checkpoint",
+  "subagent_spawn",
+  "subagent_list",
+  "subagent_status",
+  "subagent_send",
+  "subagent_cancel",
   "environment_profile",
 ]);
+
+async function buildSubagentForkContext(ctx: MinecraftToolContext, task: string): Promise<string> {
+  const sections = [
+    "Forked parent context snapshot for a model-only child subagent.",
+    `task=${task}`,
+    "",
+    "<bot_status>",
+    JSON.stringify(ctx.bot.statusSummary()),
+    "</bot_status>",
+    "",
+    "<navigation>",
+    JSON.stringify(ctx.bot.navigationStatus()),
+    "</navigation>",
+    "",
+    "<inventory>",
+    JSON.stringify(ctx.bot.inventorySummary()),
+    "</inventory>",
+    "",
+    "<goals>",
+    ctx.goals?.buildPromptSection(task) ?? "No active goal tree.",
+    "</goals>",
+    "",
+    "<memory>",
+    await ctx.memory.buildPromptSection(task),
+    "</memory>",
+  ];
+  return compactText(sections.join("\n"), 12_000);
+}
 
 async function findNearbyBlocksChunked(params: {
   ctx: MinecraftToolContext;
@@ -181,7 +261,10 @@ async function findNearbyBlocksChunked(params: {
   maxDistance: number;
   verticalRange: number;
   count: number;
-}): Promise<{ checked: number; results: Array<{ name: string; position: Vec3Like; distance: number }> }> {
+}): Promise<{
+  checked: number;
+  results: Array<{ name: string; position: Vec3Like; distance: number; relative: Vec3Like; direction: string }>;
+}> {
   params.ctx.bot.ensureConnected();
   const origin = params.ctx.bot.raw.entity.position;
   const originBlock = {
@@ -193,7 +276,7 @@ async function findNearbyBlocksChunked(params: {
   const verticalRange = Math.max(1, Math.min(maxDistance, Math.floor(params.verticalRange)));
   const count = Math.max(1, Math.min(128, Math.floor(params.count)));
   const maxDistanceSq = maxDistance * maxDistance;
-  const results: Array<{ name: string; position: Vec3Like; distance: number }> = [];
+  const results: Array<{ name: string; position: Vec3Like; distance: number; relative: Vec3Like; direction: string }> = [];
   let checked = 0;
 
   const inspect = (dx: number, dy: number, dz: number): void => {
@@ -206,10 +289,17 @@ async function findNearbyBlocksChunked(params: {
     if (!block || !blockMatches(block.name, params.names, params.match)) {
       return;
     }
+    const relative = {
+      x: pos.x - originBlock.x,
+      y: pos.y - originBlock.y,
+      z: pos.z - originBlock.z,
+    };
     results.push({
       name: block.name,
       position: { x: pos.x, y: pos.y, z: pos.z },
       distance: Number(pos.distanceTo(origin).toFixed(2)),
+      relative,
+      direction: directionFromRelative(relative),
     });
   };
 
@@ -291,9 +381,78 @@ export function createMinecraftToolRegistry(): ToolRegistry<MinecraftToolContext
   });
 
   registry.register({
+    name: "visual_sweep",
+    description:
+      "Capture left, right, and restored-center visual frames in one tool call. Use when searching for targets around the bot without repeatedly turning and observing. After the sweep, screen-coordinate tools refer to the restored center frame only.",
+    parameters: {
+      type: "object",
+      properties: {
+        yawDeg: { type: "number", minimum: 10, maximum: 90 },
+      },
+      additionalProperties: false,
+    },
+    execute: async (args, ctx) => {
+      const configuredYaw = ctx.config.vision?.contextYawDeg ?? 45;
+      const yawDeg = Math.max(10, Math.min(90, optionalNumber(args, "yawDeg", configuredYaw)));
+      ctx.vision.capture();
+      await ctx.bot.lookDelta(-yawDeg, 0);
+      const left = ctx.vision.capture();
+      await ctx.bot.lookDelta(yawDeg * 2, 0);
+      const right = ctx.vision.capture();
+      await ctx.bot.lookDelta(-yawDeg, 0);
+      const center = ctx.vision.capture();
+      const text = [
+        `Visual sweep ${yawDeg}deg left/right; screen-coordinate tools now refer to restored center frame.`,
+        "",
+        "<center_restored>",
+        center.text,
+        "</center_restored>",
+        "",
+        "<left_view>",
+        left.text,
+        "</left_view>",
+        "",
+        "<right_view>",
+        right.text,
+        "</right_view>",
+      ].join("\n");
+      return {
+        ok: true,
+        text,
+        content: [
+          { type: "text", text },
+          { type: "image", dataUrl: center.dataUrl, detail: "low" },
+          { type: "image", dataUrl: left.dataUrl, detail: "low" },
+          { type: "image", dataUrl: right.dataUrl, detail: "low" },
+        ],
+        data: {
+          yawDeg,
+          frames: {
+            center: visualFrameData(center),
+            left: visualFrameData(left),
+            right: visualFrameData(right),
+          },
+        },
+      };
+    },
+  });
+
+  registry.register({
+    name: "locate_self",
+    description:
+      "Return a structured localization snapshot: exact position, block coordinates, normalized yaw, cardinal facing, feet/below blocks, held item, and navigation state. Use after reconnects, before long navigation, and before choosing build foundations.",
+    parameters: {
+      type: "object",
+      properties: {},
+      additionalProperties: false,
+    },
+    execute: async (_args, ctx) => ok("localization snapshot", ctx.bot.localizationSnapshot() as unknown as JsonValue),
+  });
+
+  registry.register({
     name: "visual_find_blocks",
     description:
-      "Find visible blocks in the latest visual frame by name pattern and return screen coordinates. Use this to connect perception to actions like look_screen, pathfind_screen, dig_screen, place_screen, or finding a visible crafting table/machine.",
+      "Find visible blocks in the latest visual frame by name pattern and return frame-bound screen coordinates. Use this to connect perception to actions like look_screen, pathfind_screen, dig_screen, place_screen, or finding a visible crafting table/machine. Refresh after movement or camera turns.",
     parameters: {
       type: "object",
       properties: {
@@ -318,6 +477,46 @@ export function createMinecraftToolRegistry(): ToolRegistry<MinecraftToolContext
         optionalNumber(args, "count", 12),
       );
       return ok(`found ${targets.length} visible targets`, targets as unknown as JsonValue);
+    },
+  });
+
+  registry.register({
+    name: "web_search",
+    description:
+      "Search the public web through the agent-browser CLI and return ranked page titles, URLs, and snippets. Use this for external Minecraft docs, modpack documentation, server rules, or up-to-date facts that are not visible in-game.",
+    parameters: {
+      type: "object",
+      properties: {
+        query: { type: "string", description: "Search query." },
+        maxResults: { type: "number", minimum: 1, maximum: 10 },
+        engine: { type: "string", enum: ["duckduckgo", "bing"], default: "duckduckgo" },
+      },
+      required: ["query"],
+      additionalProperties: false,
+    },
+    execute: async (args, ctx) => {
+      const configured = ctx.config.webSearch;
+      const maxResults = Math.max(
+        1,
+        Math.min(
+          10,
+          Math.floor(optionalNumber(args, "maxResults", configured?.maxResults ?? 5)),
+        ),
+      );
+      const engine = args.engine === "bing" || args.engine === "duckduckgo" ? args.engine : configured?.engine ?? "duckduckgo";
+      const search = ctx.webSearch ?? searchWithAgentBrowser;
+      const result = await search({
+        query: requiredString(args, "query"),
+        maxResults,
+        engine,
+        timeoutMs: configured?.timeoutMs ?? 30_000,
+        browserCommand: configured?.browserCommand,
+        projectRoot: ctx.config.projectRoot,
+      });
+      return ok(
+        `found ${result.results.length} web result${result.results.length === 1 ? "" : "s"} for ${result.query}`,
+        result as unknown as JsonValue,
+      );
     },
   });
 
@@ -453,7 +652,7 @@ export function createMinecraftToolRegistry(): ToolRegistry<MinecraftToolContext
     },
     execute: async (args, ctx) => {
       const { x, y } = screenXY(args);
-      const hit = ctx.vision.hitFromScreen(x, y);
+      const hit = screenHit(ctx, x, y, "dig_screen");
       if (!hit) {
         throw new Error(`No visible block hit at screen (${x}, ${y}). Use observe or choose another pixel.`);
       }
@@ -478,7 +677,7 @@ export function createMinecraftToolRegistry(): ToolRegistry<MinecraftToolContext
     },
     execute: async (args, ctx) => {
       const { x, y } = screenXY(args);
-      const hit = ctx.vision.hitFromScreen(x, y);
+      const hit = screenHit(ctx, x, y, "place_screen");
       if (!hit) {
         throw new Error(`No visible placement target at screen (${x}, ${y}).`);
       }
@@ -509,7 +708,7 @@ export function createMinecraftToolRegistry(): ToolRegistry<MinecraftToolContext
     },
     execute: async (args, ctx) => {
       const { x, y } = screenXY(args);
-      const hit = ctx.vision.hitFromScreen(x, y);
+      const hit = screenHit(ctx, x, y, "pathfind_screen");
       if (!hit) {
         throw new Error(`No visible path target at screen (${x}, ${y}).`);
       }
@@ -748,15 +947,6 @@ export function createMinecraftToolRegistry(): ToolRegistry<MinecraftToolContext
       for (const target of targets) {
         const positionArray = [target.position.x, target.position.y, target.position.z];
         try {
-          await ctx.bot.gotoNear(target.position, 4);
-          executedSteps.push({
-            step: stepIndex,
-            tool: "pathfind_to_block",
-            arguments: { position: positionArray, range: 4 },
-            ok: true,
-            text: `walked near block ${positionArray.join(",")}`,
-          });
-          stepIndex += 1;
           const dug = await ctx.bot.digAt(target.position);
           harvested.push({ name: dug, position: target.position });
           executedSteps.push({
@@ -783,14 +973,16 @@ export function createMinecraftToolRegistry(): ToolRegistry<MinecraftToolContext
           }
         }
       }
-      const success = harvested.length > 0 && (failed.length === 0 || !stopOnFailure);
+      const complete = targets.length > 0 && harvested.length === targets.length && failed.length === 0;
+      const success = harvested.length > 0;
       return {
         ok: success,
         text: `harvested ${harvested.length}/${targets.length} target blocks${
           targets.length === 0 ? `; no matches for ${names.join(", ")}` : ""
-        }${failed.length > 0 ? `; ${failed.length} failed` : ""}`,
+        }${failed.length > 0 ? `; ${failed.length} failed` : ""}${success && !complete ? "; incomplete" : ""}`,
         data: {
           success,
+          complete,
           searchChecked: search.checked,
           matched: search.results.length,
           harvested,
@@ -1184,11 +1376,11 @@ export function createMinecraftToolRegistry(): ToolRegistry<MinecraftToolContext
   registry.register({
     name: "build_blueprint",
     description:
-      "Build a JSON blueprint bottom-up from an anchor. Use after visually choosing a clear building area.",
+      "Build a .litematic blueprint bottom-up from an anchor. Use after visually choosing a clear building area.",
     parameters: {
       type: "object",
       properties: {
-        blueprint: { type: "string", description: "Blueprint name, file path, or file basename." },
+        blueprint: { type: "string", description: ".litematic blueprint name, file path, or file basename." },
         anchor: { type: "string", enum: ["feet", "relative"], default: "feet" },
         offset: {
           type: "array",
@@ -1221,6 +1413,250 @@ export function createMinecraftToolRegistry(): ToolRegistry<MinecraftToolContext
         limit: typeof args.limit === "number" ? args.limit : undefined,
       });
       return ok(`blueprint ${blueprint.name}: placed=${summary.placed} skipped=${summary.skipped} failed=${summary.failed.length}`, summary as unknown as JsonValue);
+    },
+  });
+
+  registry.register({
+    name: "material_plan",
+    description:
+      "Estimate project or blueprint material requirements from current inventory. Use before large builds to decide whether to gather, craft, or import/build a blueprint.",
+    parameters: {
+      type: "object",
+      properties: {
+        project: { type: "string", description: "Project preset or label, e.g. large_wooden_castle." },
+        blueprint: { type: "string", description: "Optional local .litematic blueprint name/path to derive exact block counts." },
+        scale: { type: "string", enum: ["small", "medium", "large"] },
+        required: {
+          type: "array",
+          description: "Optional explicit required item counts.",
+          items: {
+            type: "object",
+            properties: {
+              name: { type: "string" },
+              count: { type: "number" },
+            },
+            required: ["name", "count"],
+            additionalProperties: false,
+          },
+        },
+      },
+      required: ["project"],
+      additionalProperties: false,
+    },
+    execute: async (args, ctx) => {
+      const blueprintName = typeof args.blueprint === "string" && args.blueprint.trim() ? args.blueprint.trim() : "";
+      const blueprint = blueprintName
+        ? (await resolveBlueprint(ctx.config.paths.blueprints, blueprintName)).blueprint
+        : undefined;
+      const required = Array.isArray(args.required)
+        ? args.required
+            .filter((item): item is JsonObject => Boolean(item && typeof item === "object" && !Array.isArray(item)))
+            .map((item) => ({
+              name: typeof item.name === "string" ? item.name : "",
+              count: typeof item.count === "number" ? item.count : 0,
+            }))
+            .filter((item) => item.name && item.count > 0)
+        : undefined;
+      const plan = planMaterials({
+        project: requiredString(args, "project"),
+        inventory: ctx.bot.inventorySummary(),
+        blueprint,
+        required,
+        scale:
+          args.scale === "small" || args.scale === "medium" || args.scale === "large"
+            ? args.scale
+            : undefined,
+      });
+      const status = plan.missing.length === 0 ? "ready" : "missing materials";
+      return ok(
+        `material plan ${plan.project}: ${status}; available=${plan.available.planksEquivalent} plank-equivalent required=${plan.required.planksEquivalent}`,
+        plan as unknown as JsonValue,
+      );
+    },
+  });
+
+  registry.register({
+    name: "blueprint_library_list",
+    description:
+      "List bundled .litematic blueprint-library entries that can be imported into the local blueprints folder. Use this before improvising common structures.",
+    parameters: {
+      type: "object",
+      properties: {},
+      additionalProperties: false,
+    },
+    execute: async (_args, ctx) => {
+      const entries = await listBlueprintLibrary(ctx.config.paths.blueprintLibrary);
+      return ok(`found ${entries.length} library blueprint${entries.length === 1 ? "" : "s"}`, entries as unknown as JsonValue);
+    },
+  });
+
+  registry.register({
+    name: "blueprint_library_import",
+    description:
+      "Import a bundled .litematic library blueprint into the local blueprints folder so build_blueprint and material_plan can use it.",
+    parameters: {
+      type: "object",
+      properties: {
+        name: { type: "string", description: ".litematic library blueprint name or file basename." },
+        overwrite: { type: "boolean" },
+      },
+      required: ["name"],
+      additionalProperties: false,
+    },
+    execute: async (args, ctx) => {
+      const imported = await importBlueprintFromLibrary({
+        name: requiredString(args, "name"),
+        destinationDir: ctx.config.paths.blueprints,
+        sourceDir: ctx.config.paths.blueprintLibrary,
+        overwrite: args.overwrite === true,
+      });
+      return ok(`imported blueprint ${imported.name}`, imported as unknown as JsonValue);
+    },
+  });
+
+  registry.register({
+    name: "subagent_spawn",
+    description:
+      "Spawn a model-only child subagent for background planning or decomposition. Defaults to isolated context; use context=fork only when the child needs a compact parent snapshot. Subagents cannot use Minecraft tools.",
+    parameters: {
+      type: "object",
+      properties: {
+        task: { type: "string" },
+        role: { type: "string" },
+        label: { type: "string" },
+        agentId: { type: "string", description: "Stable logical child-agent id, such as builder-planner." },
+        parentRunId: { type: "string", description: "Optional parent turn/run identifier for traceability." },
+        context: { type: "string", enum: ["isolated", "fork"], default: "isolated" },
+        forkedContext: {
+          type: "string",
+          description: "Optional compact context snapshot. If omitted with context=fork, the tool builds one from local state.",
+        },
+        model: { type: "string", description: "Optional model override for this child run." },
+        thinking: { type: "string", enum: ["none", "low", "medium", "high", "xhigh"] },
+        runTimeoutSeconds: { type: "number", minimum: 1, maximum: 1800 },
+        mode: { type: "string", enum: ["run", "session"], default: "run" },
+        cleanup: { type: "string", enum: ["keep", "delete"], default: "keep" },
+      },
+      required: ["task"],
+      additionalProperties: false,
+    },
+    execute: async (args, ctx) => {
+      if (!ctx.subagents) {
+        throw new Error("Subagent manager is not available.");
+      }
+      const task = requiredString(args, "task");
+      const contextMode = args.context === "fork" ? "fork" : "isolated";
+      const timeoutSeconds = optionalNumber(args, "runTimeoutSeconds", 0);
+      const run = await ctx.subagents.spawn({
+        task,
+        role: typeof args.role === "string" ? args.role : undefined,
+        label: typeof args.label === "string" ? args.label : undefined,
+        agentId: typeof args.agentId === "string" ? args.agentId : undefined,
+        parentRunId: typeof args.parentRunId === "string" ? args.parentRunId : undefined,
+        contextMode,
+        forkedContext:
+          contextMode === "fork"
+            ? typeof args.forkedContext === "string" && args.forkedContext.trim()
+              ? args.forkedContext
+              : await buildSubagentForkContext(ctx, task)
+            : undefined,
+        model: typeof args.model === "string" ? args.model : undefined,
+        thinking: typeof args.thinking === "string" ? args.thinking : undefined,
+        mode: typeof args.mode === "string" ? args.mode : undefined,
+        cleanup: typeof args.cleanup === "string" ? args.cleanup : undefined,
+        runTimeoutMs: timeoutSeconds > 0 ? Math.floor(timeoutSeconds * 1000) : undefined,
+      });
+      return ok(`spawned subagent ${run.id}`, run as unknown as JsonValue);
+    },
+  });
+
+  registry.register({
+    name: "subagent_list",
+    description: "List current and recent subagent runs with status/result summaries.",
+    parameters: {
+      type: "object",
+      properties: {},
+      additionalProperties: false,
+    },
+    execute: async (_args, ctx) => {
+      if (!ctx.subagents) {
+        throw new Error("Subagent manager is not available.");
+      }
+      const runs = ctx.subagents.list();
+      return ok(`subagents ${runs.length}`, runs as unknown as JsonValue);
+    },
+  });
+
+  registry.register({
+    name: "subagent_status",
+    description: "Read a specific subagent run. Optionally wait briefly for completion.",
+    parameters: {
+      type: "object",
+      properties: {
+        id: { type: "string" },
+        waitMs: { type: "number", minimum: 0, maximum: 120000 },
+      },
+      required: ["id"],
+      additionalProperties: false,
+    },
+    execute: async (args, ctx) => {
+      if (!ctx.subagents) {
+        throw new Error("Subagent manager is not available.");
+      }
+      const id = requiredString(args, "id");
+      const run = await ctx.subagents.waitFor(id, optionalNumber(args, "waitMs", 0));
+      return run ? ok(`subagent ${run.id} ${run.status}`, run as unknown as JsonValue) : ok(`subagent not found: ${id}`);
+    },
+  });
+
+  registry.register({
+    name: "subagent_send",
+    description:
+      "Send a message or steering instruction to a running child subagent. Use this to refine a background child instead of spawning duplicate children.",
+    parameters: {
+      type: "object",
+      properties: {
+        id: { type: "string" },
+        message: { type: "string" },
+        type: { type: "string", enum: ["message", "steer"], default: "steer" },
+      },
+      required: ["id", "message"],
+      additionalProperties: false,
+    },
+    execute: async (args, ctx) => {
+      if (!ctx.subagents) {
+        throw new Error("Subagent manager is not available.");
+      }
+      const id = requiredString(args, "id");
+      const message = await ctx.subagents.send(id, requiredString(args, "message"), {
+        type: args.type === "message" ? "message" : "steer",
+      });
+      return ok(`sent to subagent ${id}`, message as unknown as JsonValue);
+    },
+  });
+
+  registry.register({
+    name: "subagent_cancel",
+    description: "Cancel a running child subagent when its work is obsolete, duplicated, or unsafe to wait for.",
+    parameters: {
+      type: "object",
+      properties: {
+        id: { type: "string" },
+        reason: { type: "string" },
+      },
+      required: ["id"],
+      additionalProperties: false,
+    },
+    execute: async (args, ctx) => {
+      if (!ctx.subagents) {
+        throw new Error("Subagent manager is not available.");
+      }
+      const id = requiredString(args, "id");
+      const run = await ctx.subagents.cancel(
+        id,
+        typeof args.reason === "string" && args.reason.trim() ? args.reason.trim() : "cancelled by parent",
+      );
+      return ok(`subagent ${run.id} ${run.status}`, run as unknown as JsonValue);
     },
   });
 
@@ -1885,9 +2321,15 @@ export function createMinecraftToolRegistry(): ToolRegistry<MinecraftToolContext
         }
       }
       const executed = results.length;
-      const text = `${success ? "executed" : "failed"} ${executed}/${selectedSteps.length} planned atomic steps${
-        parsedSteps.length > selectedSteps.length ? `; truncated from ${parsedSteps.length}` : ""
-      }`;
+      const succeeded = results.filter((item) => item.ok).length;
+      const failed = results.length - succeeded;
+      const text = success
+        ? `executed ${executed}/${selectedSteps.length} planned atomic steps${
+            parsedSteps.length > selectedSteps.length ? `; truncated from ${parsedSteps.length}` : ""
+          }`
+        : `executed ${executed}/${selectedSteps.length} planned atomic steps; succeeded=${succeeded}; failed=${failed}${
+            stopOnFailure && failed > 0 ? "; stopped on first failure" : ""
+          }${parsedSteps.length > selectedSteps.length ? `; truncated from ${parsedSteps.length}` : ""}`;
       return {
         ok: success,
         text,

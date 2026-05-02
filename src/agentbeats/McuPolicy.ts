@@ -467,83 +467,6 @@ function repairDecisionForTask(decision: McuPolicyDecision, taskText: string, st
   };
 }
 
-function heuristicAction(taskText: string, step: number): McuPolicyDecision {
-  const task = taskText.toLowerCase();
-  const action = defaultMcuAction();
-  const scanYaw = step % 32 < 16 ? 8 : -8;
-
-  if (isCraftingLikeTask(taskText)) {
-    if (step === 0 || step % 24 === 0) {
-      action.inventory = 1;
-      return { ...ACTION_PAYLOAD_PREFIX, hold_steps: 1, action };
-    }
-    action["hotbar.1"] = step % 24 === 4 ? 1 : 0;
-    action.use = step % 12 >= 6 ? 1 : 0;
-    action.camera = [0, scanYaw];
-    return { ...ACTION_PAYLOAD_PREFIX, hold_steps: 2, action };
-  }
-
-  if (/\bdrop\b|丟棄|丟掉|扔掉/.test(task)) {
-    if (step === 0 || step % 16 === 0) {
-      action.inventory = 1;
-      return { ...ACTION_PAYLOAD_PREFIX, hold_steps: 1, action };
-    }
-    action.drop = step % 8 === 4 ? 1 : 0;
-    return { ...ACTION_PAYLOAD_PREFIX, hold_steps: 1, action };
-  }
-
-  if (/throw|snowball|拋|扔/.test(task)) {
-    action["hotbar.1"] = step === 0 ? 1 : 0;
-    action.use = step % 6 >= 3 ? 1 : 0;
-    action.camera = [-2, scanYaw];
-    return { ...ACTION_PAYLOAD_PREFIX, hold_steps: 1, action };
-  }
-
-  if (/wool|shear|sheep|羊毛|剪羊|綿羊/.test(task)) {
-    action.forward = step % 18 < 12 ? 1 : 0;
-    action.use = step % 18 >= 8 ? 1 : 0;
-    action.camera = [step % 30 < 10 ? 0 : 2, scanYaw];
-    return { ...ACTION_PAYLOAD_PREFIX, hold_steps: action.use ? 2 : 3, action };
-  }
-
-  if (/grass|草/.test(task)) {
-    action.forward = 1;
-    action.attack = step % 20 >= 4 ? 1 : 0;
-    action.camera = [step % 20 >= 4 ? 5 : 0, scanYaw];
-    return { ...ACTION_PAYLOAD_PREFIX, hold_steps: action.attack ? 4 : 2, action };
-  }
-
-  if (/tree|wood|log|oak|spruce|birch|jungle|acacia|dark oak|mangrove|cherry|木|樹|砍/.test(task)) {
-    action.forward = 1;
-    action.sprint = step % 30 < 10 ? 1 : 0;
-    action.attack = step % 24 >= 12 ? 1 : 0;
-    action.camera = [step % 24 >= 12 ? 2 : -2, step % 24 >= 12 ? 0 : scanYaw];
-    return { ...ACTION_PAYLOAD_PREFIX, hold_steps: action.attack ? 6 : 3, action };
-  }
-
-  if (/mine|mining|stone|cobble|diamond|iron|coal|ore|dig|挖|礦|石/.test(task)) {
-    action.forward = step % 24 < 8 ? 1 : 0;
-    action.attack = 1;
-    action.camera = [step % 24 < 8 ? 6 : 2, step % 40 < 20 ? 6 : -6];
-    return { ...ACTION_PAYLOAD_PREFIX, hold_steps: /obsidian/.test(task) ? 10 : 5, action };
-  }
-
-  if (/build|place|house|hut|tower|bridge|造|建|放置/.test(task)) {
-    action["hotbar.1"] = step % 40 === 0 ? 1 : 0;
-    action.use = step % 12 >= 8 ? 1 : 0;
-    action.forward = step % 12 < 5 ? 1 : 0;
-    action.jump = action.use;
-    action.camera = [action.use ? 10 : 8, step % 24 < 12 ? 8 : -8];
-    return { ...ACTION_PAYLOAD_PREFIX, hold_steps: action.use ? 2 : 3, action };
-  }
-
-  action.forward = 1;
-  action.sprint = 1;
-  action.jump = step % 18 === 0 ? 1 : 0;
-  action.camera = [0, scanYaw];
-  return { ...ACTION_PAYLOAD_PREFIX, hold_steps: 3, action };
-}
-
 function compactRecentActions(actions: McuEnvAction[]): string {
   return actions
     .slice(-8)
@@ -591,8 +514,16 @@ export class McuVisualPolicy {
       return this.handleInit(contextId, payload as McuInitPayload);
     }
     if (payload.type === "obs") {
-      const decision = await this.handleObservation(contextId, payload as McuObservationPayload);
-      return JSON.stringify(toCompactMcuAgentActionPayload(decision.action));
+      try {
+        const decision = await this.handleObservation(contextId, payload as McuObservationPayload);
+        return JSON.stringify(toCompactMcuAgentActionPayload(decision.action));
+      } catch (error) {
+        return JSON.stringify({
+          type: "ack",
+          success: false,
+          message: error instanceof Error ? error.message : String(error),
+        });
+      }
     }
 
     return JSON.stringify({
@@ -638,19 +569,18 @@ export class McuVisualPolicy {
       state.recentObservationImages = state.recentObservationImages.slice(-3);
     }
 
+    if (!this.config.openai.apiKey) {
+      throw new Error("OPENAI_API_KEY or API_KEY is required for AgentBeats observations; heuristic fallback actions are disabled.");
+    }
+    if (state.recentObservationImages.length === 0) {
+      throw new Error("AgentBeats observation image is required; heuristic fallback actions are disabled.");
+    }
+
     if (step <= state.holdUntilStep && !shouldUseModelOnStep(step, this.config.agentbeats.modelEveryNSteps)) {
       return { ...ACTION_PAYLOAD_PREFIX, action: state.lastAction, hold_steps: 1 };
     }
 
-    let decision: McuPolicyDecision | undefined;
-    if (this.config.openai.apiKey && payload.obs) {
-      try {
-        decision = await this.modelDecision(state, step);
-      } catch (error) {
-        console.warn(`[agentbeats] model decision failed: ${formatModelProviderError(error)}. Using heuristic action.`);
-      }
-    }
-    decision ??= heuristicAction(state.taskText, step);
+    let decision = await this.modelDecision(state, step);
     decision = repairDecisionForTask(decision, state.taskText, step);
 
     const holdSteps = Math.max(

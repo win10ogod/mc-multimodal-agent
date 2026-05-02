@@ -77,4 +77,49 @@ describe("execute_steps tool", () => {
     expect(result.text).toContain("no matches");
     expect((result.data as { executedSteps: unknown[] }).executedSteps).toHaveLength(1);
   });
+
+  it("treats partial harvest success as progress while reporting incomplete work", async () => {
+    const registry = createMinecraftToolRegistry();
+    let digCount = 0;
+    let gotoCount = 0;
+    const result = await registry.execute(
+      "harvest_nearby_blocks",
+      {
+        names: ["_log"],
+        match: "suffix",
+        count: 2,
+        maxDistance: 1,
+        verticalRange: 1,
+      },
+      {
+        ...makeContext(() => undefined),
+        bot: {
+          ensureConnected: () => undefined,
+          raw: {
+            entity: { position: { x: 0, y: 64, z: 0 } },
+            blockAt: (pos: { x: number; y: number; z: number }) =>
+              pos.y === 64 && (pos.x === 0 || pos.x === -1) && pos.z === 0 ? { name: "oak_log" } : { name: "air" },
+          },
+          gotoNear: async () => {
+            gotoCount += 1;
+            throw new Error("redundant pathfind before digAt");
+          },
+          digAt: async () => {
+            digCount += 1;
+            if (digCount === 1) {
+              return "oak_log";
+            }
+            throw new Error("simulated unreachable second log");
+          },
+        },
+      } as unknown as MinecraftToolContext,
+    );
+
+    expect(result.ok).toBe(true);
+    expect(result.text).toContain("harvested 1/2");
+    expect(result.text).toContain("incomplete");
+    expect((result.data as { complete: boolean; success: boolean }).success).toBe(true);
+    expect((result.data as { complete: boolean; success: boolean }).complete).toBe(false);
+    expect(gotoCount).toBe(0);
+  });
 });

@@ -596,6 +596,16 @@ export function parseStructuredAgentTurn(text: string): ProviderTurn | undefined
   if (batchedCalls.length > 0) {
     return { text: "", toolCalls: batchedCalls };
   }
+  const envelopeCalls = actionEnvelopeCalls(parsed);
+  if (envelopeCalls.length > 0) {
+    return {
+      text: "",
+      toolCalls: envelopeCalls.map((call, index) => ({
+        id: `structured_call_${index + 1}`,
+        ...call,
+      })),
+    };
+  }
   const name = normalizeToolName(parsed.tool_name ?? parsed.tool ?? parsed.name);
   if (!name) {
     return undefined;
@@ -695,10 +705,11 @@ export function parseSkillDraft(text: string): SkillDraft | undefined {
 
 function turnFromTextAndToolCalls(text: string, nativeToolCalls: ProviderToolCall[]): ProviderTurn {
   const structuredTurn = parseStructuredAgentTurn(text);
+  const normalizedNativeToolCalls = normalizeProviderToolCalls(nativeToolCalls);
   if (nativeToolCalls.length > 0) {
     return {
       text: structuredTurn?.text ?? text,
-      toolCalls: nativeToolCalls,
+      toolCalls: normalizedNativeToolCalls,
     };
   }
   if (structuredTurn) {
@@ -717,6 +728,10 @@ function toolCallFromObject(value: unknown): Omit<ProviderToolCall, "id">[] {
   }
   if (!isRecord(value)) {
     return [];
+  }
+  const actionCalls = actionEnvelopeCalls(value);
+  if (actionCalls.length > 0) {
+    return actionCalls;
   }
 
   const nestedCalls = value.tool_calls ?? value.toolCalls ?? value.calls;
@@ -753,6 +768,57 @@ function toolCallFromObject(value: unknown): Omit<ProviderToolCall, "id">[] {
       arguments: stringifyArguments(value.arguments ?? value.args ?? value.parameters ?? value.input ?? {}),
     },
   ];
+}
+
+function actionEnvelopeCalls(value: unknown): Omit<ProviderToolCall, "id">[] {
+  if (!isRecord(value)) {
+    return [];
+  }
+  const action = value.action ?? value.type;
+  if (action !== "tool_call" && action !== "tool_calls") {
+    return [];
+  }
+  const batched = value.tool_calls ?? value.toolCalls ?? value.calls;
+  if (Array.isArray(batched)) {
+    return batched.flatMap((entry) => toolCallFromObject(entry));
+  }
+
+  const embeddedTool = value.tool ?? value.tool_call ?? value.toolCall ?? value.call;
+  if (embeddedTool !== undefined) {
+    const parsed = parseMaybeJson(embeddedTool);
+    const calls = toolCallFromObject(parsed);
+    if (calls.length > 0) {
+      return calls;
+    }
+  }
+
+  const name = normalizeToolName(value.tool_name ?? value.name);
+  if (!name) {
+    return [];
+  }
+  return [
+    {
+      name,
+      arguments: normalizeArgumentsJson(value.arguments_json ?? value.arguments ?? value.args ?? {}),
+    },
+  ];
+}
+
+export function normalizeProviderToolCalls(calls: ProviderToolCall[]): ProviderToolCall[] {
+  return calls.flatMap((call) => {
+    if (call.name !== "action") {
+      return [call];
+    }
+    const unwrapped = actionEnvelopeCalls(parseMaybeJson(call.arguments));
+    if (unwrapped.length === 0) {
+      return [call];
+    }
+    return unwrapped.map((entry, index) => ({
+      id: unwrapped.length === 1 ? call.id : `${call.id}_${index + 1}`,
+      name: entry.name,
+      arguments: entry.arguments,
+    }));
+  });
 }
 
 function jsonCandidates(text: string): string[] {
@@ -819,7 +885,7 @@ export function parseTextToolCalls(text: string): ProviderToolCall[] {
   }
 
   const seen = new Set<string>();
-  return parsedCalls
+  const calls = parsedCalls
     .filter((call) => {
       const key = `${call.name}\n${call.arguments}`;
       if (seen.has(key)) {
@@ -832,6 +898,7 @@ export function parseTextToolCalls(text: string): ProviderToolCall[] {
       id: `text_call_${index + 1}`,
       ...call,
     }));
+  return normalizeProviderToolCalls(calls);
 }
 
 function extractResponsesText(response: any): string {

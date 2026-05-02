@@ -6,6 +6,7 @@ import type { GoalStore } from "../goals/GoalStore";
 import type { SkillLibrary } from "../skills/SkillLibrary";
 import type { JsonObject, SessionLoopState, ToolResult } from "../types";
 import { listBlueprints } from "../blueprint/Blueprint";
+import { listBlueprintLibrary } from "../blueprint/BlueprintLibrary";
 import { readTextFile } from "../utils/fs";
 import {
   createModelProvider,
@@ -18,6 +19,7 @@ import type { MinecraftToolContext } from "../tools/MinecraftTools";
 import type { ToolRegistry } from "../tools/ToolRegistry";
 import { compactText, digest, parseJsonObject } from "../utils/misc";
 import { buildBaseSystemPrompt, buildTurnInstructions } from "./systemPrompt";
+import { runWithSlowOperationWatchdog } from "./slowOperationWatchdog";
 import {
   defaultLoopDetectionConfig,
   detectToolCallLoop,
@@ -28,6 +30,7 @@ import type { MinecraftBot, PlayerGuidance } from "../bot/MinecraftBot";
 import type { VisualFrame, VisualPerception } from "../vision/VisualPerception";
 import type { ImitationObserver } from "../learning/ImitationObserver";
 import type { TaskStore } from "../tasks/TaskStore";
+import type { SubagentManager } from "../agents/SubagentManager";
 
 export type AgentLoopDeps = {
   config: AgentConfig;
@@ -41,6 +44,7 @@ export type AgentLoopDeps = {
   transcript: TranscriptStore;
   imitation?: ImitationObserver;
   tasks?: TaskStore;
+  subagents?: SubagentManager;
 };
 
 type ExecutedToolStep = {
@@ -159,21 +163,26 @@ export class AgentLoop {
       const vision = await this.captureVisionContext();
       let currentResponse: ProviderTurn;
       try {
-        currentResponse = await this.provider.start({
-          instructions: await this.buildInstructions(effectiveTask),
-          tools: this.deps.tools.definitions(),
-          imageDataUrls: vision.frames.map((frame) => frame.dataUrl),
-          text: this.buildSegmentPrompt({
-            task: effectiveTask,
-            segment,
-            maxSegments,
-            checkpoint,
-            frameText: vision.text,
-            overallStartedAt,
-            overallDeadline,
-            totalToolCallCount,
-          }),
-        });
+        currentResponse = await this.runWithSlowOperationLog(
+          "model_still_waiting",
+          { phase: "start", segment },
+          async () =>
+            this.provider.start({
+              instructions: await this.buildInstructions(effectiveTask),
+              tools: this.deps.tools.definitions(),
+              imageDataUrls: vision.frames.map((frame) => frame.dataUrl),
+              text: this.buildSegmentPrompt({
+                task: effectiveTask,
+                segment,
+                maxSegments,
+                checkpoint,
+                frameText: vision.text,
+                overallStartedAt,
+                overallDeadline,
+                totalToolCallCount,
+              }),
+            }),
+        );
       } catch (error) {
         stopReason = this.modelProviderStopReason(error, "start");
         this.logFlow("model_provider_error", {
@@ -221,7 +230,7 @@ export class AgentLoop {
           break;
         }
 
-        const outputs = [];
+        const outputs: Array<{ callId: string; name: string; result: ToolResult }> = [];
         for (const call of toolCalls) {
           if (segmentToolCallCount >= this.deps.config.loop.maxToolCalls) {
             segmentStopReason = `Segment ${segment}: tool call limit reached (${this.deps.config.loop.maxToolCalls}).`;
@@ -260,7 +269,11 @@ export class AgentLoop {
             await this.deps.transcript.append({ role: "system", text: loop.message });
             this.logFlow("tool_loop_warning", { tool: name, callId, message: loop.message });
           }
-          const rawResult = await this.deps.tools.execute(name, args as JsonObject, this.toolContext());
+          const rawResult = await this.runWithSlowOperationLog(
+            "tool_still_running",
+            { segment, callId, tool: name, totalToolCallCount },
+            () => this.deps.tools.execute(name, args as JsonObject, this.toolContext()),
+          );
           const result = this.enrichActionToolResult(name, rawResult);
           recordToolOutcome(this.state, name, args, callId, result);
           this.logToolResult(segment, segmentToolCallCount, totalToolCallCount, callId, name, result);
@@ -303,11 +316,16 @@ export class AgentLoop {
         }
         modelTurnCount += 1;
         try {
-          currentResponse = await this.provider.continue({
-            instructions: await this.buildInstructions(effectiveTask),
-            tools: this.deps.tools.definitions(),
-            toolOutputs: outputs,
-          });
+          currentResponse = await this.runWithSlowOperationLog(
+            "model_still_waiting",
+            { phase: "continue", segment, turn: modelTurnCount },
+            async () =>
+              this.provider.continue({
+                instructions: await this.buildInstructions(effectiveTask),
+                tools: this.deps.tools.definitions(),
+                toolOutputs: outputs,
+              }),
+          );
         } catch (error) {
           fatalStopReason = this.modelProviderStopReason(error, "continue");
           this.logFlow("model_provider_error", {
@@ -746,6 +764,43 @@ export class AgentLoop {
     console.log(`[agent-flow] ${new Date().toISOString()} ${event}${payload === "{}" ? "" : ` ${payload}`}`);
   }
 
+  private async runWithSlowOperationLog<T>(
+    event: "model_still_waiting" | "tool_still_running",
+    data: Record<string, unknown>,
+    action: () => Promise<T>,
+  ): Promise<T> {
+    const thresholdMs = this.deps.config.observability.logInternalFlow
+      ? Math.max(0, this.deps.config.observability.slowOperationLogMs)
+      : 0;
+    return runWithSlowOperationWatchdog({
+      label: event,
+      thresholdMs,
+      snapshot: () => ({
+        ...data,
+        connection: this.safeConnectionSummary(),
+        navigation: this.safeNavigationStatus(),
+      }),
+      log: (payload) => this.logFlow(event, payload),
+      action,
+    });
+  }
+
+  private safeConnectionSummary(): string {
+    try {
+      return this.deps.bot.connectionSummary();
+    } catch (error) {
+      return error instanceof Error ? error.message : String(error);
+    }
+  }
+
+  private safeNavigationStatus(): unknown {
+    try {
+      return this.deps.bot.isConnected() ? this.deps.bot.navigationStatus() : undefined;
+    } catch (error) {
+      return error instanceof Error ? error.message : String(error);
+    }
+  }
+
   private toolContext(): MinecraftToolContext {
     return {
       config: this.deps.config,
@@ -757,13 +812,15 @@ export class AgentLoop {
       skills: this.deps.skills,
       imitation: this.deps.imitation,
       tasks: this.deps.tasks,
+      subagents: this.deps.subagents,
     };
   }
 
   private async buildInstructions(focus = ""): Promise<string> {
     const blueprints = await listBlueprints(this.deps.config.paths.blueprints);
+    const libraryBlueprints = await listBlueprintLibrary(this.deps.config.paths.blueprintLibrary);
     const recipeStatus = this.deps.bot.recipeCatalog("", 1);
-    const blueprintSection =
+    const localBlueprintSection =
       blueprints.length > 0
         ? blueprints
             .map(
@@ -772,6 +829,22 @@ export class AgentLoop {
             )
             .join("\n")
         : "No blueprint files found.";
+    const libraryBlueprintSection =
+      libraryBlueprints.length > 0
+        ? libraryBlueprints
+            .map(
+              (item) =>
+                `- ${item.name}: ${item.placements} blocks size=${item.size.x}x${item.size.y}x${item.size.z}`,
+            )
+            .join("\n")
+        : "No bundled library blueprints found.";
+    const blueprintSection = [
+      "Local blueprints:",
+      localBlueprintSection,
+      "",
+      "Bundled blueprint library:",
+      libraryBlueprintSection,
+    ].join("\n");
     return buildTurnInstructions({
       basePrompt: buildBaseSystemPrompt({
         strictVisual: this.deps.config.strictVisual,

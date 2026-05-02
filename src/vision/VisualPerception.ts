@@ -20,10 +20,24 @@ export type VisualFrame = {
 export type VisualTarget = {
   blockName: string;
   screen: { x: number; y: number };
+  screenBox: {
+    minX: number;
+    minY: number;
+    maxX: number;
+    maxY: number;
+    width: number;
+    height: number;
+  };
   blockPosition: Vec3Like;
   previousPosition?: Vec3Like;
   distance: number;
   samples: number;
+};
+
+type FramePose = {
+  position: Vec3Like;
+  yaw: number;
+  pitch: number;
 };
 
 type Rgb = [number, number, number];
@@ -113,6 +127,7 @@ function shade(color: Rgb, distance: number, maxDistance: number): Rgb {
 
 export class VisualPerception {
   private lastHits: Array<ScreenPlacementHit | undefined> = [];
+  private lastFramePose?: FramePose;
 
   constructor(
     private readonly mc: MinecraftBot,
@@ -131,6 +146,7 @@ export class VisualPerception {
     const hFov = (this.config.vision.horizontalFovDeg * Math.PI) / 180;
     const vFov = hFov * (height / width);
     const bot = this.mc.raw;
+    const framePose = this.currentPose();
 
     for (let sy = 0; sy < sampleHeight; sy += 1) {
       for (let sx = 0; sx < sampleWidth; sx += 1) {
@@ -149,6 +165,7 @@ export class VisualPerception {
 
     this.overlayEntities(png, hFov, vFov);
     this.lastHits = hits;
+    this.lastFramePose = framePose;
     const visibleBlocks = Array.from(
       new Set(hits.flatMap((hit) => (hit?.blockName ? [hit.blockName] : []))),
     ).sort();
@@ -181,6 +198,12 @@ export class VisualPerception {
       string,
       {
         hit: ScreenPlacementHit;
+        hitSx: number;
+        hitSy: number;
+        minSx: number;
+        maxSx: number;
+        minSy: number;
+        maxSy: number;
         sxTotal: number;
         syTotal: number;
         samples: number;
@@ -199,13 +222,25 @@ export class VisualPerception {
         if (existing) {
           existing.sxTotal += sx + 0.5;
           existing.syTotal += sy + 0.5;
+          existing.minSx = Math.min(existing.minSx, sx);
+          existing.maxSx = Math.max(existing.maxSx, sx);
+          existing.minSy = Math.min(existing.minSy, sy);
+          existing.maxSy = Math.max(existing.maxSy, sy);
           existing.samples += 1;
           if (hit.distance < existing.hit.distance) {
             existing.hit = hit;
+            existing.hitSx = sx;
+            existing.hitSy = sy;
           }
         } else {
           groups.set(key, {
             hit,
+            hitSx: sx,
+            hitSy: sy,
+            minSx: sx,
+            maxSx: sx,
+            minSy: sy,
+            maxSy: sy,
             sxTotal: sx + 0.5,
             syTotal: sy + 0.5,
             samples: 1,
@@ -215,22 +250,39 @@ export class VisualPerception {
     }
 
     return [...groups.values()]
-      .map((group) => ({
-        blockName: group.hit.blockName,
-        screen: {
-          x: Math.round((group.sxTotal / group.samples / sampleWidth) * this.config.vision.width),
-          y: Math.round((group.syTotal / group.samples / sampleHeight) * this.config.vision.height),
-        },
-        blockPosition: group.hit.blockPosition,
-        previousPosition: group.hit.previousPosition,
-        distance: group.hit.distance,
-        samples: group.samples,
-      }))
+      .map((group) => {
+        const minX = Math.floor((group.minSx / sampleWidth) * this.config.vision.width);
+        const maxX = Math.ceil(((group.maxSx + 1) / sampleWidth) * this.config.vision.width);
+        const minY = Math.floor((group.minSy / sampleHeight) * this.config.vision.height);
+        const maxY = Math.ceil(((group.maxSy + 1) / sampleHeight) * this.config.vision.height);
+        return {
+          blockName: group.hit.blockName,
+          screen: {
+            x: Math.round(((group.hitSx + 0.5) / sampleWidth) * this.config.vision.width),
+            y: Math.round(((group.hitSy + 0.5) / sampleHeight) * this.config.vision.height),
+          },
+          screenBox: {
+            minX,
+            minY,
+            maxX,
+            maxY,
+            width: maxX - minX,
+            height: maxY - minY,
+          },
+          blockPosition: group.hit.blockPosition,
+          previousPosition: group.hit.previousPosition,
+          distance: group.hit.distance,
+          samples: group.samples,
+        };
+      })
       .sort((a, b) => a.distance - b.distance || b.samples - a.samples)
       .slice(0, Math.max(1, Math.min(64, count)));
   }
 
   hitFromScreen(x: number, y: number): ScreenPlacementHit | undefined {
+    if (this.screenFrameStaleReason()) {
+      return undefined;
+    }
     const sx = clamp(
       Math.floor((x / this.config.vision.width) * this.config.vision.sampleWidth),
       0,
@@ -242,6 +294,34 @@ export class VisualPerception {
       this.config.vision.sampleHeight - 1,
     );
     return this.lastHits[sy * this.config.vision.sampleWidth + sx];
+  }
+
+  screenFrameStaleReason(): string | undefined {
+    if (!this.lastFramePose) {
+      return undefined;
+    }
+    const current = this.currentPose();
+    const dx = current.position.x - this.lastFramePose.position.x;
+    const dy = current.position.y - this.lastFramePose.position.y;
+    const dz = current.position.z - this.lastFramePose.position.z;
+    const moved = Math.sqrt(dx * dx + dy * dy + dz * dz);
+    if (moved > 0.75) {
+      return `bot moved ${moved.toFixed(2)} blocks since the visual frame was captured`;
+    }
+
+    const hFovDeg = this.config.vision.horizontalFovDeg;
+    const vFovDeg = hFovDeg * (this.config.vision.height / this.config.vision.width);
+    const yawTolerance = (Math.PI / 180) * Math.max(2, (hFovDeg / this.config.vision.sampleWidth) * 1.5);
+    const pitchTolerance = (Math.PI / 180) * Math.max(2, (vFovDeg / this.config.vision.sampleHeight) * 1.5);
+    const yawDrift = Math.abs(normalizeAngle(current.yaw - this.lastFramePose.yaw));
+    const pitchDrift = Math.abs(current.pitch - this.lastFramePose.pitch);
+    if (yawDrift > yawTolerance) {
+      return `camera yaw changed ${((yawDrift * 180) / Math.PI).toFixed(1)} degrees since the visual frame was captured`;
+    }
+    if (pitchDrift > pitchTolerance) {
+      return `camera pitch changed ${((pitchDrift * 180) / Math.PI).toFixed(1)} degrees since the visual frame was captured`;
+    }
+    return undefined;
   }
 
   screenToDelta(x: number, y: number): { yawDeltaDeg: number; pitchDeltaDeg: number } {
@@ -283,6 +363,16 @@ export class VisualPerception {
       };
     }
     return undefined;
+  }
+
+  private currentPose(): FramePose {
+    const bot = this.mc.raw;
+    const pos = bot.entity.position;
+    return {
+      position: { x: pos.x, y: pos.y, z: pos.z },
+      yaw: bot.entity.yaw,
+      pitch: bot.entity.pitch,
+    };
   }
 
   private skyColor(ny: number): Rgb {

@@ -1,3 +1,4 @@
+import { existsSync } from "node:fs";
 import path from "node:path";
 import dotenv from "dotenv";
 
@@ -17,6 +18,17 @@ export type AgentConfig = {
     skipRecipePackets: boolean;
     keepAliveTimeoutMs: number;
     pathfindTimeoutMs: number;
+    pathfindSearchRadius: number;
+    pathfindThinkTimeoutMs: number;
+    pathfindTickTimeoutMs: number;
+    pathfindCanDig: boolean;
+    pathfindAllow1by1Towers: boolean;
+    pathfindAllowParkour: boolean;
+    pathfindAllowSprinting: boolean;
+    pathfindAllowEntityDetection: boolean;
+    pathfindAvoidHostiles: boolean;
+    pathfindMaxDropDown: number;
+    pathfindScaffoldBlocks: string[];
     placementTimeoutMs: number;
     placementRetries: number;
     autoReconnect: boolean;
@@ -43,6 +55,12 @@ export type AgentConfig = {
       samplingProfile: "none" | "thinking" | "coding" | "instruct";
     };
   };
+  webSearch: {
+    browserCommand: string;
+    engine: "duckduckgo" | "bing";
+    timeoutMs: number;
+    maxResults: number;
+  };
   chatGuidance: {
     enabled: boolean;
     trigger: string;
@@ -62,6 +80,7 @@ export type AgentConfig = {
     logInternalFlow: boolean;
     logToolArgs: boolean;
     logToolResults: boolean;
+    slowOperationLogMs: number;
   };
   imitation: {
     enabled: boolean;
@@ -75,10 +94,12 @@ export type AgentConfig = {
     memory: string;
     transcript: string;
     blueprints: string;
+    blueprintLibrary: string;
     soul: string;
     tasks: string;
     goals: string;
     imitation: string;
+    subagents: string;
   };
   vision: {
     width: number;
@@ -139,6 +160,17 @@ function envEnum<T extends string>(name: string, values: readonly T[], fallback:
   return values.includes(raw as T) ? (raw as T) : fallback;
 }
 
+function envList(name: string, fallback: string[]): string[] {
+  const raw = process.env[name]?.trim();
+  if (!raw) {
+    return fallback;
+  }
+  return raw
+    .split(",")
+    .map((item) => item.trim())
+    .filter((item) => item.length > 0);
+}
+
 function envJsonObject(name: string): Record<string, unknown> | undefined {
   const raw = process.env[name]?.trim();
   if (!raw) {
@@ -149,6 +181,23 @@ function envJsonObject(name: string): Record<string, unknown> | undefined {
     throw new Error(`${name} must be a JSON object.`);
   }
   return parsed as Record<string, unknown>;
+}
+
+function defaultAgentBrowserCommand(root: string): string {
+  const configured = process.env.AGENT_BROWSER_COMMAND?.trim();
+  if (configured) {
+    return configured;
+  }
+  const localBin = path.resolve(
+    root,
+    "node_modules",
+    ".bin",
+    process.platform === "win32" ? "agent-browser.cmd" : "agent-browser",
+  );
+  if (existsSync(localBin)) {
+    return localBin;
+  }
+  return process.platform === "win32" ? "agent-browser.cmd" : "agent-browser";
 }
 
 function normalizeModelName(model: string): string {
@@ -181,6 +230,21 @@ export function loadConfig(projectRoot = process.cwd()): AgentConfig {
       skipRecipePackets: envBool("MC_SKIP_RECIPE_PACKETS", envBool("MC_MODDED_TOLERANT", false)),
       keepAliveTimeoutMs: envInt("MC_KEEP_ALIVE_TIMEOUT_MS", 600_000),
       pathfindTimeoutMs: envInt("MC_PATHFIND_TIMEOUT_MS", 15_000),
+      pathfindSearchRadius: envInt("MC_PATHFIND_SEARCH_RADIUS", 96),
+      pathfindThinkTimeoutMs: envInt("MC_PATHFIND_THINK_TIMEOUT_MS", 5_000),
+      pathfindTickTimeoutMs: envInt("MC_PATHFIND_TICK_TIMEOUT_MS", 40),
+      pathfindCanDig: envBool("MC_PATHFIND_CAN_DIG", true),
+      pathfindAllow1by1Towers: envBool("MC_PATHFIND_ALLOW_1BY1_TOWERS", true),
+      pathfindAllowParkour: envBool("MC_PATHFIND_ALLOW_PARKOUR", true),
+      pathfindAllowSprinting: envBool("MC_PATHFIND_ALLOW_SPRINTING", true),
+      pathfindAllowEntityDetection: envBool("MC_PATHFIND_ALLOW_ENTITY_DETECTION", true),
+      pathfindAvoidHostiles: envBool("MC_PATHFIND_AVOID_HOSTILES", true),
+      pathfindMaxDropDown: envInt("MC_PATHFIND_MAX_DROP_DOWN", 4),
+      pathfindScaffoldBlocks: envList("MC_PATHFIND_SCAFFOLD_BLOCKS", [
+        "dirt",
+        "cobblestone",
+        "netherrack",
+      ]),
       placementTimeoutMs: envInt("MC_PLACEMENT_TIMEOUT_MS", 15_000),
       placementRetries: envInt("MC_PLACEMENT_RETRIES", 2),
       autoReconnect: envBool("MC_AUTO_RECONNECT", true),
@@ -220,6 +284,12 @@ export function loadConfig(projectRoot = process.cwd()): AgentConfig {
         ),
       },
     },
+    webSearch: {
+      browserCommand: defaultAgentBrowserCommand(root),
+      engine: envEnum("AGENT_WEB_SEARCH_ENGINE", ["duckduckgo", "bing"] as const, "duckduckgo"),
+      timeoutMs: envInt("AGENT_WEB_SEARCH_TIMEOUT_MS", 30_000),
+      maxResults: envInt("AGENT_WEB_SEARCH_MAX_RESULTS", 5),
+    },
     chatGuidance: {
       enabled: envBool("AGENT_CHAT_GUIDANCE", true),
       trigger: process.env.AGENT_CHAT_TRIGGER?.trim() || "!agent",
@@ -239,6 +309,7 @@ export function loadConfig(projectRoot = process.cwd()): AgentConfig {
       logInternalFlow: envBool("AGENT_LOG_INTERNAL_FLOW", true),
       logToolArgs: envBool("AGENT_LOG_TOOL_ARGS", true),
       logToolResults: envBool("AGENT_LOG_TOOL_RESULTS", true),
+      slowOperationLogMs: envInt("AGENT_SLOW_OPERATION_LOG_MS", 10_000),
     },
     imitation: {
       enabled: envBool("IMITATION_ENABLED", true),
@@ -252,10 +323,12 @@ export function loadConfig(projectRoot = process.cwd()): AgentConfig {
       memory: path.resolve(stateDir, "memory"),
       transcript: path.resolve(stateDir, "transcripts/main.jsonl"),
       blueprints: path.resolve(root, "blueprints"),
+      blueprintLibrary: path.resolve(root, "data/blueprint-library"),
       soul: path.resolve(root, process.env.AGENT_SOUL_FILE ?? "soul.md"),
       tasks: path.resolve(stateDir, "tasks.json"),
       goals: path.resolve(stateDir, "goals.json"),
       imitation: path.resolve(stateDir, "imitation.jsonl"),
+      subagents: path.resolve(stateDir, "subagents.json"),
     },
     vision: {
       width: envInt("VISION_WIDTH", 320),

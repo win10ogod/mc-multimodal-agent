@@ -59,13 +59,23 @@ export async function appendJsonl(filePath: string, value: unknown): Promise<voi
 export async function readJsonl<T>(filePath: string, maxEntries?: number): Promise<T[]> {
   try {
     const raw = await fs.readFile(filePath, "utf8");
-    const lines = raw
-      .split(/\r?\n/)
-      .map((line) => line.trim())
-      .filter(Boolean);
-    const selected =
-      typeof maxEntries === "number" && maxEntries > 0 ? lines.slice(-maxEntries) : lines;
-    return selected.map((line) => JSON.parse(line) as T);
+    const entries: T[] = [];
+
+    for (const rawLine of raw.split(/\r?\n/)) {
+      const line = rawLine.replace(/\u0000/g, "").trim();
+      if (!line) {
+        continue;
+      }
+
+      try {
+        entries.push(JSON.parse(line) as T);
+      } catch {
+        // JSONL files are append-only runtime logs. A crash can leave a partial line;
+        // keep the readable history instead of blocking startup or compaction.
+      }
+    }
+
+    return typeof maxEntries === "number" && maxEntries > 0 ? entries.slice(-maxEntries) : entries;
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") {
       return [];

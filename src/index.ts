@@ -41,8 +41,9 @@ async function runBackgroundTask(label: string, action: () => Promise<string>): 
 
 function stoppedBecauseDisconnected(result: string | undefined): boolean {
   return Boolean(
-    result?.includes("Minecraft bot left the game") ||
+      result?.includes("Minecraft bot left the game") ||
       result?.includes("Minecraft bot is not in game") ||
+      result?.includes("invalid bot position") ||
       result?.includes("keepAliveError"),
   );
 }
@@ -59,6 +60,7 @@ async function makeAgent() {
   const { VisualPerception } = await import("./vision/VisualPerception");
   const { TaskStore } = await import("./tasks/TaskStore");
   const { ImitationObserver } = await import("./learning/ImitationObserver");
+  const { SubagentManager, createModelSubagentRunner } = await import("./agents/SubagentManager");
   const config = loadConfig();
   assertRunnableConfig(config);
   const catalog = new ItemCatalog(config.paths.itemCatalog, config.minecraft.version);
@@ -72,6 +74,8 @@ async function makeAgent() {
   const transcript = new TranscriptStore(config.paths.transcript);
   const tasks = new TaskStore(config.paths.tasks);
   await tasks.load();
+  const subagents = new SubagentManager(config.paths.subagents, createModelSubagentRunner(config));
+  await subagents.load();
   const bot = new MinecraftBot(config);
   await bot.connect();
   catalog.syncRuntimeRegistry(bot.runtimeRegistrySnapshot());
@@ -119,8 +123,9 @@ async function makeAgent() {
     transcript,
     tasks,
     imitation,
+    subagents,
   });
-  return { bot, loop, tasks, config, catalog, memory, goals, imitation };
+  return { bot, loop, tasks, config, catalog, memory, goals, imitation, subagents };
 }
 
 type AgentSession = Awaited<ReturnType<typeof makeAgent>>;

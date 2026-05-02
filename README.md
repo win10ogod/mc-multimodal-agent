@@ -8,13 +8,14 @@ Mineflayer + OpenAI Responses API agent for a human-like Minecraft player. It fo
 - OpenAI Responses API or Chat Completions API, including OpenAI-compatible base URLs.
 - Visual-first control: the model receives a first-person raster frame and acts through screen coordinates.
 - Mineflayer movement, looking, digging, placing, crafting, inventory, chat, and pathfinding tools.
+- Browser-backed `web_search` tool powered by `agent-browser` for external docs and current public references.
 - Dynamic item/block catalog with arbitrary user-defined fields.
 - Persistent goal trees for autonomous long tasks, plus LevelDB-backed layered memory notes, indexed recall, recent transcript context, pre-compaction durable flushes, and skill snapshots.
 - `soul.md` persona file, loaded into every turn.
 - Learning new skills from scratch through `record_skill`, stored as paired `.json` and `.md` files.
 - Scheduled tasks that can run one-shot or on intervals.
 - In-game player guidance through chat, and nearby-player imitation traces.
-- Blueprint loading and bottom-up block placement from JSON layer drawings.
+- Blueprint loading and bottom-up block placement from `.litematic` files.
 - Runtime registry sync for arbitrary server versions and modded item/block names.
 
 ## Setup
@@ -22,13 +23,14 @@ Mineflayer + OpenAI Responses API agent for a human-like Minecraft player. It fo
 ```bash
 cd mc-multimodal-agent
 npm install
+npx agent-browser install
 cp .env.example .env
 ```
 
 Edit `.env`, then run:
 
 ```bash
-npm run dev -- start --task "Look around, learn the area, then build blueprints/example-hut.json from the current position."
+npm run dev -- start --task "Look around, learn the area, then build blueprints/example-hut.litematic from the current position."
 ```
 
 For hard visual planning use `OPENAI_MODEL=gpt-5.5`. For cheaper iteration use `gpt-5.4-mini`.
@@ -50,6 +52,13 @@ Transient model transport failures such as local server restarts, socket resets,
 timeouts, `429`, and `5xx` responses are retried with exponential backoff. If
 the provider is still unavailable after retries, the current task is stopped
 with a checkpoint instead of crashing the background chat loop.
+
+`web_search` uses the local `agent-browser` CLI to drive a real browser, so it
+works across the same Windows/macOS/Linux paths supported by that project. Tune
+it with `AGENT_BROWSER_COMMAND`, `AGENT_WEB_SEARCH_ENGINE`,
+`AGENT_WEB_SEARCH_TIMEOUT_MS`, and `AGENT_WEB_SEARCH_MAX_RESULTS`. The tool does
+not fall back to HTTP scraping; if the browser CLI or Chrome is unavailable it
+returns an actionable error.
 
 When structured outputs are enabled, each agent turn is constrained to this shape. Use `tool_call` to execute one tool, or `final` for a user-facing answer:
 
@@ -217,6 +226,11 @@ center image during active tasks.
 
 Pathfinding skips work when the bot is already close enough to the target, and
 `MC_PATHFIND_TIMEOUT_MS=15000` prevents unreachable goals from freezing a task.
+The pathfinder Movements policy is configurable through `MC_PATHFIND_*`
+settings. By default it follows mineflayer-pathfinder's capable movement model,
+adds common scaffold blocks, avoids hostile entity hitboxes, and marks hazards
+such as cactus, magma, powder snow, campfires, fire, and lava as high-cost
+terrain.
 Placement tools do not trust mineflayer's fixed 5 second `blockUpdate` wait;
 they send the place action, then verify the target block through world state.
 Tune this with `MC_PLACEMENT_TIMEOUT_MS=15000` and `MC_PLACEMENT_RETRIES=2`.
@@ -264,9 +278,10 @@ AGENTBEATS_MAX_HOLD_STEPS=12
 ```
 
 `AGENTBEATS_MODEL_EVERY_N_STEPS` lets one model decision drive several simulator
-frames, which makes movement less twitchy and reduces repeated API calls. If the
-model/API is unavailable, the adapter returns a simple heuristic fallback action
-instead of timing out the evaluator.
+frames, which makes movement less twitchy and reduces repeated API calls. The
+adapter no longer produces heuristic actions without a model response: missing
+API credentials, missing observation frames, or model failures are reported as
+errors so leaderboard behavior stays model-driven.
 
 For submission packaging, use the included `Dockerfile` and edit
 `agentbeats/amber-manifest-purple.json5` to point at your published container

@@ -63,7 +63,7 @@ aim at the block
     expect(taskSpecificGuidance("Find and mine the diamond ore.")).not.toContain("already");
   });
 
-  it("handles init and obs without an API key by falling back to heuristic actions", async () => {
+  it("refuses observations without an API key instead of falling back to heuristic actions", async () => {
     const config = loadConfig();
     config.openai.apiKey = "";
     const policy = new McuVisualPolicy(config);
@@ -72,9 +72,8 @@ aim at the block
     expect(ack.success).toBe(true);
 
     const action = JSON.parse(await policy.handleText(JSON.stringify({ type: "obs", step: 0, obs: "" }), "ctx"));
-    expect(action.type).toBe("action");
-    expect(action.action_type).toBe("agent");
-    expect(action.buttons).toHaveLength(1);
-    expect(action.camera).toHaveLength(1);
+    expect(action.type).toBe("ack");
+    expect(action.success).toBe(false);
+    expect(action.message).toContain("OPENAI_API_KEY");
   });
 });

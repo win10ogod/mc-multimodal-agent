@@ -269,7 +269,7 @@ export async function startAgentBeatsServer(
     )}/.well-known/agent-card.json`,
   );
   if (!config.openai.apiKey) {
-    console.warn("[agentbeats] OPENAI_API_KEY/API_KEY is not set; using heuristic fallback actions only.");
+    console.warn("[agentbeats] OPENAI_API_KEY/API_KEY is not set; observation requests will fail instead of using heuristic actions.");
   }
   return server;
 }

@@ -3,6 +3,7 @@ import {
   buildQwenExtraBody,
   formatModelProviderError,
   isRetryableModelProviderError,
+  normalizeProviderToolCalls,
   parseSkillDraft,
   parseStructuredAgentTurn,
   parseTextToolCalls,
@@ -134,6 +135,30 @@ describe("model provider text tool parsing", () => {
       text: "Done.",
       toolCalls: [],
     });
+  });
+
+  it("unwraps native action tool_call envelopes into concrete tool calls", () => {
+    const calls = normalizeProviderToolCalls([
+      {
+        id: "native_1",
+        name: "action",
+        arguments: JSON.stringify({
+          type: "tool_call",
+          tool: JSON.stringify({
+            name: "navigation_status",
+            arguments: {},
+          }),
+        }),
+      },
+    ]);
+
+    expect(calls).toEqual([
+      {
+        id: "native_1",
+        name: "navigation_status",
+        arguments: "{}",
+      },
+    ]);
   });
 
   it("parses auto skill drafts", () => {

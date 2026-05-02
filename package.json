@@ -15,6 +15,7 @@
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
+    "agent-browser": "^0.26.0",
     "dotenv": "^17.2.3",
     "level": "^10.0.0",
     "minecraft-data": "^3.108.0",
@@ -22,6 +23,7 @@
     "mineflayer-pathfinder": "^2.4.5",
     "openai": "^6.35.0",
     "pngjs": "^7.0.0",
+    "prismarine-nbt": "^2.8.0",
     "vec3": "^0.1.10"
   },
   "devDependencies": {
