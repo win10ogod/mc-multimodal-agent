@@ -1,5 +1,5 @@
 import type { AgentConfig } from "../config";
-import type { MinecraftBot } from "../bot/MinecraftBot";
+import type { BotApi } from "../bot/BotApi";
 import { resolveBlueprint } from "../blueprint/Blueprint";
 import type { ItemCatalog } from "../knowledge/ItemCatalog";
 import type { MemoryStore } from "../memory/MemoryStore";
@@ -15,7 +15,7 @@ import { Vec3 } from "vec3";
 
 export type MinecraftToolContext = {
   config: AgentConfig;
-  bot: MinecraftBot;
+  bot: BotApi;
   vision: VisualPerception;
   catalog: ItemCatalog;
   memory: MemoryStore;
