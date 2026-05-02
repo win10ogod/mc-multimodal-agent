@@ -1430,6 +1430,10 @@ export function createMinecraftToolRegistry(): ToolRegistry<MinecraftToolContext
           description: "XYZ offset from current feet block.",
         },
         clearMismatch: { type: "boolean" },
+        dryRun: {
+          type: "boolean",
+          description: "Only run blueprint material/footprint preflight; do not dig, clear, pathfind, or place blocks.",
+        },
         limit: { type: "number", description: "Optional max placements for incremental building." },
       },
       required: ["blueprint"],
@@ -1451,8 +1455,23 @@ export function createMinecraftToolRegistry(): ToolRegistry<MinecraftToolContext
         placements: blueprint.placements,
         clearMismatch: args.clearMismatch === true,
         limit: typeof args.limit === "number" ? args.limit : undefined,
+        dryRun: args.dryRun === true,
       });
-      return ok(`blueprint ${blueprint.name}: placed=${summary.placed} skipped=${summary.skipped} failed=${summary.failed.length}`, summary as unknown as JsonValue);
+      let text: string;
+      if (summary.blocked === "missing_materials") {
+        text = `blueprint ${blueprint.name}: blocked=missing_materials missing=${JSON.stringify(summary.missing ?? [])}`;
+      } else if (summary.blocked) {
+        text = `blueprint ${blueprint.name}: blocked=${summary.blocked} placed=${summary.placed} skipped=${summary.skipped} failed=${summary.failed.length}`;
+      } else if (args.dryRun === true) {
+        text = `blueprint ${blueprint.name}: preflight planned=${summary.planned ?? 0} missing=${JSON.stringify(summary.missing ?? [])}`;
+      } else {
+        text = `blueprint ${blueprint.name}: placed=${summary.placed} skipped=${summary.skipped} failed=${summary.failed.length}`;
+      }
+      return {
+        ok: !summary.blocked,
+        text,
+        data: summary as unknown as JsonValue,
+      };
     },
   });
 

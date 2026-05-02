@@ -8,6 +8,7 @@ import type { AgentConfig } from "../config";
 import type { BlueprintPlacement } from "../blueprint/Blueprint";
 import type { Vec3Like } from "../types";
 import { sleep } from "../utils/misc";
+import { createBlueprintBuildPlan, type InventoryCount } from "./BlueprintBuildPlanner";
 import { buildModdedTolerantCustomPackets } from "./moddedProtocol";
 
 const AIR_NAMES = new Set(["air", "cave_air", "void_air"]);
@@ -23,6 +24,7 @@ const PATHFINDER_HAZARD_BLOCKS = [
   "sweet_berry_bush",
   "powder_snow",
 ];
+const BLUEPRINT_NAVIGATION_FAILURE_LIMIT = 2;
 
 export type ScreenPlacementHit = {
   blockName: string;
@@ -48,7 +50,22 @@ export type BuildSummary = {
   placed: number;
   skipped: number;
   failed: Array<{ position: Vec3Like; block: string; reason: string }>;
+  blocked?: "missing_materials" | "navigation_blocked";
+  planned?: number;
+  required?: InventoryCount[];
+  available?: InventoryCount[];
+  missing?: InventoryCount[];
+  footprint?: ReturnType<typeof createBlueprintBuildPlan>["footprint"];
 };
+
+function isNavigationBuildFailure(reason: string): boolean {
+  const normalized = reason.toLowerCase();
+  return (
+    normalized.includes("pathfind timed out") ||
+    normalized.includes("path was stopped") ||
+    normalized.includes("desired goal was not reached")
+  );
+}
 
 export type PlayerGuidance = {
   time: string;
@@ -1660,6 +1677,7 @@ export class MinecraftBot {
     placements: BlueprintPlacement[];
     clearMismatch?: boolean;
     limit?: number;
+    dryRun?: boolean;
   }): Promise<BuildSummary> {
     const summary: BuildSummary = {
       blueprint: params.name,
@@ -1668,17 +1686,26 @@ export class MinecraftBot {
       skipped: 0,
       failed: [],
     };
-    const placements = params.placements
-      .slice()
-      .sort(
-        (a, b) =>
-          a.position.y - b.position.y ||
-          a.position.z - b.position.z ||
-          a.position.x - b.position.x,
-      )
-      .slice(0, params.limit ?? params.placements.length);
+    const buildPlan = createBlueprintBuildPlan({
+      placements: params.placements,
+      inventory: this.raw.inventory.items().map((item) => ({ name: item.name, count: item.count })),
+      limit: params.limit,
+    });
+    summary.planned = buildPlan.plannedPlacements.length;
+    summary.required = buildPlan.required;
+    summary.available = buildPlan.available;
+    summary.missing = buildPlan.missing;
+    summary.footprint = buildPlan.footprint;
+    if (!buildPlan.canBuild) {
+      summary.blocked = "missing_materials";
+      return summary;
+    }
+    if (params.dryRun) {
+      return summary;
+    }
 
-    for (const placement of placements) {
+    let consecutiveNavigationFailures = 0;
+    for (const placement of buildPlan.plannedPlacements) {
       const target = addVec(params.anchor, placement.position);
       summary.attempted += 1;
       try {
@@ -1701,12 +1728,19 @@ export class MinecraftBot {
         await this.equipItem(placement.block);
         await this.placeBlockAt(target);
         summary.placed += 1;
+        consecutiveNavigationFailures = 0;
       } catch (error) {
+        const reason = error instanceof Error ? error.message : String(error);
         summary.failed.push({
           position: target,
           block: placement.block,
-          reason: error instanceof Error ? error.message : String(error),
+          reason,
         });
+        consecutiveNavigationFailures = isNavigationBuildFailure(reason) ? consecutiveNavigationFailures + 1 : 0;
+        if (consecutiveNavigationFailures >= BLUEPRINT_NAVIGATION_FAILURE_LIMIT) {
+          summary.blocked = "navigation_blocked";
+          break;
+        }
       }
     }
     return summary;
