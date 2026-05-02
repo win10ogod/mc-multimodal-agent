@@ -68,4 +68,39 @@ describe("blueprint build planner", () => {
       "oak_slab@0,2,0",
     ]);
   });
+
+  it("plans wood-to-stone tool upgrades before gathering missing wood materials", () => {
+    const plan = createBlueprintBuildPlan({
+      placements: [
+        placement("oak_log", 0, 0, 0),
+        placement("oak_log", 1, 0, 0),
+        placement("oak_log", 2, 0, 0),
+        placement("oak_log", 3, 0, 0),
+        placement("oak_log", 4, 0, 0),
+        placement("oak_planks", 0, 1, 0),
+        placement("oak_planks", 1, 1, 0),
+        placement("oak_planks", 2, 1, 0),
+        placement("oak_planks", 3, 1, 0),
+        placement("oak_planks", 4, 1, 0),
+        placement("oak_planks", 0, 1, 1),
+        placement("oak_planks", 1, 1, 1),
+        placement("oak_planks", 2, 1, 1),
+      ],
+      inventory: [],
+    });
+
+    expect(plan.canBuild).toBe(false);
+    expect(plan.acquisitionPlan?.strategy).toBe("tool_upgrade_then_gather");
+    expect(plan.acquisitionPlan?.steps.map((step) => `${step.action}:${step.item ?? ""}:${step.count ?? ""}`)).toEqual([
+      "plan_craft:wooden_pickaxe:1",
+      "gather:cobblestone:6",
+      "plan_craft:stone_pickaxe:1",
+      "plan_craft:wooden_axe:1",
+      "plan_craft:stone_axe:1",
+      "gather:oak_log:7",
+      "plan_craft:oak_planks:8",
+      "retry:build_blueprint:",
+    ]);
+    expect(plan.acquisitionPlan?.steps.find((step) => step.item === "oak_log")?.suggestedTool).toBe("stone_axe");
+  });
 });

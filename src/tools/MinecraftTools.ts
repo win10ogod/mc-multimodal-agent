@@ -1459,7 +1459,8 @@ export function createMinecraftToolRegistry(): ToolRegistry<MinecraftToolContext
       });
       let text: string;
       if (summary.blocked === "missing_materials") {
-        text = `blueprint ${blueprint.name}: blocked=missing_materials missing=${JSON.stringify(summary.missing ?? [])}`;
+        const acquisition = summary.acquisitionPlan?.strategy ? ` acquisition=${summary.acquisitionPlan.strategy}` : "";
+        text = `blueprint ${blueprint.name}: blocked=missing_materials${acquisition} missing=${JSON.stringify(summary.missing ?? [])}`;
       } else if (summary.blocked) {
         text = `blueprint ${blueprint.name}: blocked=${summary.blocked} placed=${summary.placed} skipped=${summary.skipped} failed=${summary.failed.length}`;
       } else if (args.dryRun === true) {

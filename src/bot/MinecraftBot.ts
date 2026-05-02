@@ -8,7 +8,7 @@ import type { AgentConfig } from "../config";
 import type { BlueprintPlacement } from "../blueprint/Blueprint";
 import type { Vec3Like } from "../types";
 import { sleep } from "../utils/misc";
-import { createBlueprintBuildPlan, type InventoryCount } from "./BlueprintBuildPlanner";
+import { createBlueprintBuildPlan, type InventoryCount, type MaterialAcquisitionPlan } from "./BlueprintBuildPlanner";
 import { buildModdedTolerantCustomPackets } from "./moddedProtocol";
 
 const AIR_NAMES = new Set(["air", "cave_air", "void_air"]);
@@ -55,6 +55,7 @@ export type BuildSummary = {
   required?: InventoryCount[];
   available?: InventoryCount[];
   missing?: InventoryCount[];
+  acquisitionPlan?: MaterialAcquisitionPlan;
   footprint?: ReturnType<typeof createBlueprintBuildPlan>["footprint"];
 };
 
@@ -1695,6 +1696,7 @@ export class MinecraftBot {
     summary.required = buildPlan.required;
     summary.available = buildPlan.available;
     summary.missing = buildPlan.missing;
+    summary.acquisitionPlan = buildPlan.acquisitionPlan;
     summary.footprint = buildPlan.footprint;
     if (!buildPlan.canBuild) {
       summary.blocked = "missing_materials";

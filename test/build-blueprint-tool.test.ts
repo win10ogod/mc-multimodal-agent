@@ -104,6 +104,11 @@ describe("build_blueprint tool", () => {
     expect(summary.failed).toEqual([]);
     expect(summary.blocked).toBe("missing_materials");
     expect(summary.missing).toEqual([{ name: "oak_log", count: 1 }]);
+    expect(summary.acquisitionPlan?.steps.map((step) => step.item)).toContain("wooden_pickaxe");
+    expect(summary.acquisitionPlan?.steps.map((step) => step.item)).toContain("stone_pickaxe");
+    expect(summary.acquisitionPlan?.steps.map((step) => step.item)).toContain("wooden_axe");
+    expect(summary.acquisitionPlan?.steps.map((step) => step.item)).toContain("stone_axe");
+    expect(summary.acquisitionPlan?.steps.find((step) => step.item === "oak_log")?.suggestedTool).toBe("stone_axe");
     expect(blockAtCalls).toBe(0);
     expect(digCalls).toBe(0);
     expect(equipCalls).toBe(0);
@@ -133,6 +138,15 @@ describe("build_blueprint tool", () => {
             failed: [],
             blocked: "missing_materials",
             missing: [{ name: "oak_log", count: 28 }],
+            acquisitionPlan: {
+              strategy: "tool_upgrade_then_gather",
+              missing: [{ name: "oak_log", count: 28 }],
+              steps: [
+                { action: "plan_craft", item: "wooden_pickaxe", count: 1, reason: "bootstrap mining" },
+                { action: "gather", item: "oak_log", count: 28, suggestedTool: "stone_axe", reason: "missing exact log" },
+              ],
+              notes: [],
+            },
           }),
         },
       } as unknown as MinecraftToolContext,
@@ -140,9 +154,13 @@ describe("build_blueprint tool", () => {
 
     expect(result.ok).toBe(false);
     expect(result.text).toContain("blocked=missing_materials");
+    expect(result.text).toContain("acquisition=tool_upgrade_then_gather");
     expect(result.data).toMatchObject({
       blocked: "missing_materials",
       missing: [{ name: "oak_log", count: 28 }],
+      acquisitionPlan: {
+        strategy: "tool_upgrade_then_gather",
+      },
     });
   });
 
