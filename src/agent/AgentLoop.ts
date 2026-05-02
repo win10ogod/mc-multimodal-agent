@@ -108,7 +108,9 @@ export class AgentLoop {
   }
 
   async runTask(task: string): Promise<string> {
-    this.deps.bot.ensureConnected();
+    if (!(await this.ensureBotReady("task_start"))) {
+      this.deps.bot.ensureConnected();
+    }
     const overallStartedAt = Date.now();
     const overallDeadline = overallStartedAt + this.deps.config.loop.overallTaskTimeoutMs;
     const maxSegments = Math.max(1, this.deps.config.loop.maxSegments);
@@ -141,7 +143,7 @@ export class AgentLoop {
     const executedSteps: ExecutedToolStep[] = [];
 
     for (let segment = 1; segment <= maxSegments; segment += 1) {
-      if (!this.deps.bot.isConnected()) {
+      if (!(await this.ensureBotReady(`segment_${segment}_start`))) {
         stopReason = `Stopped: Minecraft bot left the game (${this.deps.bot.connectionSummary()}).`;
         break;
       }
@@ -209,7 +211,7 @@ export class AgentLoop {
       this.logModelTurn("start", segment, modelTurnCount, currentResponse);
 
       while (toolCalls.length > 0) {
-        if (!this.deps.bot.isConnected()) {
+        if (!(await this.ensureBotReady(`segment_${segment}_turn_${modelTurnCount}`))) {
           fatalStopReason = `Stopped: Minecraft bot left the game (${this.deps.bot.connectionSummary()}).`;
           break;
         }
@@ -232,6 +234,8 @@ export class AgentLoop {
 
         const outputs: Array<{ callId: string; name: string; result: ToolResult }> = [];
         for (const call of toolCalls) {
+          const name = call.name ?? "";
+          const callId = call.id ?? `call_${segment}_${segmentToolCallCount + 1}`;
           if (segmentToolCallCount >= this.deps.config.loop.maxToolCalls) {
             segmentStopReason = `Segment ${segment}: tool call limit reached (${this.deps.config.loop.maxToolCalls}).`;
             break;
@@ -244,14 +248,12 @@ export class AgentLoop {
             stopReason = `Stopped: task exceeded overall timeout ${this.deps.config.loop.overallTaskTimeoutMs}ms without finishing.`;
             break;
           }
-          if (!this.deps.bot.isConnected()) {
+          if (!(await this.ensureBotReady(`before_tool_${name || "unknown"}`))) {
             fatalStopReason = `Stopped: Minecraft bot left the game (${this.deps.bot.connectionSummary()}).`;
             break;
           }
           segmentToolCallCount += 1;
           totalToolCallCount += 1;
-          const name = call.name ?? "";
-          const callId = call.id ?? `call_${segment}_${segmentToolCallCount}`;
           const args = parseJsonObject(call.arguments);
           const loop = detectToolCallLoop(this.state, name, args, defaultLoopDetectionConfig);
           this.logToolCall(segment, segmentToolCallCount, totalToolCallCount, callId, name, args as JsonObject);
@@ -310,7 +312,7 @@ export class AgentLoop {
           fatalStopReason = "Stopped: no tool outputs were produced.";
           break;
         }
-        if (!this.deps.bot.isConnected()) {
+        if (!(await this.ensureBotReady(`after_tools_segment_${segment}_turn_${modelTurnCount}`))) {
           fatalStopReason = `Stopped: Minecraft bot left the game (${this.deps.bot.connectionSummary()}).`;
           break;
         }
@@ -448,6 +450,52 @@ export class AgentLoop {
       "Use tools to make concrete progress. For deterministic short runs of already chosen atomic actions, execute_steps is available; otherwise call one atomic tool, inspect its result, and continue.",
     );
     return parts.join("\n");
+  }
+
+  private async ensureBotReady(reason: string): Promise<boolean> {
+    if (this.deps.bot.isConnected()) {
+      return true;
+    }
+    if (!this.deps.config.minecraft.autoReconnect) {
+      return false;
+    }
+    const before = this.safeConnectionSummary();
+    this.logFlow("bot_reconnect_start", { reason, connection: before });
+    try {
+      await this.deps.bot.connect();
+      if (!this.deps.bot.isConnected()) {
+        this.logFlow("bot_reconnect_failed", {
+          reason,
+          connection: this.safeConnectionSummary(),
+        });
+        return false;
+      }
+      this.deps.catalog.syncRuntimeRegistry(this.deps.bot.runtimeRegistrySnapshot());
+      this.deps.imitation?.attach(this.deps.bot.raw);
+      await this.deps.memory.addNote({
+        kind: "environment",
+        layer: "episodic",
+        source: "system",
+        importance: 0.75,
+        text: `AgentLoop reconnected Minecraft bot during ${reason}. Before: ${before}. After: ${this.safeConnectionSummary()}`,
+        tags: ["environment", "reconnect", this.deps.bot.raw.version],
+        scope: {
+          server: `${this.deps.config.minecraft.host}:${this.deps.config.minecraft.port}`,
+          version: this.deps.bot.raw.version,
+        },
+      });
+      this.logFlow("bot_reconnect_done", {
+        reason,
+        connection: this.safeConnectionSummary(),
+      });
+      return true;
+    } catch (error) {
+      this.logFlow("bot_reconnect_error", {
+        reason,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return false;
+    }
   }
 
   private async captureVisionContext(): Promise<{ frames: VisualFrame[]; text: string }> {
