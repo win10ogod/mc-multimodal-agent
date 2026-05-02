@@ -145,6 +145,18 @@ export class McuVirtualBot implements BotApi {
     // Always "connected" in MCU mode — the simulator is the world.
   }
 
+  isConnected(): boolean {
+    return true;
+  }
+
+  connectionSummary(): string {
+    return `mcu virtual bot v${this.raw.version}`;
+  }
+
+  drainGuidance(): Array<{ time: string; username: string; message: string }> {
+    return [];
+  }
+
   async chat(message: string): Promise<void> {
     this.push({ kind: "say", text: message });
   }

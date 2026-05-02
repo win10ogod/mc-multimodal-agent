@@ -8,7 +8,7 @@ import type { SkillLibrary } from "../skills/SkillLibrary";
 import type { ImitationObserver } from "../learning/ImitationObserver";
 import type { TaskStore } from "../tasks/TaskStore";
 import type { JsonObject, JsonValue, ToolResult, Vec3Like } from "../types";
-import type { VisualPerception } from "../vision/VisualPerception";
+import type { VisionApi } from "../bot/BotApi";
 import { ToolRegistry } from "./ToolRegistry";
 import { compactText, sleep } from "../utils/misc";
 import { Vec3 } from "vec3";
@@ -16,7 +16,7 @@ import { Vec3 } from "vec3";
 export type MinecraftToolContext = {
   config: AgentConfig;
   bot: BotApi;
-  vision: VisualPerception;
+  vision: VisionApi;
   catalog: ItemCatalog;
   memory: MemoryStore;
   goals?: GoalStore;

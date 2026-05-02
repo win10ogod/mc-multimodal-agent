@@ -1,9 +1,15 @@
 import type { MinecraftBot } from "./MinecraftBot";
+import type { VisualPerception } from "../vision/VisualPerception";
 
 export type RawBotView = MinecraftBot["raw"];
 
+export type VisionApi = Pick<VisualPerception, "capture" | "findVisibleTargets" | "hitFromScreen" | "screenToDelta">;
+
 const TOOL_BOT_METHODS = [
   "ensureConnected",
+  "isConnected",
+  "connectionSummary",
+  "drainGuidance",
   "chat",
   "stopMovement",
   "stopNavigation",

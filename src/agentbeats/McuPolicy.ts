@@ -557,6 +557,7 @@ function compactRecentActions(actions: McuEnvAction[]): string {
 export class McuVisualPolicy {
   private readonly client: OpenAI;
   private readonly contexts = new Map<string, McuContextState>();
+  private readonly toolDrivers = new Map<string, import("./McuToolDriver").McuToolDriver>();
 
   constructor(private readonly config: AgentConfig) {
     this.client = new OpenAI({
@@ -588,9 +589,16 @@ export class McuVisualPolicy {
     }
 
     if (payload.type === "init") {
+      if (this.config.agentbeats.useToolAgent) {
+        return this.handleToolAgentInit(contextId, payload as McuInitPayload);
+      }
       return this.handleInit(contextId, payload as McuInitPayload);
     }
     if (payload.type === "obs") {
+      if (this.config.agentbeats.useToolAgent) {
+        const decision = await this.handleToolAgentObservation(contextId, payload as McuObservationPayload);
+        return JSON.stringify(toCompactMcuAgentActionPayload(decision.action));
+      }
       const decision = await this.handleObservation(contextId, payload as McuObservationPayload);
       return JSON.stringify(toCompactMcuAgentActionPayload(decision.action));
     }
@@ -619,6 +627,47 @@ export class McuVisualPolicy {
       success: true,
       message: "Initialization successful.",
     });
+  }
+
+  private async handleToolAgentInit(contextId: string, payload: McuInitPayload): Promise<string> {
+    const { McuToolDriver } = await import("./McuToolDriver");
+    const taskText = payload.text?.trim() || "";
+    const promptText = payload.prompt?.trim() || "";
+    const driver = new McuToolDriver({
+      config: this.config,
+      contextId,
+      taskText,
+      promptText,
+    });
+    this.toolDrivers.set(contextId, driver);
+    console.log(`[agentbeats] tool-agent init context=${contextId} task=${JSON.stringify(taskText)}`);
+    return JSON.stringify({ type: "ack", success: true, message: "Tool-agent initialized." });
+  }
+
+  private async handleToolAgentObservation(contextId: string, payload: McuObservationPayload): Promise<McuPolicyDecision> {
+    let driver = this.toolDrivers.get(contextId);
+    if (!driver) {
+      const { McuToolDriver } = await import("./McuToolDriver");
+      driver = new McuToolDriver({ config: this.config, contextId, taskText: "" });
+      this.toolDrivers.set(contextId, driver);
+    }
+    const step = Math.max(0, Number.isFinite(payload.step) ? Number(payload.step) : 0);
+    if (payload.obs) {
+      driver.ingestObservation(payload.obs);
+    }
+    let decision: McuPolicyDecision;
+    try {
+      decision = await driver.step(step);
+    } catch (error) {
+      console.warn(`[agentbeats] tool-agent step failed: ${formatModelProviderError(error)}`);
+      decision = { type: "action", action_type: "env", action: defaultMcuAction(), hold_steps: 1 };
+    }
+    const intents = driver.drainIntents();
+    if (intents.length > 0) {
+      console.log(`[agentbeats] tool-agent step=${step} intents=${intents.map((i) => i.kind).join(",")}`);
+    }
+    const holdSteps = Math.max(1, Math.min(this.config.agentbeats.maxHoldSteps, decision.hold_steps ?? this.config.agentbeats.defaultHoldSteps));
+    return { ...decision, hold_steps: holdSteps };
   }
 
   private async handleObservation(contextId: string, payload: McuObservationPayload): Promise<McuPolicyDecision> {
