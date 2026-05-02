@@ -139,20 +139,34 @@ Nearby player movement and block changes are recorded to `state/imitation.jsonl`
 
 ## Blueprint Format
 
-Blueprints are JSON files with a `palette` and Y-axis `layers`. Each string row is Z, each character is X.
+Blueprints are `.litematic` files only. Put local files in `blueprints/`, or
+ask the agent to import a bundled example with the blueprint-library tools:
 
-```json
-{
-  "name": "example-hut",
-  "palette": { "P": "oak_planks", "G": "glass", "D": "oak_door" },
-  "layers": [
-    ["PPP", "P P", "PPP"],
-    ["PGP", "D P", "PPP"]
-  ]
-}
+```bash
+npm run dev -- start --task "Use blueprint_library_list, then import example-hut with blueprint_library_import."
 ```
 
-Spaces and `.` are empty cells. Placement starts from the selected anchor and proceeds bottom-up.
+For reliable builds, run a preflight first:
+
+```bash
+npm run dev -- start --task "Use build_blueprint with blueprint=example-hut offset=[2,0,3] limit=40 dryRun=true, then report required/available/missing/footprint."
+```
+
+If materials are missing, the preflight returns an `acquisitionPlan`. In survival
+mode the agent should craft wooden tools, gather stone, upgrade to stone tools,
+then gather exact missing materials before retrying the preflight.
+
+For creative/development testing, command-based grants can fill safe build
+materials with `/give` before building:
+
+```env
+MC_ALLOW_COMMAND_MATERIALS=true
+MC_COMMAND_MATERIAL_MAX_COUNT=512
+```
+
+The `grant_materials` tool remains disabled by default. When enabled, it only
+grants built-in safe building materials such as wood variants, stone, glass,
+sand, dirt, and any additional items listed in `MC_COMMAND_MATERIAL_ALLOWED_ITEMS`.
 
 ## Skills
 

@@ -34,6 +34,9 @@ export type AgentConfig = {
     autoReconnect: boolean;
     reconnectAttempts: number;
     reconnectDelayMs: number;
+    allowCommandMaterials: boolean;
+    commandMaterialMaxCount: number;
+    commandMaterialAllowedItems: string[];
   };
   openai: {
     apiKey: string;
@@ -252,6 +255,56 @@ export function loadConfig(projectRoot = process.cwd()): AgentConfig {
       autoReconnect: envBool("MC_AUTO_RECONNECT", true),
       reconnectAttempts: envInt("MC_RECONNECT_ATTEMPTS", 8),
       reconnectDelayMs: envInt("MC_RECONNECT_DELAY_MS", 5_000),
+      allowCommandMaterials: envBool("MC_ALLOW_COMMAND_MATERIALS", false),
+      commandMaterialMaxCount: envInt("MC_COMMAND_MATERIAL_MAX_COUNT", 512),
+      commandMaterialAllowedItems: envList("MC_COMMAND_MATERIAL_ALLOWED_ITEMS", [
+        "oak_log",
+        "spruce_log",
+        "birch_log",
+        "jungle_log",
+        "acacia_log",
+        "dark_oak_log",
+        "mangrove_log",
+        "cherry_log",
+        "crimson_stem",
+        "warped_stem",
+        "oak_planks",
+        "spruce_planks",
+        "birch_planks",
+        "jungle_planks",
+        "acacia_planks",
+        "dark_oak_planks",
+        "mangrove_planks",
+        "cherry_planks",
+        "crimson_planks",
+        "warped_planks",
+        "oak_slab",
+        "spruce_slab",
+        "birch_slab",
+        "jungle_slab",
+        "acacia_slab",
+        "dark_oak_slab",
+        "mangrove_slab",
+        "cherry_slab",
+        "crimson_slab",
+        "warped_slab",
+        "oak_door",
+        "spruce_door",
+        "birch_door",
+        "jungle_door",
+        "acacia_door",
+        "dark_oak_door",
+        "mangrove_door",
+        "cherry_door",
+        "crimson_door",
+        "warped_door",
+        "cobblestone",
+        "stone",
+        "dirt",
+        "grass_block",
+        "glass",
+        "sand",
+      ]),
     },
     openai: {
       apiKey,

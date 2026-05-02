@@ -116,6 +116,51 @@ function chatSafeLine(value: string): string {
   return compactText(value.replace(/\s+/g, " ").trim(), 220);
 }
 
+function normalizeCommandMaterialName(name: string): { item: string; commandItem: string } | undefined {
+  const normalized = name.trim().toLowerCase();
+  if (!/^(?:minecraft:)?[a-z0-9_]+$/.test(normalized)) {
+    return undefined;
+  }
+  const item = normalized.startsWith("minecraft:") ? normalized.slice("minecraft:".length) : normalized;
+  return { item, commandItem: `minecraft:${item}` };
+}
+
+const SAFE_COMMAND_MATERIAL_RE =
+  /^(?:(?:stripped_)?(?:oak|spruce|birch|jungle|acacia|dark_oak|mangrove|cherry)_(?:log|wood)|(?:stripped_)?(?:crimson|warped)_(?:stem|hyphae)|(?:oak|spruce|birch|jungle|acacia|dark_oak|mangrove|cherry|crimson|warped|bamboo)_(?:planks|slab|stairs|fence|fence_gate|door|trapdoor|button|pressure_plate|sign|hanging_sign))$/;
+const SAFE_COMMAND_MATERIALS = new Set([
+  "cobblestone",
+  "stone",
+  "stone_slab",
+  "stone_stairs",
+  "stone_bricks",
+  "stone_brick_slab",
+  "stone_brick_stairs",
+  "dirt",
+  "grass_block",
+  "glass",
+  "sand",
+  "gravel",
+  "torch",
+  "lantern",
+]);
+
+function commandMaterialAllowed(item: string, allowed: Set<string>): boolean {
+  return allowed.has(item) || SAFE_COMMAND_MATERIALS.has(item) || SAFE_COMMAND_MATERIAL_RE.test(item);
+}
+
+function materialGrantItems(value: JsonValue | undefined): Array<{ name: string; count: number }> {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return value
+    .filter((item): item is JsonObject => Boolean(item && typeof item === "object" && !Array.isArray(item)))
+    .map((item) => ({
+      name: typeof item.name === "string" ? item.name : "",
+      count: typeof item.count === "number" && Number.isFinite(item.count) ? Math.floor(item.count) : 0,
+    }))
+    .filter((item) => item.name.trim() && item.count > 0);
+}
+
 async function announceGoalPlan(ctx: MinecraftToolContext, root: GoalNode, goals: GoalNode[]): Promise<void> {
   if (!ctx.config.observability.announcePlansInChat) {
     return;
@@ -1473,6 +1518,85 @@ export function createMinecraftToolRegistry(): ToolRegistry<MinecraftToolContext
         text,
         data: summary as unknown as JsonValue,
       };
+    },
+  });
+
+  registry.register({
+    name: "grant_materials",
+    description:
+      "Grant missing build materials with Minecraft /give commands when MC_ALLOW_COMMAND_MATERIALS=true. Use for creative/testing blueprint builds; if disabled or denied, fall back to survival gathering.",
+    parameters: {
+      type: "object",
+      properties: {
+        items: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: {
+              name: { type: "string" },
+              count: { type: "number", minimum: 1 },
+            },
+            required: ["name", "count"],
+            additionalProperties: false,
+          },
+        },
+        reason: { type: "string" },
+      },
+      required: ["items"],
+      additionalProperties: false,
+    },
+    execute: async (args, ctx) => {
+      if (!ctx.config.minecraft.allowCommandMaterials) {
+        return {
+          ok: false,
+          text: "grant_materials disabled: set MC_ALLOW_COMMAND_MATERIALS=true to allow /give-based material grants.",
+        };
+      }
+      const items = materialGrantItems(args.items);
+      if (items.length === 0) {
+        return { ok: false, text: "grant_materials requires at least one item with a positive count." };
+      }
+      const maxCount = Math.max(1, ctx.config.minecraft.commandMaterialMaxCount);
+      const allowed = new Set(
+        ctx.config.minecraft.commandMaterialAllowedItems
+          .map((item) => normalizeCommandMaterialName(item)?.item)
+          .filter((item): item is string => Boolean(item)),
+      );
+      const normalizedItems: Array<{ name: string; commandItem: string; count: number }> = [];
+      for (const item of items) {
+        const normalized = normalizeCommandMaterialName(item.name);
+        if (!normalized) {
+          return { ok: false, text: `grant_materials invalid material name: ${item.name}` };
+        }
+        if (!commandMaterialAllowed(normalized.item, allowed)) {
+          return { ok: false, text: `grant_materials not allowed for material: ${normalized.item}` };
+        }
+        if (item.count > maxCount) {
+          return { ok: false, text: `grant_materials count for ${normalized.item} exceeds max ${maxCount}: ${item.count}` };
+        }
+        normalizedItems.push({ name: normalized.item, commandItem: normalized.commandItem, count: item.count });
+      }
+
+      const commands: string[] = [];
+      for (const item of normalizedItems) {
+        let remaining = item.count;
+        while (remaining > 0) {
+          const batch = Math.min(64, remaining);
+          const command = `/give ${ctx.config.minecraft.username} ${item.commandItem} ${batch}`;
+          await ctx.bot.chat(command);
+          commands.push(command);
+          remaining -= batch;
+          if (remaining > 0) {
+            await sleep(100);
+          }
+        }
+      }
+      const total = normalizedItems.reduce((sum, item) => sum + item.count, 0);
+      return ok(`granted ${total} command material${total === 1 ? "" : "s"}`, {
+        reason: typeof args.reason === "string" ? args.reason : undefined,
+        granted: normalizedItems.map(({ name, count }) => ({ name, count })),
+        commands,
+      } as unknown as JsonValue);
     },
   });
 
