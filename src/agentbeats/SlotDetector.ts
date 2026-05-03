@@ -15,7 +15,6 @@ import jpeg from "jpeg-js";
 // Minecraft inventory window logical layout (vanilla 1.x, scale-invariant
 // fractions of the 176x166 window).
 const WIN_LOGICAL_W = 176;
-const WIN_LOGICAL_H = 166;
 const SLOT_LOGICAL = 18;          // stride between slot centers
 const SLOT_INNER_LOGICAL = 16;    // visible slot square
 // Logical pixel positions of each slot's TOP-LEFT corner inside the window.
@@ -250,6 +249,63 @@ function floodFill(
   return { x0, y0, x1, y1, area };
 }
 
+/** GENERAL DETECTION POLICY (call this for SoM marking + click compilation):
+ *  1. Find inventory window via grey-mass scan.
+ *  2. Discover all interactable slot rectangles in the window via CV.
+ *  3. Attempt to promote the raster-ordered slots to semantic-named slots
+ *     using the closest matching LogicalLayout from InventoryLayouts.ts.
+ *  4. Return a unified GuiLayout that always has raster `index` and
+ *     pixel `cx,cy` for every slot, plus an optional `role`/`name` when
+ *     the GUI was recognized.
+ *
+ *  Works for any GUI -- vanilla, modded, or unknown -- because slot
+ *  detection is purely visual. Layout matching only adds names; missing
+ *  it just means slots stay numbered (e.g. "slot_5" instead of
+ *  "hotbar_3"), which is still fully usable for SoM. */
+export type GuiSlot = {
+  index: number;        // raster order, 0..N-1
+  name?: string;        // semantic name if a layout matched, e.g. "hotbar_0"
+  role?: string;        // semantic role, e.g. "hotbar", "result", "furnace_input"
+  cx: number;           // pixel center
+  cy: number;
+  w: number;            // bounding-box size (for click verification)
+  h: number;
+};
+
+export type GuiLayout = {
+  windowX: number;
+  windowY: number;
+  windowW: number;
+  windowH: number;
+  /** ID of the matching LogicalLayout (e.g. "player_inventory") if any
+   *  was a confident match; null for unknown/unmatched GUIs. */
+  matchedLayoutId: string | null;
+  /** All interactable slots, raster order. */
+  slots: GuiSlot[];
+  cursorOpenCenter: { x: number; y: number };
+};
+
+/** Slot lookup by raster index. */
+export function guiSlotByIndex(layout: GuiLayout, index: number): GuiSlot | null {
+  return layout.slots[index] ?? null;
+}
+
+/** Slot lookup by semantic name (e.g. "hotbar_0", "craft_3x3_result").
+ *  Returns null if the GUI wasn't matched to a known layout or the name
+ *  isn't found. */
+export function guiSlotByName(layout: GuiLayout, name: string): GuiSlot | null {
+  for (const s of layout.slots) {
+    if (s.name === name) return s;
+  }
+  return null;
+}
+
+/** Slot lookup by semantic role (e.g. "hotbar", "furnace_input"). Returns
+ *  the FIRST matching slot, or all of them if you pass `all=true`. */
+export function guiSlotsByRole(layout: GuiLayout, role: string): GuiSlot[] {
+  return layout.slots.filter((s) => s.role === role);
+}
+
 /** Discover every interactable slot in the inventory window without
  *  assuming any specific GUI layout. Returns null if no window is found
  *  or no slot-shaped components are detected.
@@ -348,3 +404,183 @@ export function discoverSlots(jpegBase64: string): DiscoveredLayout | null {
     cursorOpenCenter: { x: Math.round(w / 2), y: Math.round(h / 2) },
   };
 }
+
+// =========================================================================
+// Unified detection: discoverSlots + LogicalLayout matching.
+// =========================================================================
+import { ALL_LAYOUTS, slotScreenCenter, type LogicalLayout } from "./InventoryLayouts";
+
+function aspect(w: number, h: number): number {
+  return h === 0 ? 0 : w / h;
+}
+
+/** Score a candidate logical layout's plausibility for the discovered
+ *  geometry. Lower score = better match. Returns +Infinity for layouts
+ *  that don't match aspect/slot-count basics at all. */
+function scoreLayout(disc: DiscoveredLayout, layout: LogicalLayout): number {
+  const aDisc = aspect(disc.windowW, disc.windowH);
+  const aLayout = aspect(layout.windowW, layout.windowH);
+  if (Math.abs(aDisc - aLayout) > 0.25) return Infinity;
+  const slotDelta = Math.abs(layout.slots.length - disc.slots.length);
+  // Allow a few missing/extra slots (items in slot can darken interior
+  // beyond our threshold; recipe-book panel can add pseudo-slots).
+  if (slotDelta > 6) return Infinity;
+  return slotDelta * 10 + Math.abs(aDisc - aLayout) * 50;
+}
+
+/** Match discovered slots against a logical layout, then backfill any
+ *  layout-known slots that CV missed (e.g. slots filled with items can
+ *  darken past our detection threshold). Returns null on poor matches. */
+function annotateWithLayout(
+  disc: DiscoveredLayout,
+  layout: LogicalLayout,
+): GuiSlot[] | null {
+  const scale = disc.windowW / layout.windowW;
+  const layoutScreen = layout.slots.map((s) => ({
+    name: s.name,
+    role: s.role,
+    p: slotScreenCenter(s, disc.windowX, disc.windowY, scale),
+  }));
+  const tolerance = Math.max(8, disc.slotPx * 0.7);
+
+  // 1. Greedy nearest-neighbour: each discovered slot grabs the closest
+  //    unused layout slot within tolerance.
+  const matchedLayout = new Set<number>();
+  const matched: Array<{ disc: DiscoveredSlot; layoutIdx: number; dist: number }> = [];
+  const unmatched: DiscoveredSlot[] = [];
+  for (const slot of disc.slots) {
+    let bestIdx = -1;
+    let bestDist = Infinity;
+    for (let i = 0; i < layoutScreen.length; i += 1) {
+      if (matchedLayout.has(i)) continue;
+      const dx = layoutScreen[i].p.x - slot.cx;
+      const dy = layoutScreen[i].p.y - slot.cy;
+      const d = Math.hypot(dx, dy);
+      if (d < bestDist) { bestDist = d; bestIdx = i; }
+    }
+    if (bestIdx >= 0 && bestDist <= tolerance) {
+      matchedLayout.add(bestIdx);
+      matched.push({ disc: slot, layoutIdx: bestIdx, dist: bestDist });
+    } else {
+      unmatched.push(slot);
+    }
+  }
+  // Confidence: at least 50% of layout slots accounted for.
+  if (matched.length < layout.slots.length * 0.5) return null;
+
+  // 2. Backfill layout slots that no discovered component matched. This
+  //    covers slots with items in them (icon darkens slot interior past
+  //    our threshold) -- we still have the layout's pixel center.
+  const out: GuiSlot[] = [];
+  // Discovered + matched slots: keep original cv positions but tag with name/role
+  for (const m of matched) {
+    out.push({
+      index: 0,  // assigned after raster sort
+      cx: m.disc.cx,
+      cy: m.disc.cy,
+      w: m.disc.w,
+      h: m.disc.h,
+      name: layoutScreen[m.layoutIdx].name,
+      role: layoutScreen[m.layoutIdx].role,
+    });
+  }
+  // Backfilled layout slots: use layout's predicted pixel center, default size.
+  for (let i = 0; i < layoutScreen.length; i += 1) {
+    if (matchedLayout.has(i)) continue;
+    const ls = layoutScreen[i];
+    const slotPx = Math.max(8, Math.round(disc.slotPx));
+    out.push({
+      index: 0,
+      cx: ls.p.x,
+      cy: ls.p.y,
+      w: slotPx,
+      h: slotPx,
+      name: ls.name,
+      role: ls.role,
+    });
+  }
+  // Unmatched discovered components (probably spurious or modded extras):
+  // keep them anonymous so the agent can still see them.
+  for (const u of unmatched) {
+    out.push({ index: 0, cx: u.cx, cy: u.cy, w: u.w, h: u.h });
+  }
+
+  // 3. Re-sort raster order and re-index.
+  const stride = Math.max(8, Math.round(disc.slotPx * 1.1));
+  out.sort((a, b) => {
+    const ra = Math.round(a.cy / stride);
+    const rb = Math.round(b.cy / stride);
+    if (ra !== rb) return ra - rb;
+    return a.cx - b.cx;
+  });
+  out.forEach((s, i) => { s.index = i; });
+
+  return out;
+}
+
+/** GENERAL DETECTION POLICY entry point.
+ *  - Always runs CV slot discovery (works for any GUI).
+ *  - Tries to promote raster indices to semantic names by matching
+ *    aspect + slot-count + per-slot screen-distance against the known
+ *    LogicalLayouts in InventoryLayouts.ts.
+ *  - Returns a GuiLayout that always has raster `index`+pixel center,
+ *    plus optional `name`/`role` when the GUI was recognized.
+ *  - Returns null when no inventory window is found (caller should fall
+ *    through to the LLM-direct path).
+ *
+ *  `hintLayoutId` skips matching if you already know which GUI is open
+ *  (e.g. from an open-window event or task text). */
+export function detectGuiLayout(
+  jpegBase64: string,
+  hintLayoutId?: string,
+): GuiLayout | null {
+  const disc = discoverSlots(jpegBase64);
+  if (!disc) return null;
+
+  // Try the hinted layout first if given, else score all and pick best.
+  let bestLayout: LogicalLayout | null = null;
+  let bestSlots: GuiSlot[] | null = null;
+  if (hintLayoutId) {
+    const hinted = ALL_LAYOUTS.find((l) => l.id === hintLayoutId);
+    if (hinted) {
+      const annotated = annotateWithLayout(disc, hinted);
+      if (annotated) {
+        bestLayout = hinted;
+        bestSlots = annotated;
+      }
+    }
+  }
+  if (!bestLayout) {
+    let bestScore = Infinity;
+    for (const layout of ALL_LAYOUTS) {
+      const s = scoreLayout(disc, layout);
+      if (s < bestScore) {
+        const annotated = annotateWithLayout(disc, layout);
+        if (annotated) {
+          bestScore = s;
+          bestLayout = layout;
+          bestSlots = annotated;
+        }
+      }
+    }
+  }
+
+  const slots: GuiSlot[] = bestSlots ?? disc.slots.map((s) => ({
+    index: s.index,
+    cx: s.cx,
+    cy: s.cy,
+    w: s.w,
+    h: s.h,
+  }));
+
+  return {
+    windowX: disc.windowX,
+    windowY: disc.windowY,
+    windowW: disc.windowW,
+    windowH: disc.windowH,
+    matchedLayoutId: bestLayout?.id ?? null,
+    slots,
+    cursorOpenCenter: disc.cursorOpenCenter,
+  };
+}
+
