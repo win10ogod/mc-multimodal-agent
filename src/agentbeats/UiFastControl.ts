@@ -429,10 +429,10 @@ export type ClosedLoopCraftPlan = {
     slotRole?: string;
     frozenTarget: { x: number; y: number };
     button: "attack" | "use";
-    /** What we expect of the slot AFTER the click, used for verification.
-     *  Optional: callers that don't need verification can omit it. */
+    /** When true, sneak+attack (shift+click) — used for `take` from a
+     *  result slot when the cursor still holds the source ingredient. */
+    shift?: boolean;
     expectAfter?: "should_empty" | "should_fill";
-    /** Fingerprint of the target slot patch sampled at probe time. */
     prePatch?: { meanR: number; meanG: number; meanB: number; stddev: number };
   } | null;
   /** Awaiting click verification: when set, the click was JUST emitted on
@@ -455,12 +455,15 @@ export type ClosedLoopCraftPlan = {
  *  emit a single MCU env action — either a camera correction (if cursor
  *  not yet on target) or a click (if within tolerance). Caller passes the
  *  click button ("attack" for left-click, "use" for right-click).
+ *  Set `shift` to add the sneak modifier — shift+attack on a result slot
+ *  transfers crafted items to inventory regardless of what cursor holds.
  *  Returns null if the cursor wasn't detected and we should noop this
  *  frame and re-observe. */
 export function servoCursorStep(opts: {
   cursor: { x: number; y: number } | null;
   target: { x: number; y: number };
   button: "attack" | "use";
+  shift?: boolean;
   hitThresholdPx?: number;
 }): { action: McuEnvAction; click: boolean; reason: string } | null {
   if (!opts.cursor) return null;
@@ -471,7 +474,8 @@ export function servoCursorStep(opts: {
   if (errMag <= hit) {
     const action = defaultMcuAction();
     action[opts.button] = 1;
-    return { action, click: true, reason: `click err=${errMag.toFixed(1)}px` };
+    if (opts.shift) action.sneak = 1;
+    return { action, click: true, reason: `${opts.shift ? "shift+" : ""}click err=${errMag.toFixed(1)}px` };
   }
   // Camera-delta proportional to pixel error. Clamp + quantize per frame.
   let yawDeg = ex / PX_PER_CAM_YAW;

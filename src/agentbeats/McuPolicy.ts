@@ -726,13 +726,15 @@ export class McuVisualPolicy {
               console.log(`[agentbeats] closed-loop probe says done reason=${probed.reason ?? ""}`);
               plan.done = true;
             } else {
-              // MinecraftSim GUI mode: `use=1` (right-click) does not appear to
-              // register as a slot interaction — pickups via `attack` work but
-              // place_one with `use` left the slot empty (verified visually).
-              // Use `attack` for ALL slot operations: a left-click on an
-              // empty craft slot drops the full held stack, which still
-              // satisfies the recipe (any 1 log in the 2x2 grid -> planks).
-              const button: "attack" | "use" = "attack";
+              // Click semantics in MC inventory:
+              //   pickup    -> attack (left-click): grab whole stack
+              //   place_one -> use    (right-click): drop 1 item, keep rest
+              //   place_all -> attack (left-click): drop whole stack
+              //   take      -> shift+attack (shift left-click): transfer
+              //                crafted output to inventory regardless of
+              //                what cursor holds (bypasses incompat check)
+              const button: "attack" | "use" = probed.action === "place_one" ? "use" : "attack";
+              const shift = probed.action === "take";
               const probedSlot = layout.slots[probed.slot];
               if (!probedSlot) {
                 console.warn(`[agentbeats] probe returned slot ${probed.slot} but layout only has ${layout.slots.length}; skipping`);
@@ -743,6 +745,7 @@ export class McuVisualPolicy {
                   slotRole: probedSlot.role,
                   frozenTarget: { x: probedSlot.cx, y: probedSlot.cy },
                   button,
+                  shift,
                 };
                 plan.servoSteps = 0;
                 state.closedLoopHistory.unshift(`${probed.action} slot=${probed.slot}${probedSlot.name ? `(${probedSlot.name})` : ""}`);
@@ -783,6 +786,7 @@ export class McuVisualPolicy {
             cursor,
             target,
             button: pc.button,
+            shift: pc.shift,
             hitThresholdPx: 5,
           });
           plan.servoSteps += 1;
@@ -791,6 +795,7 @@ export class McuVisualPolicy {
             console.warn(`[agentbeats] closed-loop: servo cap hit on ${pc.slotName ?? `slot[${pc.rasterIndex}]`}; clicking anyway`);
             const action = defaultMcuAction();
             action[pc.button] = 1;
+            if (pc.shift) action.sneak = 1;
             plan.pendingClick = null;
             return { ...ACTION_PAYLOAD_PREFIX, action, hold_steps: 1 };
           }
