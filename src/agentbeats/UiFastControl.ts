@@ -414,8 +414,21 @@ export type ClosedLoopCraftPlan = {
   /** Cap the number of probe iterations so a confused VLM can't loop forever. */
   maxIterations: number;
   /** Pending click target — when set, the policy is servoing the cursor to
-   *  this slot. Cleared once the click fires. */
-  pendingClick: { slot: number; button: "attack" | "use" } | null;
+   *  this slot. Cleared once the click fires.
+   *  - rasterIndex: the index VLM picked from the marked frame (used as
+   *    the LAST-RESORT lookup if name/role can't be resolved).
+   *  - slotName: semantic name from the matched layout (e.g. "hotbar_0")
+   *    -- stable across frames; preferred lookup key.
+   *  - slotRole: semantic role (e.g. "result") -- second-choice fallback.
+   *  - frozenTarget: pixel position captured at probe time, used if all
+   *    lookups fail (e.g. layout matching is now degraded). */
+  pendingClick: {
+    rasterIndex: number;
+    slotName?: string;
+    slotRole?: string;
+    frozenTarget: { x: number; y: number };
+    button: "attack" | "use";
+  } | null;
   /** How many servo steps we've spent on the current pendingClick. Capped
    *  so a misbehaving cursor (or detection failure) doesn't deadlock. */
   servoSteps: number;

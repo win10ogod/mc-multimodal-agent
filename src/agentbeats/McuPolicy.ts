@@ -708,13 +708,24 @@ export class McuVisualPolicy {
               plan.done = true;
             } else {
               const button: "attack" | "use" = probed.action === "place_one" ? "use" : "attack";
-              plan.pendingClick = { slot: probed.slot, button };
-              plan.servoSteps = 0;
-              state.closedLoopHistory.unshift(`${probed.action} slot=${probed.slot}`);
-              state.closedLoopHistory = state.closedLoopHistory.slice(0, 5);
-              console.log(
-                `[agentbeats] closed-loop probe iter=${plan.iteration}: ${probed.action} slot=${probed.slot} reason=${probed.reason ?? ""}`,
-              );
+              const probedSlot = layout.slots[probed.slot];
+              if (!probedSlot) {
+                console.warn(`[agentbeats] probe returned slot ${probed.slot} but layout only has ${layout.slots.length}; skipping`);
+              } else {
+                plan.pendingClick = {
+                  rasterIndex: probed.slot,
+                  slotName: probedSlot.name,
+                  slotRole: probedSlot.role,
+                  frozenTarget: { x: probedSlot.cx, y: probedSlot.cy },
+                  button,
+                };
+                plan.servoSteps = 0;
+                state.closedLoopHistory.unshift(`${probed.action} slot=${probed.slot}${probedSlot.name ? `(${probedSlot.name})` : ""}`);
+                state.closedLoopHistory = state.closedLoopHistory.slice(0, 5);
+                console.log(
+                  `[agentbeats] closed-loop probe iter=${plan.iteration}: ${probed.action} slot=${probed.slot} name=${probedSlot.name ?? "?"} reason=${probed.reason ?? ""}`,
+                );
+              }
             }
           } catch (error) {
             console.warn(`[agentbeats] closed-loop probe failed: ${formatModelProviderError(error)} -- ending closed-loop`);
@@ -722,39 +733,51 @@ export class McuVisualPolicy {
           }
         }
 
-        // Servo step toward the pending click target.
+        // Servo step toward the pending click target. Resolve the target
+        // by SEMANTIC NAME first (stable across frames), then role, then
+        // raster index, then frozen pixel position. This protects against
+        // raster-index reshuffling when a frame's slot detection misses
+        // some item-filled slots.
         if (plan.pendingClick !== null && !plan.done) {
-          const targetSlot = layout.slots[plan.pendingClick.slot];
-          if (!targetSlot) {
-            console.warn(`[agentbeats] closed-loop: pending slot ${plan.pendingClick.slot} not in layout (only ${layout.slots.length}); aborting click`);
-            plan.pendingClick = null;
-          } else {
-            const stepResult = servoCursorStep({
-              cursor,
-              target: { x: targetSlot.cx, y: targetSlot.cy },
-              button: plan.pendingClick.button,
-              hitThresholdPx: 5,
-            });
-            plan.servoSteps += 1;
-            const SERVO_STEP_CAP = 10;
-            if (plan.servoSteps > SERVO_STEP_CAP) {
-              console.warn(`[agentbeats] closed-loop: servo cap hit on slot ${plan.pendingClick.slot}; clicking anyway`);
-              const action = defaultMcuAction();
-              action[plan.pendingClick.button] = 1;
-              plan.pendingClick = null;
-              return { ...ACTION_PAYLOAD_PREFIX, action, hold_steps: 1 };
-            }
-            if (stepResult) {
-              console.log(
-                `[agentbeats] servo step=${step} cursor=(${cursor?.x},${cursor?.y}) target=(${targetSlot.cx},${targetSlot.cy}) ${stepResult.reason}`,
-              );
-              if (stepResult.click) plan.pendingClick = null;
-              return { ...ACTION_PAYLOAD_PREFIX, action: stepResult.action, hold_steps: 1 };
-            }
-            // Cursor not detected this frame — emit a noop and re-observe next obs.
-            console.log(`[agentbeats] servo step=${step}: no cursor detected; noop`);
-            return { ...ACTION_PAYLOAD_PREFIX, action: defaultMcuAction(), hold_steps: 1 };
+          const pc = plan.pendingClick;
+          let target: { x: number; y: number } | null = null;
+          if (pc.slotName) {
+            const found = layout.slots.find((s) => s.name === pc.slotName);
+            if (found) target = { x: found.cx, y: found.cy };
           }
+          if (!target && pc.slotRole) {
+            const found = layout.slots.find((s) => s.role === pc.slotRole);
+            if (found) target = { x: found.cx, y: found.cy };
+          }
+          if (!target && layout.slots[pc.rasterIndex]) {
+            target = { x: layout.slots[pc.rasterIndex].cx, y: layout.slots[pc.rasterIndex].cy };
+          }
+          if (!target) target = pc.frozenTarget;
+
+          const stepResult = servoCursorStep({
+            cursor,
+            target,
+            button: pc.button,
+            hitThresholdPx: 5,
+          });
+          plan.servoSteps += 1;
+          const SERVO_STEP_CAP = 10;
+          if (plan.servoSteps > SERVO_STEP_CAP) {
+            console.warn(`[agentbeats] closed-loop: servo cap hit on ${pc.slotName ?? `slot[${pc.rasterIndex}]`}; clicking anyway`);
+            const action = defaultMcuAction();
+            action[pc.button] = 1;
+            plan.pendingClick = null;
+            return { ...ACTION_PAYLOAD_PREFIX, action, hold_steps: 1 };
+          }
+          if (stepResult) {
+            console.log(
+              `[agentbeats] servo step=${step} cursor=(${cursor?.x},${cursor?.y}) target=(${target.x},${target.y}) name=${pc.slotName ?? "?"} ${stepResult.reason}`,
+            );
+            if (stepResult.click) plan.pendingClick = null;
+            return { ...ACTION_PAYLOAD_PREFIX, action: stepResult.action, hold_steps: 1 };
+          }
+          console.log(`[agentbeats] servo step=${step}: no cursor detected; noop`);
+          return { ...ACTION_PAYLOAD_PREFIX, action: defaultMcuAction(), hold_steps: 1 };
         }
       }
     }
