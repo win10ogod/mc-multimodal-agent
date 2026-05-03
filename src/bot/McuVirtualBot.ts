@@ -433,7 +433,7 @@ export class McuVirtualBot implements BotApi {
     limit?: number;
   }): Promise<BuildSummary> {
     this.push({ kind: "buildBlueprint", params: params as unknown as Record<string, unknown> });
-    return { blueprint: params.name, attempted: 0, placed: 0, skipped: 0, failed: [] };
+    return { blueprint: params.name, anchor: params.anchor, attempted: 0, placed: 0, skipped: 0, failed: [] };
   }
 }
 

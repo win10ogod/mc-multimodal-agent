@@ -152,6 +152,18 @@ For reliable builds, run a preflight first:
 npm run dev -- start --task "Use build_blueprint with blueprint=example-hut offset=[2,0,3] limit=40 dryRun=true, then report required/available/missing/footprint."
 ```
 
+For continuation or repair after a partial blueprint build, prefer the higher
+level workflow tool:
+
+```bash
+npm run dev -- start --task "Use blueprint_build_continue with blueprint=example-hut position=[x,y,z] limit=40, then follow any nextToolCalls it returns."
+```
+
+`blueprint_build_continue` keeps the same world anchor across retries, runs a
+dry-run preflight, optionally grants safe missing materials when command grants
+are enabled, executes one bounded build pass, and returns `nextToolCalls` for
+blocked or partial builds.
+
 If materials are missing, the preflight returns an `acquisitionPlan`. In survival
 mode the agent should craft wooden tools, gather stone, upgrade to stone tools,
 then gather exact missing materials before retrying the preflight.

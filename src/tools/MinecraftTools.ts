@@ -161,6 +161,63 @@ function materialGrantItems(value: JsonValue | undefined): Array<{ name: string;
     .filter((item) => item.name.trim() && item.count > 0);
 }
 
+async function grantCommandMaterials(
+  ctx: MinecraftToolContext,
+  items: Array<{ name: string; count: number }>,
+  reason?: string,
+): Promise<ToolResult> {
+  if (!ctx.config.minecraft.allowCommandMaterials) {
+    return {
+      ok: false,
+      text: "grant_materials disabled: set MC_ALLOW_COMMAND_MATERIALS=true to allow /give-based material grants.",
+    };
+  }
+  if (items.length === 0) {
+    return { ok: false, text: "grant_materials requires at least one item with a positive count." };
+  }
+  const maxCount = Math.max(1, ctx.config.minecraft.commandMaterialMaxCount);
+  const allowed = new Set(
+    ctx.config.minecraft.commandMaterialAllowedItems
+      .map((item) => normalizeCommandMaterialName(item)?.item)
+      .filter((item): item is string => Boolean(item)),
+  );
+  const normalizedItems: Array<{ name: string; commandItem: string; count: number }> = [];
+  for (const item of items) {
+    const normalized = normalizeCommandMaterialName(item.name);
+    if (!normalized) {
+      return { ok: false, text: `grant_materials invalid material name: ${item.name}` };
+    }
+    if (!commandMaterialAllowed(normalized.item, allowed)) {
+      return { ok: false, text: `grant_materials not allowed for material: ${normalized.item}` };
+    }
+    if (item.count > maxCount) {
+      return { ok: false, text: `grant_materials count for ${normalized.item} exceeds max ${maxCount}: ${item.count}` };
+    }
+    normalizedItems.push({ name: normalized.item, commandItem: normalized.commandItem, count: item.count });
+  }
+
+  const commands: string[] = [];
+  for (const item of normalizedItems) {
+    let remaining = item.count;
+    while (remaining > 0) {
+      const batch = Math.min(64, remaining);
+      const command = `/give ${ctx.config.minecraft.username} ${item.commandItem} ${batch}`;
+      await ctx.bot.chat(command);
+      commands.push(command);
+      remaining -= batch;
+      if (remaining > 0) {
+        await sleep(100);
+      }
+    }
+  }
+  const total = normalizedItems.reduce((sum, item) => sum + item.count, 0);
+  return ok(`granted ${total} command material${total === 1 ? "" : "s"}`, {
+    reason,
+    granted: normalizedItems.map(({ name, count }) => ({ name, count })),
+    commands,
+  } as unknown as JsonValue);
+}
+
 async function announceGoalPlan(ctx: MinecraftToolContext, root: GoalNode, goals: GoalNode[]): Promise<void> {
   if (!ctx.config.observability.announcePlansInChat) {
     return;
@@ -242,6 +299,83 @@ function directionFromRelative(relative: Vec3Like): string {
     parts.push(`down ${Math.abs(relative.y)}`);
   }
   return parts.join(", ") || "here";
+}
+
+function anchorArray(anchor: Vec3Like): [number, number, number] {
+  return [anchor.x, anchor.y, anchor.z];
+}
+
+function blueprintAnchorFromArgs(args: JsonObject, ctx: MinecraftToolContext): Vec3Like {
+  if (Array.isArray(args.position)) {
+    return vecFromArray(args.position);
+  }
+  const base = ctx.bot.feetBlock();
+  const offset = vecFromArray(args.offset);
+  return {
+    x: base.x + offset.x,
+    y: base.y + offset.y,
+    z: base.z + offset.z,
+  };
+}
+
+function blueprintContinueArguments(
+  blueprint: string,
+  anchor: Vec3Like,
+  args: JsonObject,
+  clearMismatch: boolean,
+): JsonObject {
+  const next: JsonObject = {
+    blueprint,
+    position: anchorArray(anchor),
+  };
+  if (typeof args.limit === "number") {
+    next.limit = args.limit;
+  }
+  if (clearMismatch !== true) {
+    next.clearMismatch = false;
+  }
+  if (typeof args.materialMode === "string") {
+    next.materialMode = args.materialMode;
+  }
+  return next;
+}
+
+function acquisitionNextToolCalls(
+  summary: { acquisitionPlan?: { steps?: Array<{ suggestedToolCall?: { tool: string; arguments: Record<string, unknown> } }> } },
+  blueprint: string,
+  anchor: Vec3Like,
+  args: JsonObject,
+  clearMismatch: boolean,
+): Array<{ tool: string; arguments: JsonObject }> {
+  const suggested =
+    summary.acquisitionPlan?.steps
+      ?.map((step) => step.suggestedToolCall)
+      .filter((step): step is { tool: string; arguments: Record<string, unknown> } =>
+        Boolean(step?.tool && step.arguments && typeof step.arguments === "object" && !Array.isArray(step.arguments)),
+      )
+      .map((step) => ({ tool: step.tool, arguments: step.arguments as JsonObject })) ?? [];
+  return [
+    ...suggested,
+    {
+      tool: "blueprint_build_continue",
+      arguments: blueprintContinueArguments(blueprint, anchor, args, clearMismatch),
+    },
+  ];
+}
+
+function repairNextToolCalls(
+  blueprint: string,
+  anchor: Vec3Like,
+  args: JsonObject,
+  clearMismatch: boolean,
+): Array<{ tool: string; arguments: JsonObject }> {
+  return [
+    { tool: "observe", arguments: {} },
+    {
+      tool: "blueprint_build_continue",
+      arguments: blueprintContinueArguments(blueprint, anchor, args, clearMismatch),
+    },
+  ];
 }
 
 const SKILL_META_TOOLS = new Set([
@@ -1474,6 +1608,14 @@ export function createMinecraftToolRegistry(): ToolRegistry<MinecraftToolContext
           maxItems: 3,
           description: "XYZ offset from current feet block.",
         },
+        position: {
+          type: "array",
+          items: { type: "number" },
+          minItems: 3,
+          maxItems: 3,
+          description:
+            "Absolute world XYZ anchor. Use a returned anchor value for retries so the blueprint origin does not drift after the bot moves.",
+        },
         clearMismatch: { type: "boolean" },
         dryRun: {
           type: "boolean",
@@ -1487,13 +1629,7 @@ export function createMinecraftToolRegistry(): ToolRegistry<MinecraftToolContext
     execute: async (args, ctx) => {
       const requested = requiredString(args, "blueprint");
       const { blueprint } = await resolveBlueprint(ctx.config.paths.blueprints, requested);
-      const base = ctx.bot.feetBlock();
-      const offset = vecFromArray(args.offset);
-      const anchor = {
-        x: base.x + offset.x,
-        y: base.y + offset.y,
-        z: base.z + offset.z,
-      };
+      const anchor = blueprintAnchorFromArgs(args, ctx);
       const summary = await ctx.bot.buildBlueprint({
         name: blueprint.name,
         anchor,
@@ -1502,21 +1638,178 @@ export function createMinecraftToolRegistry(): ToolRegistry<MinecraftToolContext
         limit: typeof args.limit === "number" ? args.limit : undefined,
         dryRun: args.dryRun === true,
       });
+      const anchorText = ` anchor=${anchor.x},${anchor.y},${anchor.z}`;
+      const firstFailure = summary.failed[0];
+      const failureText = firstFailure
+        ? ` first_failure=${firstFailure.block}@${firstFailure.position.x},${firstFailure.position.y},${firstFailure.position.z}: ${firstFailure.reason}`
+        : "";
       let text: string;
       if (summary.blocked === "missing_materials") {
         const acquisition = summary.acquisitionPlan?.strategy ? ` acquisition=${summary.acquisitionPlan.strategy}` : "";
-        text = `blueprint ${blueprint.name}: blocked=missing_materials${acquisition} missing=${JSON.stringify(summary.missing ?? [])}`;
+        text = `blueprint ${blueprint.name}:${anchorText} blocked=missing_materials${acquisition} missing=${JSON.stringify(summary.missing ?? [])}`;
       } else if (summary.blocked) {
-        text = `blueprint ${blueprint.name}: blocked=${summary.blocked} placed=${summary.placed} skipped=${summary.skipped} failed=${summary.failed.length}`;
+        text = `blueprint ${blueprint.name}:${anchorText} blocked=${summary.blocked} placed=${summary.placed} skipped=${summary.skipped} failed=${summary.failed.length}${failureText}`;
       } else if (args.dryRun === true) {
-        text = `blueprint ${blueprint.name}: preflight planned=${summary.planned ?? 0} missing=${JSON.stringify(summary.missing ?? [])}`;
+        text = `blueprint ${blueprint.name}:${anchorText} preflight planned=${summary.planned ?? 0} missing=${JSON.stringify(summary.missing ?? [])}`;
       } else {
-        text = `blueprint ${blueprint.name}: placed=${summary.placed} skipped=${summary.skipped} failed=${summary.failed.length}`;
+        text = `blueprint ${blueprint.name}:${anchorText} placed=${summary.placed} skipped=${summary.skipped} failed=${summary.failed.length}${failureText}`;
       }
       return {
-        ok: !summary.blocked,
+        ok: !summary.blocked && (args.dryRun === true || summary.failed.length === 0),
         text,
-        data: summary as unknown as JsonValue,
+        data: { ...summary, anchor } as unknown as JsonValue,
+      };
+    },
+  });
+
+  registry.register({
+    name: "blueprint_build_continue",
+    description:
+      "Continue a .litematic blueprint build as a bounded workflow: fixed world anchor, dry-run preflight, optional safe material grants, real build, and actionable recovery steps.",
+    parameters: {
+      type: "object",
+      properties: {
+        blueprint: { type: "string", description: ".litematic blueprint name, file path, or file basename." },
+        position: {
+          type: "array",
+          items: { type: "number" },
+          minItems: 3,
+          maxItems: 3,
+          description: "Absolute world XYZ anchor from a prior blueprint tool result. Preferred for retries.",
+        },
+        offset: {
+          type: "array",
+          items: { type: "number" },
+          minItems: 3,
+          maxItems: 3,
+          description: "XYZ offset from current feet block when no absolute position is known.",
+        },
+        clearMismatch: {
+          type: "boolean",
+          description: "Clear blocks that conflict with blueprint placements. Defaults to true for continuation.",
+        },
+        limit: { type: "number", description: "Optional max placements for this continuation pass." },
+        materialMode: {
+          type: "string",
+          enum: ["auto", "grant", "none"],
+          default: "auto",
+          description:
+            "auto grants safe missing materials only when command grants are enabled; grant requires command grants; none returns acquisition steps.",
+        },
+      },
+      required: ["blueprint"],
+      additionalProperties: false,
+    },
+    execute: async (args, ctx) => {
+      const requested = requiredString(args, "blueprint");
+      const { blueprint } = await resolveBlueprint(ctx.config.paths.blueprints, requested);
+      const anchor = blueprintAnchorFromArgs(args, ctx);
+      const clearMismatch = args.clearMismatch !== false;
+      const limit = typeof args.limit === "number" ? args.limit : undefined;
+      const materialMode =
+        args.materialMode === "grant" || args.materialMode === "none" ? args.materialMode : "auto";
+      const anchorText = `${anchor.x},${anchor.y},${anchor.z}`;
+      const buildParams = {
+        name: blueprint.name,
+        anchor,
+        placements: blueprint.placements,
+        clearMismatch,
+        limit,
+      };
+
+      const preflight = await ctx.bot.buildBlueprint({ ...buildParams, dryRun: true });
+      let checked = preflight;
+      let grantResult: ToolResult | undefined;
+      if (checked.blocked === "missing_materials") {
+        const missing = (checked.missing ?? []).map((item) => ({ name: item.name, count: item.count }));
+        const canGrant = materialMode !== "none" && ctx.config.minecraft.allowCommandMaterials;
+        if (canGrant) {
+          grantResult = await grantCommandMaterials(
+            ctx,
+            missing,
+            `blueprint_build_continue ${blueprint.name} anchor=${anchorText}`,
+          );
+          if (!grantResult.ok) {
+            return {
+              ok: false,
+              text: `blueprint_continue ${blueprint.name}: anchor=${anchorText} state=blocked_missing_materials grant_failed=${grantResult.text}`,
+              data: {
+                state: "blocked_missing_materials",
+                anchor,
+                preflight: checked,
+                grant: grantResult,
+                nextToolCalls: acquisitionNextToolCalls(checked, blueprint.name, anchor, args, clearMismatch),
+              } as unknown as JsonValue,
+            };
+          }
+          checked = await ctx.bot.buildBlueprint({ ...buildParams, dryRun: true });
+        }
+      }
+
+      if (checked.blocked === "missing_materials") {
+        return {
+          ok: false,
+          text: `blueprint_continue ${blueprint.name}: anchor=${anchorText} state=blocked_missing_materials missing=${JSON.stringify(checked.missing ?? [])}`,
+          data: {
+            state: "blocked_missing_materials",
+            anchor,
+            preflight,
+            postGrantPreflight: checked,
+            grant: grantResult,
+            nextToolCalls: acquisitionNextToolCalls(checked, blueprint.name, anchor, args, clearMismatch),
+          } as unknown as JsonValue,
+        };
+      }
+
+      if (checked.blocked) {
+        return {
+          ok: false,
+          text: `blueprint_continue ${blueprint.name}: anchor=${anchorText} state=blocked blocked=${checked.blocked}`,
+          data: {
+            state: "blocked",
+            anchor,
+            preflight,
+            postGrantPreflight: checked,
+            grant: grantResult,
+            nextToolCalls: repairNextToolCalls(blueprint.name, anchor, args, clearMismatch),
+          } as unknown as JsonValue,
+        };
+      }
+
+      const build = await ctx.bot.buildBlueprint({ ...buildParams, dryRun: false });
+      const firstFailure = build.failed[0];
+      const failureText = firstFailure
+        ? ` first_failure=${firstFailure.block}@${firstFailure.position.x},${firstFailure.position.y},${firstFailure.position.z}: ${firstFailure.reason}`
+        : "";
+      if (build.blocked || build.failed.length > 0) {
+        const state = build.blocked === "navigation_blocked" ? "blocked_navigation" : "partial";
+        return {
+          ok: false,
+          text: `blueprint_continue ${blueprint.name}: anchor=${anchorText} state=${state} placed=${build.placed} skipped=${build.skipped} failed=${build.failed.length}${failureText}`,
+          data: {
+            state,
+            anchor,
+            preflight,
+            postGrantPreflight: checked,
+            grant: grantResult,
+            build,
+            nextToolCalls: repairNextToolCalls(blueprint.name, anchor, args, clearMismatch),
+          } as unknown as JsonValue,
+        };
+      }
+
+      return {
+        ok: true,
+        text: `blueprint_continue ${blueprint.name}: anchor=${anchorText} state=complete placed=${build.placed} skipped=${build.skipped} failed=0`,
+        data: {
+          state: "complete",
+          anchor,
+          preflight,
+          postGrantPreflight: checked,
+          grant: grantResult,
+          build,
+          nextToolCalls: [],
+        } as unknown as JsonValue,
       };
     },
   });
@@ -1546,57 +1839,8 @@ export function createMinecraftToolRegistry(): ToolRegistry<MinecraftToolContext
       additionalProperties: false,
     },
     execute: async (args, ctx) => {
-      if (!ctx.config.minecraft.allowCommandMaterials) {
-        return {
-          ok: false,
-          text: "grant_materials disabled: set MC_ALLOW_COMMAND_MATERIALS=true to allow /give-based material grants.",
-        };
-      }
       const items = materialGrantItems(args.items);
-      if (items.length === 0) {
-        return { ok: false, text: "grant_materials requires at least one item with a positive count." };
-      }
-      const maxCount = Math.max(1, ctx.config.minecraft.commandMaterialMaxCount);
-      const allowed = new Set(
-        ctx.config.minecraft.commandMaterialAllowedItems
-          .map((item) => normalizeCommandMaterialName(item)?.item)
-          .filter((item): item is string => Boolean(item)),
-      );
-      const normalizedItems: Array<{ name: string; commandItem: string; count: number }> = [];
-      for (const item of items) {
-        const normalized = normalizeCommandMaterialName(item.name);
-        if (!normalized) {
-          return { ok: false, text: `grant_materials invalid material name: ${item.name}` };
-        }
-        if (!commandMaterialAllowed(normalized.item, allowed)) {
-          return { ok: false, text: `grant_materials not allowed for material: ${normalized.item}` };
-        }
-        if (item.count > maxCount) {
-          return { ok: false, text: `grant_materials count for ${normalized.item} exceeds max ${maxCount}: ${item.count}` };
-        }
-        normalizedItems.push({ name: normalized.item, commandItem: normalized.commandItem, count: item.count });
-      }
-
-      const commands: string[] = [];
-      for (const item of normalizedItems) {
-        let remaining = item.count;
-        while (remaining > 0) {
-          const batch = Math.min(64, remaining);
-          const command = `/give ${ctx.config.minecraft.username} ${item.commandItem} ${batch}`;
-          await ctx.bot.chat(command);
-          commands.push(command);
-          remaining -= batch;
-          if (remaining > 0) {
-            await sleep(100);
-          }
-        }
-      }
-      const total = normalizedItems.reduce((sum, item) => sum + item.count, 0);
-      return ok(`granted ${total} command material${total === 1 ? "" : "s"}`, {
-        reason: typeof args.reason === "string" ? args.reason : undefined,
-        granted: normalizedItems.map(({ name, count }) => ({ name, count })),
-        commands,
-      } as unknown as JsonValue);
+      return grantCommandMaterials(ctx, items, typeof args.reason === "string" ? args.reason : undefined);
     },
   });
 

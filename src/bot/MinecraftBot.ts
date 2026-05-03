@@ -46,6 +46,7 @@ export type PlacementSummary = {
 
 export type BuildSummary = {
   blueprint: string;
+  anchor?: Vec3Like;
   attempted: number;
   placed: number;
   skipped: number;
@@ -1682,6 +1683,7 @@ export class MinecraftBot {
   }): Promise<BuildSummary> {
     const summary: BuildSummary = {
       blueprint: params.name,
+      anchor: params.anchor,
       attempted: 0,
       placed: 0,
       skipped: 0,

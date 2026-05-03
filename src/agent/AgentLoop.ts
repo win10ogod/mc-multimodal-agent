@@ -84,6 +84,7 @@ const AUTO_OBSERVE_AFTER_TOOLS = new Set([
   "combat_pulse",
   "craft_item",
   "build_blueprint",
+  "blueprint_build_continue",
   "execute_steps",
   "execute_skill",
 ]);

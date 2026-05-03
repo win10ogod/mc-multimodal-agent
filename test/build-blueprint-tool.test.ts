@@ -61,6 +61,96 @@ describe("build_blueprint tool", () => {
     expect(received?.placements.every((placement) => placement.block !== "air")).toBe(true);
   });
 
+  it("uses an explicit world anchor so retries do not drift after the bot moves", async () => {
+    const registry = createMinecraftToolRegistry();
+    let received:
+      | {
+          anchor: Vec3Like;
+        }
+      | undefined;
+    let feetBlockCalls = 0;
+
+    const result = await registry.execute(
+      "build_blueprint",
+      {
+        blueprint: "example-hut",
+        position: [100, 70, 200],
+        offset: [2, 0, 3],
+        dryRun: true,
+      },
+      {
+        config: {
+          paths: {
+            blueprints: path.resolve("blueprints"),
+          },
+        },
+        bot: {
+          feetBlock: () => {
+            feetBlockCalls += 1;
+            return { x: 10, y: 64, z: 20 };
+          },
+          buildBlueprint: async (params: { anchor: Vec3Like }) => {
+            received = params;
+            return {
+              blueprint: "example-hut",
+              attempted: 0,
+              placed: 0,
+              skipped: 0,
+              failed: [],
+              planned: 40,
+              missing: [],
+              anchor: params.anchor,
+            };
+          },
+        },
+      } as unknown as MinecraftToolContext,
+    );
+
+    expect(result.ok).toBe(true);
+    expect(received?.anchor).toEqual({ x: 100, y: 70, z: 200 });
+    expect(feetBlockCalls).toBe(0);
+    expect(result.text).toContain("anchor=100,70,200");
+  });
+
+  it("returns a failed tool result when actual blueprint placement is partial", async () => {
+    const registry = createMinecraftToolRegistry();
+    const result = await registry.execute(
+      "build_blueprint",
+      {
+        blueprint: "example-hut",
+        position: [100, 70, 200],
+        limit: 2,
+      },
+      {
+        config: {
+          paths: {
+            blueprints: path.resolve("blueprints"),
+          },
+        },
+        bot: {
+          feetBlock: () => ({ x: 0, y: 64, z: 0 }),
+          buildBlueprint: async () => ({
+            blueprint: "example-hut",
+            attempted: 2,
+            placed: 1,
+            skipped: 0,
+            failed: [
+              {
+                position: { x: 101, y: 70, z: 200 },
+                block: "oak_log",
+                reason: "No solid neighbor for placement at 101,70,200",
+              },
+            ],
+          }),
+        },
+      } as unknown as MinecraftToolContext,
+    );
+
+    expect(result.ok).toBe(false);
+    expect(result.text).toContain("failed=1");
+    expect(result.text).toContain("No solid neighbor");
+  });
+
   it("does not mutate the world when blueprint materials are missing", async () => {
     let blockAtCalls = 0;
     let digCalls = 0;
@@ -245,5 +335,245 @@ describe("build_blueprint tool", () => {
     expect(summary.failed).toHaveLength(2);
     expect(summary.blocked).toBe("navigation_blocked");
     expect(placeCalls).toBe(2);
+  });
+});
+
+describe("blueprint_build_continue tool", () => {
+  it("preflights, grants safe missing materials, rechecks, and builds at one stable anchor", async () => {
+    const registry = createMinecraftToolRegistry();
+    const sent: string[] = [];
+    const calls: Array<{ anchor: Vec3Like; dryRun?: boolean; clearMismatch?: boolean; limit?: number }> = [];
+    const summaries = [
+      {
+        blueprint: "example-hut",
+        anchor: { x: 100, y: 70, z: 200 },
+        attempted: 0,
+        placed: 0,
+        skipped: 0,
+        failed: [],
+        blocked: "missing_materials" as const,
+        missing: [{ name: "oak_log", count: 2 }],
+      },
+      {
+        blueprint: "example-hut",
+        anchor: { x: 100, y: 70, z: 200 },
+        attempted: 0,
+        placed: 0,
+        skipped: 0,
+        failed: [],
+        planned: 40,
+        missing: [],
+      },
+      {
+        blueprint: "example-hut",
+        anchor: { x: 100, y: 70, z: 200 },
+        attempted: 40,
+        placed: 40,
+        skipped: 0,
+        failed: [],
+        planned: 40,
+        missing: [],
+      },
+    ];
+
+    const result = await registry.execute(
+      "blueprint_build_continue",
+      {
+        blueprint: "example-hut",
+        position: [100, 70, 200],
+        offset: [9, 9, 9],
+        limit: 40,
+      },
+      {
+        config: {
+          minecraft: {
+            username: "OpenClawMC",
+            allowCommandMaterials: true,
+            commandMaterialMaxCount: 128,
+            commandMaterialAllowedItems: ["oak_log"],
+          },
+          paths: {
+            blueprints: path.resolve("blueprints"),
+          },
+        },
+        bot: {
+          feetBlock: () => ({ x: 1, y: 2, z: 3 }),
+          chat: async (message: string) => {
+            sent.push(message);
+          },
+          buildBlueprint: async (params: { anchor: Vec3Like; dryRun?: boolean; clearMismatch?: boolean; limit?: number }) => {
+            calls.push({
+              anchor: params.anchor,
+              dryRun: params.dryRun,
+              clearMismatch: params.clearMismatch,
+              limit: params.limit,
+            });
+            const next = summaries.shift();
+            if (!next) {
+              throw new Error("unexpected extra buildBlueprint call");
+            }
+            return next;
+          },
+        },
+      } as unknown as MinecraftToolContext,
+    );
+
+    expect(result.ok).toBe(true);
+    expect(result.text).toContain("state=complete");
+    expect(sent).toEqual(["/give OpenClawMC minecraft:oak_log 2"]);
+    expect(calls.map((call) => call.dryRun)).toEqual([true, true, false]);
+    expect(calls.map((call) => call.anchor)).toEqual([
+      { x: 100, y: 70, z: 200 },
+      { x: 100, y: 70, z: 200 },
+      { x: 100, y: 70, z: 200 },
+    ]);
+    expect(calls.every((call) => call.limit === 40)).toBe(true);
+  });
+
+  it("returns actionable next tool calls when material grants are unavailable", async () => {
+    const registry = createMinecraftToolRegistry();
+    const result = await registry.execute(
+      "blueprint_build_continue",
+      {
+        blueprint: "example-hut",
+        position: [100, 70, 200],
+        limit: 40,
+      },
+      {
+        config: {
+          minecraft: {
+            username: "OpenClawMC",
+            allowCommandMaterials: false,
+            commandMaterialMaxCount: 128,
+            commandMaterialAllowedItems: ["oak_log"],
+          },
+          paths: {
+            blueprints: path.resolve("blueprints"),
+          },
+        },
+        bot: {
+          feetBlock: () => ({ x: 1, y: 2, z: 3 }),
+          buildBlueprint: async () => ({
+            blueprint: "example-hut",
+            anchor: { x: 100, y: 70, z: 200 },
+            attempted: 0,
+            placed: 0,
+            skipped: 0,
+            failed: [],
+            blocked: "missing_materials",
+            missing: [{ name: "oak_log", count: 2 }],
+            acquisitionPlan: {
+              strategy: "tool_upgrade_then_gather",
+              missing: [{ name: "oak_log", count: 2 }],
+              steps: [
+                {
+                  action: "gather",
+                  item: "oak_log",
+                  count: 2,
+                  reason: "collect missing logs",
+                  suggestedToolCall: {
+                    tool: "harvest_nearby_blocks",
+                    arguments: { names: ["oak_log"], count: 2, maxDistance: 48 },
+                  },
+                },
+              ],
+              notes: [],
+            },
+          }),
+        },
+      } as unknown as MinecraftToolContext,
+    );
+
+    expect(result.ok).toBe(false);
+    expect(result.text).toContain("state=blocked_missing_materials");
+    expect(result.data).toMatchObject({
+      nextToolCalls: [
+        {
+          tool: "harvest_nearby_blocks",
+          arguments: { names: ["oak_log"], count: 2, maxDistance: 48 },
+        },
+        {
+          tool: "blueprint_build_continue",
+          arguments: { blueprint: "example-hut", position: [100, 70, 200], limit: 40 },
+        },
+      ],
+    });
+  });
+
+  it("keeps failed placement recovery anchored to the same world position", async () => {
+    const registry = createMinecraftToolRegistry();
+    const summaries = [
+      {
+        blueprint: "example-hut",
+        anchor: { x: 100, y: 70, z: 200 },
+        attempted: 0,
+        placed: 0,
+        skipped: 0,
+        failed: [],
+        planned: 40,
+        missing: [],
+      },
+      {
+        blueprint: "example-hut",
+        anchor: { x: 100, y: 70, z: 200 },
+        attempted: 40,
+        placed: 20,
+        skipped: 5,
+        failed: [
+          {
+            position: { x: 104, y: 72, z: 203 },
+            block: "oak_log",
+            reason: "No solid neighbor for placement at 104,72,203",
+          },
+        ],
+        planned: 40,
+        missing: [],
+      },
+    ];
+
+    const result = await registry.execute(
+      "blueprint_build_continue",
+      {
+        blueprint: "example-hut",
+        position: [100, 70, 200],
+        limit: 40,
+      },
+      {
+        config: {
+          minecraft: {
+            username: "OpenClawMC",
+            allowCommandMaterials: false,
+            commandMaterialMaxCount: 128,
+            commandMaterialAllowedItems: [],
+          },
+          paths: {
+            blueprints: path.resolve("blueprints"),
+          },
+        },
+        bot: {
+          feetBlock: () => ({ x: 1, y: 2, z: 3 }),
+          buildBlueprint: async () => {
+            const next = summaries.shift();
+            if (!next) {
+              throw new Error("unexpected extra buildBlueprint call");
+            }
+            return next;
+          },
+        },
+      } as unknown as MinecraftToolContext,
+    );
+
+    expect(result.ok).toBe(false);
+    expect(result.text).toContain("state=partial");
+    expect(result.text).toContain("No solid neighbor");
+    expect(result.data).toMatchObject({
+      nextToolCalls: [
+        { tool: "observe", arguments: {} },
+        {
+          tool: "blueprint_build_continue",
+          arguments: { blueprint: "example-hut", position: [100, 70, 200], limit: 40 },
+        },
+      ],
+    });
   });
 });
