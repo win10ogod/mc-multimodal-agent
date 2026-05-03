@@ -24,7 +24,7 @@ import {
   type UiFastControlFrame,
 } from "./UiFastControl";
 import { probeNextCraftAction } from "./InventoryProbe";
-import { detectCursor, detectGuiLayout } from "./SlotDetector";
+import { detectCursor, detectGuiLayout, samplePatchFingerprint } from "./SlotDetector";
 
 type McuInitPayload = {
   type: "init";
@@ -739,6 +739,8 @@ export class McuVisualPolicy {
               if (!probedSlot) {
                 console.warn(`[agentbeats] probe returned slot ${probed.slot} but layout only has ${layout.slots.length}; skipping`);
               } else {
+                const expectAfter: "should_empty" | "should_fill" =
+                  (probed.action === "place_one" || probed.action === "place_all") ? "should_fill" : "should_empty";
                 plan.pendingClick = {
                   rasterIndex: probed.slot,
                   slotName: probedSlot.name,
@@ -746,6 +748,9 @@ export class McuVisualPolicy {
                   frozenTarget: { x: probedSlot.cx, y: probedSlot.cy },
                   button,
                   shift,
+                  expectAfter,
+                  phase: "servo",
+                  retries: 0,
                 };
                 plan.servoSteps = 0;
                 state.closedLoopHistory.unshift(`${probed.action} slot=${probed.slot}${probedSlot.name ? `(${probedSlot.name})` : ""}`);
@@ -761,53 +766,135 @@ export class McuVisualPolicy {
           }
         }
 
-        // Servo step toward the pending click target. Resolve the target
-        // by SEMANTIC NAME first (stable across frames), then role, then
-        // raster index, then frozen pixel position. This protects against
-        // raster-index reshuffling when a frame's slot detection misses
-        // some item-filled slots.
+        // Click state machine: servo -> fired -> moveAway -> verify ->
+        // (success: clear & next probe | fail: retry up to MAX_RETRIES).
         if (plan.pendingClick !== null && !plan.done) {
           const pc = plan.pendingClick;
-          let target: { x: number; y: number } | null = null;
-          if (pc.slotName) {
-            const found = layout.slots.find((s) => s.name === pc.slotName);
-            if (found) target = { x: found.cx, y: found.cy };
-          }
-          if (!target && pc.slotRole) {
-            const found = layout.slots.find((s) => s.role === pc.slotRole);
-            if (found) target = { x: found.cx, y: found.cy };
-          }
-          if (!target && layout.slots[pc.rasterIndex]) {
-            target = { x: layout.slots[pc.rasterIndex].cx, y: layout.slots[pc.rasterIndex].cy };
-          }
-          if (!target) target = pc.frozenTarget;
+          // Resolve current target slot pixel by semantic name (stable
+          // across frames even when raster indices shift).
+          const resolveSlot = (): { cx: number; cy: number } => {
+            if (pc.slotName) {
+              const f = layout.slots.find((s) => s.name === pc.slotName);
+              if (f) return { cx: f.cx, cy: f.cy };
+            }
+            if (pc.slotRole) {
+              const f = layout.slots.find((s) => s.role === pc.slotRole);
+              if (f) return { cx: f.cx, cy: f.cy };
+            }
+            const f = layout.slots[pc.rasterIndex];
+            if (f) return { cx: f.cx, cy: f.cy };
+            return { cx: pc.frozenTarget.x, cy: pc.frozenTarget.y };
+          };
+          const slotCenter = resolveSlot();
 
-          const stepResult = servoCursorStep({
-            cursor,
-            target,
-            button: pc.button,
-            shift: pc.shift,
-            hitThresholdPx: 5,
-          });
-          plan.servoSteps += 1;
+          // Safe spot to move cursor to for verification: somewhere
+          // inside the inventory window away from the just-clicked slot.
+          // Use a corner of the window opposite to the slot.
+          const safeSpot = {
+            x: slotCenter.cx > layout.windowX + layout.windowW / 2
+              ? layout.windowX + 8
+              : layout.windowX + layout.windowW - 8,
+            y: layout.windowY + layout.windowH - 8,
+          };
+
           const SERVO_STEP_CAP = 10;
-          if (plan.servoSteps > SERVO_STEP_CAP) {
-            console.warn(`[agentbeats] closed-loop: servo cap hit on ${pc.slotName ?? `slot[${pc.rasterIndex}]`}; clicking anyway`);
-            const action = defaultMcuAction();
-            action[pc.button] = 1;
-            if (pc.shift) action.sneak = 1;
-            plan.pendingClick = null;
-            return { ...ACTION_PAYLOAD_PREFIX, action, hold_steps: 1 };
+          const MAX_RETRIES = 2;
+          const HIT_THRESHOLD_PX = 5;
+
+          // === Phase: servo === move cursor to slot, then click
+          if (pc.phase === "servo") {
+            const stepResult = servoCursorStep({
+              cursor,
+              target: { x: slotCenter.cx, y: slotCenter.cy },
+              button: pc.button,
+              shift: pc.shift,
+              hitThresholdPx: HIT_THRESHOLD_PX,
+            });
+            plan.servoSteps += 1;
+            const shouldClickNow = plan.servoSteps > SERVO_STEP_CAP || (stepResult && stepResult.click);
+            if (shouldClickNow) {
+              // Capture pre-click patch BEFORE emitting the click action
+              pc.prePatch = samplePatchFingerprint(payload.obs, slotCenter.cx, slotCenter.cy) ?? undefined;
+              const action = defaultMcuAction();
+              action[pc.button] = 1;
+              if (pc.shift) action.sneak = 1;
+              pc.phase = "fired";
+              plan.servoSteps = 0;
+              console.log(`[agentbeats] click ${pc.slotName ?? pc.rasterIndex} (${pc.button}${pc.shift ? "+sneak" : ""}) prePatch.stddev=${pc.prePatch?.stddev.toFixed(1) ?? "?"}`);
+              return { ...ACTION_PAYLOAD_PREFIX, action, hold_steps: 1 };
+            }
+            if (stepResult) {
+              console.log(
+                `[agentbeats] servo step=${step} cursor=(${cursor?.x},${cursor?.y}) target=(${slotCenter.cx},${slotCenter.cy}) name=${pc.slotName ?? "?"} ${stepResult.reason}`,
+              );
+              return { ...ACTION_PAYLOAD_PREFIX, action: stepResult.action, hold_steps: 1 };
+            }
+            console.log(`[agentbeats] servo step=${step}: no cursor detected; noop`);
+            return { ...ACTION_PAYLOAD_PREFIX, action: defaultMcuAction(), hold_steps: 1 };
           }
-          if (stepResult) {
+
+          // === Phase: fired === one settle frame to let the click apply
+          if (pc.phase === "fired") {
+            pc.phase = "moveAway";
+            plan.servoSteps = 0;
+            console.log(`[agentbeats] click settled; moving cursor away from ${pc.slotName ?? pc.rasterIndex} for verify`);
+            return { ...ACTION_PAYLOAD_PREFIX, action: defaultMcuAction(), hold_steps: 1 };
+          }
+
+          // === Phase: moveAway === servo cursor to safe spot
+          if (pc.phase === "moveAway") {
+            const stepResult = servoCursorStep({
+              cursor,
+              target: safeSpot,
+              button: "attack", // unused — moveAway never hits hitThreshold logic since we never click
+              hitThresholdPx: HIT_THRESHOLD_PX,
+            });
+            plan.servoSteps += 1;
+            const distFromSafe = cursor ? Math.hypot(cursor.x - safeSpot.x, cursor.y - safeSpot.y) : 999;
+            const arrived = distFromSafe < 12 || plan.servoSteps > SERVO_STEP_CAP;
+            if (arrived) {
+              pc.phase = "verify";
+              console.log(`[agentbeats] cursor at safe spot (${cursor?.x},${cursor?.y}); next frame will verify`);
+              return { ...ACTION_PAYLOAD_PREFIX, action: defaultMcuAction(), hold_steps: 1 };
+            }
+            if (stepResult && !stepResult.click) {
+              return { ...ACTION_PAYLOAD_PREFIX, action: stepResult.action, hold_steps: 1 };
+            }
+            return { ...ACTION_PAYLOAD_PREFIX, action: defaultMcuAction(), hold_steps: 1 };
+          }
+
+          // === Phase: verify === sample target slot patch, decide
+          if (pc.phase === "verify") {
+            const post = samplePatchFingerprint(payload.obs, slotCenter.cx, slotCenter.cy);
+            if (!post) {
+              console.warn(`[agentbeats] verify: could not sample patch; assuming success`);
+              plan.pendingClick = null;
+              return { ...ACTION_PAYLOAD_PREFIX, action: defaultMcuAction(), hold_steps: 1 };
+            }
+            // Empty slot: low stddev (uniform grey ~10-20).
+            // Filled slot: high stddev (item icon ~40+).
+            const isEmpty = post.stddev < 25;
+            const isFilled = post.stddev > 35;
+            const matched = pc.expectAfter === "should_empty" ? isEmpty : isFilled;
             console.log(
-              `[agentbeats] servo step=${step} cursor=(${cursor?.x},${cursor?.y}) target=(${target.x},${target.y}) name=${pc.slotName ?? "?"} ${stepResult.reason}`,
+              `[agentbeats] verify ${pc.slotName ?? pc.rasterIndex}: post.stddev=${post.stddev.toFixed(1)} expect=${pc.expectAfter} -> ${matched ? "OK" : "MISMATCH"} (retry ${pc.retries}/${MAX_RETRIES})`,
             );
-            if (stepResult.click) plan.pendingClick = null;
-            return { ...ACTION_PAYLOAD_PREFIX, action: stepResult.action, hold_steps: 1 };
+            if (matched) {
+              plan.pendingClick = null;
+              return { ...ACTION_PAYLOAD_PREFIX, action: defaultMcuAction(), hold_steps: 1 };
+            }
+            if (pc.retries >= MAX_RETRIES) {
+              console.warn(`[agentbeats] verify failed and retries exhausted on ${pc.slotName ?? pc.rasterIndex}; advancing anyway`);
+              plan.pendingClick = null;
+              return { ...ACTION_PAYLOAD_PREFIX, action: defaultMcuAction(), hold_steps: 1 };
+            }
+            // Retry: re-arm servo phase
+            pc.retries += 1;
+            pc.phase = "servo";
+            plan.servoSteps = 0;
+            console.log(`[agentbeats] RETRY click on ${pc.slotName ?? pc.rasterIndex} (attempt ${pc.retries + 1})`);
+            return { ...ACTION_PAYLOAD_PREFIX, action: defaultMcuAction(), hold_steps: 1 };
           }
-          console.log(`[agentbeats] servo step=${step}: no cursor detected; noop`);
-          return { ...ACTION_PAYLOAD_PREFIX, action: defaultMcuAction(), hold_steps: 1 };
         }
       }
     }

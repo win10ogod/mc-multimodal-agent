@@ -403,6 +403,48 @@ export function detectCursor(jpegBase64: string, layout: GuiLayout): { x: number
   return best ? { x: Math.round(best.cx), y: Math.round(best.cy) } : null;
 }
 
+/** Sample a small RGB patch around a pixel and return mean+stddev as a
+ *  fingerprint. Used by the closed-loop click verifier to compare a
+ *  slot's appearance before vs after a click (filled vs empty). */
+export function samplePatchFingerprint(
+  jpegBase64: string,
+  cx: number,
+  cy: number,
+  size = 12,
+): { meanR: number; meanG: number; meanB: number; stddev: number } | null {
+  const cleaned = jpegBase64.startsWith("data:image/")
+    ? jpegBase64.replace(/^data:image\/[a-z]+;base64,/, "")
+    : jpegBase64;
+  let decoded;
+  try {
+    decoded = jpeg.decode(Buffer.from(cleaned, "base64"), { useTArray: true, formatAsRGBA: true });
+  } catch {
+    return null;
+  }
+  const { width: w, height: h, data } = decoded;
+  const half = Math.floor(size / 2);
+  let n = 0, sumR = 0, sumG = 0, sumB = 0;
+  const pixels: Array<[number, number, number]> = [];
+  for (let dy = -half; dy < half; dy += 1) {
+    for (let dx = -half; dx < half; dx += 1) {
+      const x = cx + dx, y = cy + dy;
+      if (x < 0 || y < 0 || x >= w || y >= h) continue;
+      const i = (y * w + x) * 4;
+      pixels.push([data[i], data[i + 1], data[i + 2]]);
+      sumR += data[i]; sumG += data[i + 1]; sumB += data[i + 2];
+      n += 1;
+    }
+  }
+  if (n === 0) return null;
+  const meanR = sumR / n, meanG = sumG / n, meanB = sumB / n;
+  let varSum = 0;
+  for (const [r, g, b] of pixels) {
+    const dr = r - meanR, dg = g - meanG, db = b - meanB;
+    varSum += dr * dr + dg * dg + db * db;
+  }
+  return { meanR, meanG, meanB, stddev: Math.sqrt(varSum / n) };
+}
+
 /** Debug variant: return ALL plausible cursor components (useful for
  *  triaging false positives during calibration). */
 export function detectCursorCandidates(

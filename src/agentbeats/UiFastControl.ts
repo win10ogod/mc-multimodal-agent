@@ -429,11 +429,21 @@ export type ClosedLoopCraftPlan = {
     slotRole?: string;
     frozenTarget: { x: number; y: number };
     button: "attack" | "use";
-    /** When true, sneak+attack (shift+click) — used for `take` from a
-     *  result slot when the cursor still holds the source ingredient. */
     shift?: boolean;
-    expectAfter?: "should_empty" | "should_fill";
+    /** Verification post-click. */
+    expectAfter: "should_empty" | "should_fill";
+    /** State machine phase for this click:
+     *   "servo"      — moving cursor toward target slot
+     *   "fired"      — click was just emitted, waiting one frame to settle
+     *   "moveAway"   — moving cursor off the slot to a safe spot
+     *   "verify"     — at safe spot; sample patch and decide
+     *   (cleared on success/abort) */
+    phase: "servo" | "fired" | "moveAway" | "verify";
+    /** Pre-click patch fingerprint of the target slot, sampled at the
+     *  moment the click fires. Used to determine "did anything change". */
     prePatch?: { meanR: number; meanG: number; meanB: number; stddev: number };
+    /** How many times this click has been retried after verification failure. */
+    retries: number;
   } | null;
   /** Awaiting click verification: when set, the click was JUST emitted on
    *  the previous frame and we're checking whether the slot state changed
