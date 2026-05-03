@@ -518,11 +518,86 @@ function annotateWithLayout(
   return out;
 }
 
+/** Infer the regular grid pattern from discovered slots and fill in any
+ *  positions that look like slots but the CV step missed (commonly because
+ *  an item icon darkens the slot interior past our threshold).
+ *
+ *  Strategy:
+ *  - Cluster cy values into row bands using the slot pixel stride.
+ *  - For each row, cluster cx into columns and infer the column spacing.
+ *  - For each (row, col) inside the window bounding box, if no slot is
+ *    already present there, add a synthetic one at the predicted center.
+ *
+ *  This guarantees we never miss a slot just because it had an item in it,
+ *  even for unknown/modded GUIs we have no LogicalLayout for. */
+function fillGridGaps(disc: DiscoveredLayout): DiscoveredSlot[] {
+  if (disc.slots.length < 3) return disc.slots;
+  const stride = Math.max(8, Math.round(disc.slotPx * 1.1));
+  const rowTol = Math.max(3, Math.round(stride * 0.4));
+  const colTol = Math.max(3, Math.round(stride * 0.4));
+
+  // Cluster by row Y.
+  const rows: Array<{ cy: number; members: DiscoveredSlot[] }> = [];
+  const sortedByY = [...disc.slots].sort((a, b) => a.cy - b.cy);
+  for (const s of sortedByY) {
+    const last = rows[rows.length - 1];
+    if (last && Math.abs(s.cy - last.cy) <= rowTol) {
+      last.members.push(s);
+      last.cy = (last.cy * (last.members.length - 1) + s.cy) / last.members.length;
+    } else {
+      rows.push({ cy: s.cy, members: [s] });
+    }
+  }
+
+  const filled: DiscoveredSlot[] = [...disc.slots];
+  for (const row of rows) {
+    if (row.members.length < 2) continue;
+    const colsByX = [...row.members].sort((a, b) => a.cx - b.cx);
+    // Estimate column stride from neighbouring slots in this row.
+    const diffs: number[] = [];
+    for (let i = 1; i < colsByX.length; i += 1) {
+      const d = colsByX[i].cx - colsByX[i - 1].cx;
+      if (d > 4 && d < disc.windowW) diffs.push(d);
+    }
+    if (diffs.length === 0) continue;
+    diffs.sort((a, b) => a - b);
+    // Use the smallest non-trivial inter-slot distance as the col stride
+    // (gaps between slots are multiples of this stride).
+    const colStride = Math.round(diffs[0]);
+    if (colStride < 8) continue;
+
+    // Walk the row, fill any column gap whose center is inside the
+    // window bbox.
+    const minX = colsByX[0].cx;
+    const maxX = colsByX[colsByX.length - 1].cx;
+    for (let cx = minX; cx <= maxX; cx += colStride) {
+      const exists = filled.some(
+        (s) => Math.abs(s.cx - cx) <= colTol && Math.abs(s.cy - row.cy) <= rowTol,
+      );
+      if (exists) continue;
+      // Within window bounds?
+      if (cx < disc.windowX + 4 || cx > disc.windowX + disc.windowW - 4) continue;
+      filled.push({
+        index: 0,
+        cx: Math.round(cx),
+        cy: Math.round(row.cy),
+        x: Math.round(cx - disc.slotPx / 2),
+        y: Math.round(row.cy - disc.slotPx / 2),
+        w: disc.slotPx,
+        h: disc.slotPx,
+      });
+    }
+  }
+  return filled;
+}
+
 /** GENERAL DETECTION POLICY entry point.
  *  - Always runs CV slot discovery (works for any GUI).
  *  - Tries to promote raster indices to semantic names by matching
  *    aspect + slot-count + per-slot screen-distance against the known
  *    LogicalLayouts in InventoryLayouts.ts.
+ *  - For unknown GUIs (no layout match), runs grid-gap fill to catch
+ *    item-filled slots the CV missed.
  *  - Returns a GuiLayout that always has raster `index`+pixel center,
  *    plus optional `name`/`role` when the GUI was recognized.
  *  - Returns null when no inventory window is found (caller should fall
@@ -565,13 +640,22 @@ export function detectGuiLayout(
     }
   }
 
-  const slots: GuiSlot[] = bestSlots ?? disc.slots.map((s) => ({
-    index: s.index,
-    cx: s.cx,
-    cy: s.cy,
-    w: s.w,
-    h: s.h,
-  }));
+  let slots: GuiSlot[];
+  if (bestSlots) {
+    slots = bestSlots;
+  } else {
+    // Unknown GUI: still try to recover missing slots from the discovered
+    // grid pattern so item-filled slots aren't dropped.
+    const filled = fillGridGaps(disc);
+    const stride = Math.max(8, Math.round(disc.slotPx * 1.1));
+    filled.sort((a, b) => {
+      const ra = Math.round(a.cy / stride);
+      const rb = Math.round(b.cy / stride);
+      if (ra !== rb) return ra - rb;
+      return a.cx - b.cx;
+    });
+    slots = filled.map((s, i) => ({ index: i, cx: s.cx, cy: s.cy, w: s.w, h: s.h }));
+  }
 
   return {
     windowX: disc.windowX,
