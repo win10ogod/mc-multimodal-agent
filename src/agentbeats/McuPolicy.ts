@@ -16,6 +16,14 @@ import {
   type McuEnvAction,
   type McuPolicyDecision,
 } from "./McuPrompt";
+import {
+  buildClosedLoopActionFrames,
+  buildCraftOpenInventoryFrames,
+  planClosedLoopCraft,
+  type ClosedLoopCraftPlan,
+  type CraftMacroFrame,
+} from "./CraftMacro";
+import { probeNextCraftAction } from "./InventoryProbe";
 
 type McuInitPayload = {
   type: "init";
@@ -36,6 +44,11 @@ type McuContextState = {
   holdUntilStep: number;
   recentActions: McuEnvAction[];
   recentObservationImages: string[];
+  pendingMacroFrames: CraftMacroFrame[];
+  closedLoopCraft: ClosedLoopCraftPlan | null;
+  /** Short labels of the most recent closed-loop probe actions (newest first),
+   *  passed back to the VLM each iteration so it doesn't repeat itself. */
+  closedLoopHistory: string[];
 };
 
 const ACTION_PAYLOAD_PREFIX = {
@@ -352,8 +365,12 @@ export function taskSpecificGuidance(taskText: string): string {
       return "Task strategy: center reachable stone block faces and hold attack repeatedly until stone breaks.";
     case "crafting":
       return [
-        "Task strategy: ingredients are already in your starting inventory.",
-        "First press inventory (E) to open the GUI. Inside the inventory, place ingredients in the 2x2 craft grid for simple recipes, or right-click (use) the crafting table for 3x3 recipes. Always start by setting inventory to 1 on step 0 unless you are clearly already inside the GUI.",
+        "Task strategy: ingredients (and a crafting_table item if needed) are pre-given in inventory.",
+        "Open inventory ONCE with inventory=1 (single frame); after it is open, do NOT press inventory again until you are done — repeated inventory presses just toggle the GUI off and waste steps.",
+        "GUI cursor control: when the inventory is open, the cursor is moved by camera deltas. camera=[0,5] moves the cursor right by ~5 units, [0,-5] left, [5,0] down, [-5,0] up. Magnitudes 3-12 are typical. use=1 places ONE item in the slot under the cursor; attack=1 grabs/drops the whole stack under the cursor.",
+        "For 2x2 recipes (oak_planks, crafting_table): open inventory, then issue several camera deltas to move the cursor onto a 2x2 grid slot in the upper right, use=1 to place one ingredient, repeat for each required slot, finally move cursor to the result slot and attack=1 to take the output.",
+        "For 3x3 recipes (furnace, cake, enchanting_table, ladder, bell, diorite, clock, bee_nest, stonecut): you must FIRST place the crafting_table block in the world. Select the hotbar slot holding the crafting_table, tilt camera down so a clear ground tile is centered, use=1 to place it, then use=1 again on the placed block to open the 3x3 GUI before placing ingredients.",
+        "Loop avoidance: if you have issued the same single button (inventory, use, or attack) for more than ~10 consecutive frames with camera=[0,0] and nothing has changed visibly, switch strategy — emit camera deltas, walk forward, or close the GUI and re-approach.",
       ].join(" ");
     case "smelting":
       return [
@@ -542,6 +559,10 @@ export class McuVisualPolicy {
   private handleInit(contextId: string, payload: McuInitPayload): string {
     const taskText = payload.text?.trim() || "";
     const promptText = payload.prompt?.trim() || "";
+    const closedLoopCraft = planClosedLoopCraft(taskText);
+    const pendingMacroFrames: CraftMacroFrame[] = closedLoopCraft
+      ? buildCraftOpenInventoryFrames(closedLoopCraft.target)
+      : [];
     this.contexts.set(contextId, {
       taskText,
       promptText,
@@ -549,8 +570,13 @@ export class McuVisualPolicy {
       holdUntilStep: -1,
       recentActions: [],
       recentObservationImages: [],
+      pendingMacroFrames,
+      closedLoopCraft,
+      closedLoopHistory: [],
     });
-    console.log(`[agentbeats] init context=${contextId} task=${JSON.stringify(taskText)}`);
+    console.log(
+      `[agentbeats] init context=${contextId} task=${JSON.stringify(taskText)} closedLoop=${closedLoopCraft ? `${closedLoopCraft.target} ingredient=${closedLoopCraft.ingredient}` : "none"}`,
+    );
     return JSON.stringify({
       type: "ack",
       success: true,
@@ -600,13 +626,16 @@ export class McuVisualPolicy {
   }
 
   private async handleObservation(contextId: string, payload: McuObservationPayload): Promise<McuPolicyDecision> {
-    const state = this.contexts.get(contextId) ?? {
+    const state: McuContextState = this.contexts.get(contextId) ?? {
       taskText: "",
       promptText: "",
       lastAction: defaultMcuAction(),
       holdUntilStep: -1,
       recentActions: [],
       recentObservationImages: [],
+      pendingMacroFrames: [],
+      closedLoopCraft: null,
+      closedLoopHistory: [],
     };
     this.contexts.set(contextId, state);
 
@@ -614,6 +643,83 @@ export class McuVisualPolicy {
     if (payload.obs) {
       state.recentObservationImages.push(payload.obs);
       state.recentObservationImages = state.recentObservationImages.slice(-3);
+    }
+
+    const emitMacroFrame = (frame: CraftMacroFrame): McuPolicyDecision => {
+      const holdSteps = Math.max(
+        1,
+        Math.min(this.config.agentbeats.maxHoldSteps, frame.holdSteps),
+      );
+      state.lastAction = frame.action;
+      state.holdUntilStep = step + holdSteps - 1;
+      state.recentActions.push(frame.action);
+      state.recentActions = state.recentActions.slice(-16);
+      console.log(
+        `[agentbeats] macro step=${step} hold=${holdSteps} ${frame.label} action=${JSON.stringify({
+          pressed: MCU_BUTTON_KEYS.filter((key) => frame.action[key] === 1),
+          camera: frame.action.camera,
+        })}`,
+      );
+      return { ...ACTION_PAYLOAD_PREFIX, action: frame.action, hold_steps: holdSteps };
+    };
+
+    // Drain any queued macro frames first.
+    if (state.pendingMacroFrames.length > 0) {
+      const frame = state.pendingMacroFrames.shift()!;
+      return emitMacroFrame(frame);
+    }
+
+    // Closed-loop crafting: when no frames are queued and a closed-loop plan
+    // is active, take the current obs, ask the VLM what action to take next,
+    // then queue the cursor+click frames for that action. Repeats until the
+    // VLM says "done" or we hit the iteration cap.
+    const plan = state.closedLoopCraft;
+    if (plan && !plan.done && plan.iteration < plan.maxIterations && payload.obs) {
+      try {
+        const result = await probeNextCraftAction({
+          client: this.client,
+          model: this.config.openai.model,
+          obsBase64: payload.obs,
+          taskTarget: plan.target,
+          ingredient: plan.ingredient,
+          iteration: plan.iteration,
+          recentActions: state.closedLoopHistory,
+        });
+        plan.iteration += 1;
+        const probed = result.action;
+        const layout = result.layout;
+        if (!probed) {
+          console.log(`[agentbeats] closed-loop probe returned no action at iter=${plan.iteration}; deferring to LLM`);
+          plan.done = true;
+        } else if (probed.action === "done") {
+          console.log(`[agentbeats] closed-loop probe says done iter=${plan.iteration} reason=${probed.reason ?? ""}`);
+          plan.done = true;
+        } else {
+          const button: "attack" | "use" = probed.action === "place_one" ? "use" : "attack";
+          const built = buildClosedLoopActionFrames({
+            fromCursor: plan.cursor,
+            toSlot: probed.slot,
+            mouseButton: button,
+            label: `cl_${plan.iteration}_${probed.action}_s${probed.slot}`,
+            layout,
+          });
+          plan.cursor = built.newCursor;
+          state.pendingMacroFrames.push(...built.frames);
+          state.closedLoopHistory.unshift(`${probed.action} slot=${probed.slot}`);
+          state.closedLoopHistory = state.closedLoopHistory.slice(0, 5);
+          console.log(
+            `[agentbeats] closed-loop iter=${plan.iteration} ${probed.action} slot=${probed.slot} reason=${probed.reason ?? ""} layout=${layout ? `win(${layout.windowX},${layout.windowY},${layout.windowW}x${layout.windowH})` : "fallback"} -> ${built.frames.length} frames`,
+          );
+        }
+      } catch (error) {
+        console.warn(`[agentbeats] closed-loop probe failed: ${formatModelProviderError(error)} -- ending closed-loop`);
+        plan.done = true;
+      }
+      if (state.pendingMacroFrames.length > 0) {
+        const frame = state.pendingMacroFrames.shift()!;
+        return emitMacroFrame(frame);
+      }
+      // Nothing queued (probe was "done" or failed) -- fall through to LLM.
     }
 
     if (!this.config.openai.apiKey) {
