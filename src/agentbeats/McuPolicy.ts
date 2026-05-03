@@ -744,7 +744,11 @@ export class McuVisualPolicy {
 
         // If we have no current click target, ask the VLM for one.
         if (plan.pendingClick === null) {
-          const cursorHolding = detectCursorHolding(payload.obs, plan.cursor);
+          // CV cursor-holding detection is unreliable: the offset patch
+          // (cx+8, cy+8) routinely lands on a real inventory slot's
+          // item icon and reports false "holding". Pass null and let
+          // the VLM read held-item state visually from the SoM image.
+          const cursorHolding = null;
           try {
             const result = await probeNextCraftAction({
               client: this.client,
