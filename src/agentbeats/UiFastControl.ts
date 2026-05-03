@@ -43,13 +43,15 @@ export type ProbeRequest = {
 // and it regressed to 1.50 because cursor undershoots on short moves. K=4
 // (som7) scored 4.00 with very high criterion scores -- best so far. Until
 // we add CV cursor verification, stick with K=4.
-// Empirical from servo run som11: pitch=-8 moved cursor -39 px ->
-// K_pitch ~= 4.9 px/deg. Setting K_pitch=5 makes a 16-px error compute
-// to cam=3.2 -> quantized to 4 -> moves ~20 px (lands within hit
-// tolerance), preventing the oscillation seen in som11.
+// MC sim's cam->cursor response is HIGHLY non-linear: at large cmds (cam=10)
+// K_pitch ~= 6.7, K_yaw ~= 3.7; at small cmds (cam=2-4) K drops to ~2.0-2.75.
+// Tuning a single linear K is a compromise. som7/som11 ran K_yaw=8.5,
+// K_pitch=5.0 with deadzone=4 and converged stably at "stuck err ~5-8 px".
+// Earlier this session I tried K_yaw=3.5, K_pitch=6.5 hoping to fix the
+// stall but it didn't help (same floor) and regressed elsewhere. Reverting.
 const PX_PER_CAM_YAW = 8.5;
 const PX_PER_CAM_PITCH = 5.0;
-const PITCH_DEADZONE_MIN = 4;        // smallest pitch cmd that actually moves the cursor; lowered from 8 to allow convergence
+const PITCH_DEADZONE_MIN = 4;        // smallest pitch cmd that still produces visible cursor motion in the sim
 const CAM_BIN_DEG = 2;
 const MAX_CAM_DEG = 10;
 
@@ -444,6 +446,11 @@ export type ClosedLoopCraftPlan = {
     prePatch?: { meanR: number; meanG: number; meanB: number; stddev: number };
     /** How many times this click has been retried after verification failure. */
     retries: number;
+    /** Kind of click for logging + cleanup-loop guard.
+     *   "click"   — normal click derived from a VLM probe action
+     *   "cleanup" — auto-scheduled place_all to free the cursor after a
+     *               failed normal click; do NOT recurse into another cleanup. */
+    kind?: "click" | "cleanup";
   } | null;
   /** Awaiting click verification: when set, the click was JUST emitted on
    *  the previous frame and we're checking whether the slot state changed
@@ -462,6 +469,15 @@ export type ClosedLoopCraftPlan = {
   /** Slot from which the agent first picked up the ingredient stack. Used
    *  to instruct the VLM to return leftover items here after place_one. */
   pickupSourceSlot: { index: number; name?: string } | null;
+  /** Cursor reading from the previous obs frame, used to detect stale
+   *  cursor detections (the white-blob detector sometimes latches onto a
+   *  static GUI feature like a slot highlight or item icon). */
+  lastCursorRead: { x: number; y: number } | null;
+  /** Cam delta we emitted on the previous obs frame. If this was non-zero
+   *  and the new cursor reading is identical, the detector is stale. */
+  lastEmittedCam: [number, number];
+  /** How many consecutive frames the cursor reading has looked stale. */
+  staleCursorFrames: number;
 };
 
 /** Servo control law: given current cursor + target slot pixel center,
@@ -539,13 +555,19 @@ export function planClosedLoopCraft(taskText: string): ClosedLoopCraftPlan | nul
     cursor: CURSOR_OPEN_CENTER,
     iteration: 0,
     done: false,
-    maxIterations: 8,
+    // Bumped from 8 -> 16: retry/cleanup/SoM-reset cycles can chew
+    // through several probes per "real" action, and falling back to
+    // manual LLM cursor control runs at ~3% success.
+    maxIterations: 16,
     pendingClick: null,
     awaitingVerify: null,
     servoSteps: 0,
     layoutHint: null,
     sessionLayout: null,
     pickupSourceSlot: null,
+    lastCursorRead: null,
+    lastEmittedCam: [0, 0],
+    staleCursorFrames: 0,
   };
 }
 

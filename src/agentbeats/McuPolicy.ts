@@ -368,9 +368,9 @@ export function taskSpecificGuidance(taskText: string): string {
       return [
         "Task strategy: ingredients (and a crafting_table item if needed) are pre-given in inventory.",
         "Open inventory ONCE with inventory=1 (single frame); after it is open, do NOT press inventory again until you are done — repeated inventory presses just toggle the GUI off and waste steps.",
-        "GUI cursor control: when the inventory is open, the cursor is moved by camera deltas. camera=[0,5] moves the cursor right by ~5 units, [0,-5] left, [5,0] down, [-5,0] up. Magnitudes 3-12 are typical. use=1 places ONE item in the slot under the cursor; attack=1 grabs/drops the whole stack under the cursor.",
-        "For 2x2 recipes (oak_planks, crafting_table): open inventory, then issue several camera deltas to move the cursor onto a 2x2 grid slot in the upper right, use=1 to place one ingredient, repeat for each required slot, finally move cursor to the result slot and attack=1 to take the output.",
+        "IMPORTANT: a CV-driven UI helper takes over cursor control automatically when the inventory is open for handled 2x2 recipes (oak_planks, crafting_table). Manual VLM cursor control runs at ~3% success rate. If the inventory is open and the helper is operating, emit a NO-OP action (no buttons pressed, camera=[0,0]) so the helper can run uninterrupted; do NOT issue camera deltas yourself.",
         "For 3x3 recipes (furnace, cake, enchanting_table, ladder, bell, diorite, clock, bee_nest, stonecut): you must FIRST place the crafting_table block in the world. Select the hotbar slot holding the crafting_table, tilt camera down so a clear ground tile is centered, use=1 to place it, then use=1 again on the placed block to open the 3x3 GUI before placing ingredients.",
+        "Manual cursor control fallback (only for unhandled recipes): camera=[0,5] moves cursor right ~5, [0,-5] left, [5,0] down, [-5,0] up. use=1 places ONE item; attack=1 grabs/drops whole stack.",
         "Loop avoidance: if you have issued the same single button (inventory, use, or attack) for more than ~10 consecutive frames with camera=[0,0] and nothing has changed visibly, switch strategy — emit camera deltas, walk forward, or close the GUI and re-approach.",
       ].join(" ");
     case "smelting":
@@ -701,8 +701,46 @@ export class McuVisualPolicy {
       if (!layout) {
         // Already handled above (plan.done=true path)
       } else {
-        const cursor = detectCursor(payload.obs, layout);
+        const rawCursor = detectCursor(payload.obs, layout);
+        // Stale-detection guard: the white-blob detector can latch onto a
+        // static GUI feature (slot highlight, item icon) and report the
+        // SAME pixel forever despite the sim moving the cursor. If the
+        // last frame we emitted a non-zero camera delta and the new
+        // reading is within 2px of the previous reading, treat the
+        // detection as stale and pretend we don't see the cursor.
+        const camLast = plan.lastEmittedCam;
+        const camWasNonZero = Math.abs(camLast[0]) > 0 || Math.abs(camLast[1]) > 0;
+        const sameAsLast = !!(rawCursor && plan.lastCursorRead
+          && Math.abs(rawCursor.x - plan.lastCursorRead.x) <= 2
+          && Math.abs(rawCursor.y - plan.lastCursorRead.y) <= 2);
+        const isStale = camWasNonZero && sameAsLast;
+        if (isStale) {
+          plan.staleCursorFrames += 1;
+          console.warn(`[agentbeats] stale cursor reading (${rawCursor?.x},${rawCursor?.y}) after cam=[${camLast[0]},${camLast[1]}] (${plan.staleCursorFrames}/3)`);
+        } else {
+          plan.staleCursorFrames = 0;
+        }
+        const cursor = isStale ? null : rawCursor;
+        plan.lastCursorRead = rawCursor ?? plan.lastCursorRead;
         plan.cursor = cursor ?? plan.cursor;
+        // Persistent staleness -> the detector is hopeless this round.
+        // Abort the current pendingClick so the next probe replans rather
+        // than spamming clicks on a phantom cursor position.
+        if (plan.staleCursorFrames >= 3 && plan.pendingClick !== null) {
+          console.warn(`[agentbeats] cursor detection stale for 3 frames; aborting pendingClick (${plan.pendingClick.kind ?? "click"} slot=${plan.pendingClick.rasterIndex}); invalidating SoM session for fresh detection`);
+          state.closedLoopHistory.unshift(`abort slot=${plan.pendingClick.rasterIndex} (cursor detection stale; resetting SoM session)`);
+          state.closedLoopHistory = state.closedLoopHistory.slice(0, 5);
+          plan.pendingClick = null;
+          plan.staleCursorFrames = 0;
+          plan.lastEmittedCam = [0, 0];
+          plan.lastCursorRead = null;
+          // Invalidate the session-locked SoM layout so the next frame
+          // re-runs detection from scratch. Keeps the closed-loop in
+          // charge (manual LLM cursor control runs at ~3% success).
+          plan.sessionLayout = null;
+          plan.layoutHint = null;
+          return { ...ACTION_PAYLOAD_PREFIX, action: defaultMcuAction(), hold_steps: 1 };
+        }
 
         // If we have no current click target, ask the VLM for one.
         if (plan.pendingClick === null) {
@@ -723,10 +761,18 @@ export class McuVisualPolicy {
             plan.iteration += 1;
             const probed = result.action;
             if (!probed) {
-              console.log(`[agentbeats] closed-loop probe returned no action; deferring to LLM`);
-              plan.done = true;
+              // Probe failed to return an action — invalidate the SoM
+              // session so the next frame redetects (some slots may have
+              // been occluded the first time) and re-probes. Don't set
+              // done: manual LLM cursor control runs at ~3% success.
+              console.log(`[agentbeats] closed-loop probe returned no action; invalidating SoM session and reprobing next frame`);
+              plan.sessionLayout = null;
+              plan.layoutHint = null;
             } else if (probed.action === "done") {
               console.log(`[agentbeats] closed-loop probe says done reason=${probed.reason ?? ""}`);
+              plan.done = true;
+            } else if (probed.action === "fallback_manual") {
+              console.log(`[agentbeats] closed-loop probe says fallback_manual reason=${probed.reason ?? ""} -- handing control to manual LLM cursor`);
               plan.done = true;
             } else {
               // Click semantics in MC inventory:
@@ -771,6 +817,7 @@ export class McuVisualPolicy {
                   expectAfter,
                   phase: "servo",
                   retries: 0,
+                  kind: "click",
                 };
                 plan.servoSteps = 0;
                 state.closedLoopHistory.unshift(`${probed.action} slot=${probed.slot}${probedSlot.name ? `(${probedSlot.name})` : ""}`);
@@ -821,6 +868,13 @@ export class McuVisualPolicy {
           const MAX_RETRIES = 2;
           const HIT_THRESHOLD_PX = 5;
 
+          // Helper: emit a closed-loop action and remember the cam delta
+          // so the next frame's stale-cursor check has ground truth.
+          const emit = (action: McuEnvAction): McuPolicyDecision => {
+            plan.lastEmittedCam = [action.camera[0], action.camera[1]];
+            return { ...ACTION_PAYLOAD_PREFIX, action, hold_steps: 1 };
+          };
+
           // === Phase: servo === move cursor to slot, then click
           if (pc.phase === "servo") {
             const stepResult = servoCursorStep({
@@ -833,7 +887,6 @@ export class McuVisualPolicy {
             plan.servoSteps += 1;
             const shouldClickNow = plan.servoSteps > SERVO_STEP_CAP || (stepResult && stepResult.click);
             if (shouldClickNow) {
-              // Capture pre-click patch BEFORE emitting the click action
               pc.prePatch = samplePatchFingerprint(payload.obs, slotCenter.cx, slotCenter.cy) ?? undefined;
               const action = defaultMcuAction();
               action[pc.button] = 1;
@@ -841,16 +894,16 @@ export class McuVisualPolicy {
               pc.phase = "fired";
               plan.servoSteps = 0;
               console.log(`[agentbeats] click ${pc.slotName ?? pc.rasterIndex} (${pc.button}${pc.shift ? "+sneak" : ""}) prePatch.stddev=${pc.prePatch?.stddev.toFixed(1) ?? "?"}`);
-              return { ...ACTION_PAYLOAD_PREFIX, action, hold_steps: 1 };
+              return emit(action);
             }
             if (stepResult) {
               console.log(
                 `[agentbeats] servo step=${step} cursor=(${cursor?.x},${cursor?.y}) target=(${slotCenter.cx},${slotCenter.cy}) name=${pc.slotName ?? "?"} ${stepResult.reason}`,
               );
-              return { ...ACTION_PAYLOAD_PREFIX, action: stepResult.action, hold_steps: 1 };
+              return emit(stepResult.action);
             }
             console.log(`[agentbeats] servo step=${step}: no cursor detected; noop`);
-            return { ...ACTION_PAYLOAD_PREFIX, action: defaultMcuAction(), hold_steps: 1 };
+            return emit(defaultMcuAction());
           }
 
           // === Phase: fired === one settle frame to let the click apply
@@ -858,7 +911,7 @@ export class McuVisualPolicy {
             pc.phase = "moveAway";
             plan.servoSteps = 0;
             console.log(`[agentbeats] click settled; moving cursor away from ${pc.slotName ?? pc.rasterIndex} for verify`);
-            return { ...ACTION_PAYLOAD_PREFIX, action: defaultMcuAction(), hold_steps: 1 };
+            return emit(defaultMcuAction());
           }
 
           // === Phase: moveAway === servo cursor to safe spot
@@ -866,7 +919,7 @@ export class McuVisualPolicy {
             const stepResult = servoCursorStep({
               cursor,
               target: safeSpot,
-              button: "attack", // unused — moveAway never hits hitThreshold logic since we never click
+              button: "attack",
               hitThresholdPx: HIT_THRESHOLD_PX,
             });
             plan.servoSteps += 1;
@@ -875,12 +928,12 @@ export class McuVisualPolicy {
             if (arrived) {
               pc.phase = "verify";
               console.log(`[agentbeats] cursor at safe spot (${cursor?.x},${cursor?.y}); next frame will verify`);
-              return { ...ACTION_PAYLOAD_PREFIX, action: defaultMcuAction(), hold_steps: 1 };
+              return emit(defaultMcuAction());
             }
             if (stepResult && !stepResult.click) {
-              return { ...ACTION_PAYLOAD_PREFIX, action: stepResult.action, hold_steps: 1 };
+              return emit(stepResult.action);
             }
-            return { ...ACTION_PAYLOAD_PREFIX, action: defaultMcuAction(), hold_steps: 1 };
+            return emit(defaultMcuAction());
           }
 
           // === Phase: verify === sample target slot patch, decide
@@ -891,8 +944,6 @@ export class McuVisualPolicy {
               plan.pendingClick = null;
               return { ...ACTION_PAYLOAD_PREFIX, action: defaultMcuAction(), hold_steps: 1 };
             }
-            // Empty slot: low stddev (uniform grey ~10-20).
-            // Filled slot: high stddev (item icon ~40+).
             const isEmpty = post.stddev < 25;
             const isFilled = post.stddev > 35;
             const matched = pc.expectAfter === "should_empty" ? isEmpty : isFilled;
@@ -900,21 +951,69 @@ export class McuVisualPolicy {
               `[agentbeats] verify ${pc.slotName ?? pc.rasterIndex}: post.stddev=${post.stddev.toFixed(1)} expect=${pc.expectAfter} -> ${matched ? "OK" : "MISMATCH"} (retry ${pc.retries}/${MAX_RETRIES})`,
             );
             if (matched) {
+              state.closedLoopHistory.unshift(`${pc.kind ?? "click"} slot=${pc.rasterIndex}${pc.slotName ? `(${pc.slotName})` : ""} OK`);
+              state.closedLoopHistory = state.closedLoopHistory.slice(0, 5);
               plan.pendingClick = null;
               return { ...ACTION_PAYLOAD_PREFIX, action: defaultMcuAction(), hold_steps: 1 };
             }
-            if (pc.retries >= MAX_RETRIES) {
-              console.warn(`[agentbeats] verify failed and retries exhausted on ${pc.slotName ?? pc.rasterIndex}; advancing anyway`);
-              plan.pendingClick = null;
+            // Mismatch path
+            if (pc.retries < MAX_RETRIES) {
+              pc.retries += 1;
+              pc.phase = "servo";
+              plan.servoSteps = 0;
+              console.log(`[agentbeats] RETRY click on ${pc.slotName ?? pc.rasterIndex} (attempt ${pc.retries + 1}/${MAX_RETRIES + 1})`);
               return { ...ACTION_PAYLOAD_PREFIX, action: defaultMcuAction(), hold_steps: 1 };
             }
-            // Retry: re-arm servo phase
-            pc.retries += 1;
-            pc.phase = "servo";
-            plan.servoSteps = 0;
-            console.log(`[agentbeats] RETRY click on ${pc.slotName ?? pc.rasterIndex} (attempt ${pc.retries + 1})`);
+            // Retries exhausted. If we were already running a cleanup
+            // click, give up entirely and surface to the LLM. Otherwise
+            // schedule a cleanup: place_all back to the original pickup
+            // source slot (or the first empty main_inv if no source) so
+            // the cursor is empty before the next LLM probe.
+            const failureLabel = `${pc.kind ?? "click"} slot=${pc.rasterIndex}${pc.slotName ? `(${pc.slotName})` : ""} FAILED post.stddev=${post.stddev.toFixed(0)}`;
+            state.closedLoopHistory.unshift(failureLabel);
+            state.closedLoopHistory = state.closedLoopHistory.slice(0, 5);
+            console.warn(`[agentbeats] ${failureLabel}; retries exhausted`);
+            const cursorHoldingNow = detectCursorHolding(payload.obs, plan.cursor);
+            if (pc.kind !== "cleanup" && cursorHoldingNow === true) {
+              // Pick a target for the cleanup click: prefer the original
+              // pickup source slot (returns leftover ingredient there), else
+              // the first empty main_inv slot.
+              let cleanupTarget: typeof layout.slots[number] | null = null;
+              if (plan.pickupSourceSlot && plan.pickupSourceSlot.name) {
+                cleanupTarget = layout.slots.find((s) => s.name === plan.pickupSourceSlot!.name) ?? null;
+              }
+              if (!cleanupTarget) {
+                for (const s of layout.slots) {
+                  if (s.role !== "main_inv") continue;
+                  const patch = samplePatchFingerprint(payload.obs, s.cx, s.cy);
+                  if (patch && patch.stddev < 25) { cleanupTarget = s; break; }
+                }
+              }
+              if (cleanupTarget) {
+                console.log(`[agentbeats] CLEANUP: place_all into ${cleanupTarget.name ?? cleanupTarget.index} before reprobing`);
+                plan.pendingClick = {
+                  rasterIndex: cleanupTarget.index,
+                  slotName: cleanupTarget.name,
+                  slotRole: cleanupTarget.role,
+                  frozenTarget: { x: cleanupTarget.cx, y: cleanupTarget.cy },
+                  button: "attack",
+                  shift: false,
+                  expectAfter: "should_fill",
+                  phase: "servo",
+                  retries: 0,
+                  kind: "cleanup",
+                };
+                plan.servoSteps = 0;
+                return { ...ACTION_PAYLOAD_PREFIX, action: defaultMcuAction(), hold_steps: 1 };
+              }
+              console.warn(`[agentbeats] CLEANUP: no viable target; surfacing to LLM`);
+            }
+            // Either cursor empty already, or cleanup itself failed, or no
+            // target — clear and let the next probe replan from scratch.
+            plan.pendingClick = null;
             return { ...ACTION_PAYLOAD_PREFIX, action: defaultMcuAction(), hold_steps: 1 };
           }
+
         }
       }
     }

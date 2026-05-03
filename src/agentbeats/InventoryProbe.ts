@@ -144,7 +144,8 @@ export type CraftAction =
   | { action: "place_one"; slot: number; reason?: string }    // use-click slot to drop ONE item from cursor
   | { action: "place_all"; slot: number; reason?: string }    // attack-click slot to deposit whole held stack
   | { action: "take"; slot: number; reason?: string }         // attack-click result slot
-  | { action: "done"; reason?: string };
+  | { action: "done"; reason?: string }
+  | { action: "fallback_manual"; reason?: string };           // SoM does not mark the target the VLM needs; let LLM drive cursor manually
 
 export type CraftProbeResult = {
   action: CraftAction | null;
@@ -229,6 +230,7 @@ export async function probeNextCraftAction(opts: {
     `  {"action": "place_all", "slot": N, "reason": "..."}  -- left-click slot N to drop whole held stack (use for cleanup)`,
     `  {"action": "take",      "slot": N, "reason": "..."}  -- left-click result slot to grab crafted output. REQUIRES cursor empty.`,
     `  {"action": "done",                  "reason": "..."} -- task complete; ${opts.taskTarget} is in inventory and cursor is empty`,
+    `  {"action": "fallback_manual",       "reason": "..."} -- SoM marks do NOT cover the slot you need (UI too complex for our detector); hand control back to the manual LLM controller`,
     "",
     `IMPORTANT (MCU sim quirks):`,
     `  - Shift+click DOES NOT WORK. "take" is a plain left-click.`,
@@ -286,6 +288,7 @@ export async function probeNextCraftAction(opts: {
   const slot = typeof parsed.slot === "number" ? parsed.slot : Number(parsed.slot);
   const reason = typeof parsed.reason === "string" ? parsed.reason : undefined;
   if (action === "done") return { action: { action: "done", reason }, layout: detectedLayout };
+  if (action === "fallback_manual") return { action: { action: "fallback_manual", reason }, layout: detectedLayout };
   if (!Number.isFinite(slot) || slot < 0 || slot > 40) {
     return { action: null, layout: detectedLayout };
   }
