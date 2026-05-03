@@ -17,7 +17,7 @@
  */
 import minecraftData from "minecraft-data";
 import { defaultMcuAction, type McuEnvAction } from "./McuPrompt";
-import { detectedSlotPixel, type DetectedLayout } from "./SlotDetector";
+import type { GuiLayout } from "./SlotDetector";
 
 export type UiFastControlFrame = {
   action: McuEnvAction;
@@ -39,13 +39,12 @@ export type ProbeRequest = {
 
 // --- Calibration constants (640x360 obs, MC GUI scale auto) ---------------
 
-// Empirical K is non-linear with magnitude in GUI mode. Measured from som7
-// frames: K_pitch at large magnitudes (cmd=-30 deg over 3 frames) was ~6
-// px/deg (cursor moved -180 px when target was -120). Bumping K_pitch from
-// 4 -> 6 keeps full-stroke moves on target; small moves still rely on the
-// deadzone boost to clear the GUI's pitch dead band.
+// Empirical K is non-linear with magnitude in GUI mode. Tested K=6 (som8)
+// and it regressed to 1.50 because cursor undershoots on short moves. K=4
+// (som7) scored 4.00 with very high criterion scores -- best so far. Until
+// we add CV cursor verification, stick with K=4.
 const PX_PER_CAM_YAW = 8.5;
-const PX_PER_CAM_PITCH = 6.0;
+const PX_PER_CAM_PITCH = 4.0;
 const PITCH_DEADZONE_MIN = 8;
 const CAM_BIN_DEG = 2;
 const MAX_CAM_DEG = 10;
@@ -94,12 +93,16 @@ function mainInventorySlot(idx: number): { x: number; y: number } {
   return { x: SLOT.mainInvX0 + col * SLOT.mainInvDx, y: SLOT.mainInvRows[row] };
 }
 
-/** Resolve a probe slot index (0..40) to a screen pixel center.
- *  When a CV-detected `layout` is supplied, slot positions come from that
- *  per-frame detection (preferred); otherwise the static fallback table
- *  is used. */
-export function slotIndexToPixel(slotIndex: number, layout?: DetectedLayout | null): { x: number; y: number } | null {
-  if (layout) return detectedSlotPixel(layout, slotIndex);
+/** Resolve a slot index to its on-screen pixel center.
+ *  When a `GuiLayout` from the unified detector is supplied, indices are
+ *  the raster order from that detection (0..N-1) — this is the canonical
+ *  path. Without a layout we fall back to the static 0..40 mapping for
+ *  the common player-inventory GUI (legacy / smoke-test usage). */
+export function slotIndexToPixel(slotIndex: number, layout?: GuiLayout | null): { x: number; y: number } | null {
+  if (layout) {
+    const s = layout.slots[slotIndex];
+    return s ? { x: s.cx, y: s.cy } : null;
+  }
   if (slotIndex >= 0 && slotIndex <= 8) return hotbarSlot(slotIndex);
   if (slotIndex >= 9 && slotIndex <= 35) return mainInventorySlot(slotIndex - 9);
   if (slotIndex >= 36 && slotIndex <= 39) return SLOT.craft2x2[slotIndex - 36];
@@ -360,7 +363,7 @@ export function buildClosedLoopActionFrames(opts: {
   toSlot: number;
   mouseButton: "attack" | "use";
   label: string;
-  layout?: DetectedLayout | null;
+  layout?: GuiLayout | null;
 }): { frames: UiFastControlFrame[]; newCursor: { x: number; y: number } } {
   const target = slotIndexToPixel(opts.toSlot, opts.layout ?? null);
   if (!target) return { frames: [], newCursor: opts.fromCursor };

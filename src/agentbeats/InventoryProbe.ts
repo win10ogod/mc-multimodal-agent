@@ -12,7 +12,7 @@
  */
 import type OpenAI from "openai";
 import { markInventoryFrame } from "./SlotMarker";
-import type { DetectedLayout } from "./SlotDetector";
+import type { GuiLayout } from "./SlotDetector";
 
 // Hotbar slot pixel centers when the inventory GUI is open at 640x360 obs.
 // Mirrors the SLOT.hotbarX0/Dx/Y constants in UiFastControl.
@@ -20,7 +20,7 @@ const HOTBAR_X0 = 215;
 const HOTBAR_DX = 18;
 const HOTBAR_Y = 218;
 
-function buildSlotDescription(): string {
+function buildHotbarOnlyDescription(): string {
   const lines = ["The bottom row inside the inventory window is the HOTBAR with 9 slots numbered 0-8 from LEFT to RIGHT."];
   lines.push("Approximate pixel centers of each hotbar slot in this 640x360 image:");
   for (let i = 0; i < 9; i += 1) {
@@ -41,7 +41,7 @@ export async function probeHotbar(opts: {
 
   const promptText = [
     "You are looking at an open Minecraft inventory GUI (image is 640x360 px).",
-    buildSlotDescription(),
+    buildHotbarOnlyDescription(),
     "",
     `For EACH of these candidate items, tell me which hotbar slot index (0..8) currently contains it, or "none" if absent: ${opts.candidates.join(", ")}`,
     "",
@@ -103,25 +103,41 @@ export async function probeHotbar(opts: {
   return out;
 }
 
-// --- Closed-loop crafting actions ---------------------------------------
+// --- Closed-loop GUI actions --------------------------------------------
 
-/** Slot index conventions used by the closed-loop probe.
- *  0..8   hotbar (left -> right)
- *  9..17  main inventory row 1 (top row, just above hotbar)
- *  18..26 main inventory row 2
- *  27..35 main inventory row 3
- *  36..39 craft 2x2 grid: TL, TR, BL, BR
- *  40     craft 2x2 result slot
- */
-const SLOT_DESCRIPTION = [
-  "Inventory slot indices (in the open inventory GUI):",
-  "  0..8   = hotbar row at bottom (slot 0 leftmost)",
-  "  9..17  = main inventory row 1 (just above hotbar)",
-  "  18..26 = main inventory row 2",
-  "  27..35 = main inventory row 3 (top row)",
-  "  36..39 = 2x2 crafting grid: 36=top-left, 37=top-right, 38=bottom-left, 39=bottom-right",
-  "  40     = 2x2 crafting RESULT slot (right of the grid arrow; planks appear here)",
-].join("\n");
+/** Build a per-frame slot description from the detected GuiLayout, listing
+ *  each visible slot's raster index and (when known) its semantic role.
+ *  This replaces the previous hard-coded "0..8 = hotbar" mapping which
+ *  only worked for one specific GUI numbering scheme. */
+function buildSlotDescription(layout: GuiLayout): string {
+  const lines: string[] = [
+    `${layout.slots.length} slots are marked on the image with yellow numbered badges (raster order).`,
+  ];
+  if (layout.matchedLayoutId) {
+    lines.push(`Detected GUI: ${layout.matchedLayoutId}.`);
+  } else {
+    lines.push(`Detected GUI: unknown — slots numbered in raster order.`);
+  }
+  // Group slots by role for compact listing.
+  const byRole = new Map<string, number[]>();
+  const anonymous: number[] = [];
+  for (const s of layout.slots) {
+    if (s.role) {
+      const list = byRole.get(s.role) ?? [];
+      list.push(s.index);
+      byRole.set(s.role, list);
+    } else {
+      anonymous.push(s.index);
+    }
+  }
+  for (const [role, idxs] of byRole) {
+    lines.push(`  role=${role}: indices ${idxs.join(", ")}`);
+  }
+  if (anonymous.length > 0) {
+    lines.push(`  unrecognized slots: indices ${anonymous.join(", ")}`);
+  }
+  return lines.join("\n");
+}
 
 export type CraftAction =
   | { action: "pickup"; slot: number; reason?: string }       // attack-click slot to grab whole stack
@@ -135,7 +151,7 @@ export type CraftProbeResult = {
   /** The CV-detected slot layout from this probe's frame. McuPolicy passes
    *  it back to the cursor compiler so the click lands at the SAME pixel
    *  position the VLM saw labeled, not a stale hardcoded one. */
-  layout: DetectedLayout | null;
+  layout: GuiLayout | null;
 };
 
 export async function probeNextCraftAction(opts: {
@@ -154,7 +170,7 @@ export async function probeNextCraftAction(opts: {
   // mentally projecting from a text description.
   let imgBase64: string;
   let imgMime: "image/png" | "image/jpeg";
-  let detectedLayout: DetectedLayout | null = null;
+  let detectedLayout: GuiLayout | null = null;
   try {
     const marked = markInventoryFrame(opts.obsBase64);
     imgBase64 = marked.pngBase64;
@@ -180,9 +196,9 @@ export async function probeNextCraftAction(opts: {
   const promptText = [
     `You are controlling a Minecraft inventory GUI (640x360 image) to craft ${opts.taskTarget} from ${opts.ingredient}.`,
     "",
-    `The image has YELLOW NUMBERED BADGES drawn at the center of each slot.`,
-    `Use the visible numbers to choose a slot, do not guess from text descriptions.`,
-    SLOT_DESCRIPTION,
+    `The image has YELLOW NUMBERED BADGES drawn at the corner of each slot.`,
+    `Use the visible numbers to choose a slot. Pick the index of the slot you mean.`,
+    buildSlotDescription(detectedLayout),
     "",
     `Recent actions you've already executed (do NOT repeat the same one if state hasn't changed):`,
     historyText,
@@ -193,13 +209,13 @@ export async function probeNextCraftAction(opts: {
     `  {"action": "pickup",    "slot": N, "reason": "..."}  -- left-click slot N to grab whole stack`,
     `  {"action": "place_one", "slot": N, "reason": "..."}  -- right-click slot N to drop ONE item from cursor`,
     `  {"action": "place_all", "slot": N, "reason": "..."}  -- left-click slot N to drop whole held stack`,
-    `  {"action": "take",      "slot": N, "reason": "..."}  -- left-click slot N (use this for the RESULT slot 40)`,
+    `  {"action": "take",      "slot": N, "reason": "..."}  -- left-click slot N (use this for a RESULT slot)`,
     `  {"action": "done",                  "reason": "..."} -- task complete; ${opts.taskTarget} is in inventory`,
     "",
     `Standard crafting flow for ${opts.taskTarget}:`,
-    `  1. If craft grid is empty: pickup the ${opts.ingredient} stack from wherever you see it`,
-    `  2. If cursor is holding ${opts.ingredient}: place_one into slot 36 (craft top-left)`,
-    `  3. If craft RESULT slot 40 has ${opts.taskTarget}: take from slot 40`,
+    `  1. If craft grid is empty: pickup the ${opts.ingredient} stack from whichever slot contains it (look at the marked image)`,
+    `  2. If cursor is holding ${opts.ingredient}: place_one into a craft grid slot (role=craft_2x2 or craft_3x3)`,
+    `  3. If a RESULT slot (role=result) contains ${opts.taskTarget}: take from that slot`,
     `  4. If ${opts.taskTarget} is in your inventory: done`,
     "",
     `This is iteration ${opts.iteration}. Return ONLY the JSON action.`,
