@@ -306,6 +306,99 @@ export function guiSlotsByRole(layout: GuiLayout, role: string): GuiSlot[] {
   return layout.slots.filter((s) => s.role === role);
 }
 
+// =========================================================================
+// Cursor position detector (for Image-Based Visual Servoing).
+// =========================================================================
+
+/** Detect the GUI cursor (small white-arrow sprite) within the inventory
+ *  window. Strategy: mask near-white pixels, flood-fill connected
+ *  components, keep the largest component whose size matches the cursor's
+ *  ~10x16 footprint and is not at a slot's typical position (helps avoid
+ *  matching white items in slots). Returns null if no plausible cursor
+ *  is found. */
+export function detectCursor(jpegBase64: string, layout: GuiLayout): { x: number; y: number } | null {
+  const cleaned = jpegBase64.startsWith("data:image/")
+    ? jpegBase64.replace(/^data:image\/[a-z]+;base64,/, "")
+    : jpegBase64;
+  const buf = Buffer.from(cleaned, "base64");
+  let decoded;
+  try {
+    decoded = jpeg.decode(buf, { useTArray: true, formatAsRGBA: true });
+  } catch {
+    return null;
+  }
+  const { width: w, data } = decoded;
+
+  // Search inside the inventory window only.
+  const x0 = layout.windowX;
+  const y0 = layout.windowY;
+  const ww = layout.windowW;
+  const hh = layout.windowH;
+
+  // Build mask of near-white pixels.
+  const mask = new Uint8Array(ww * hh);
+  for (let yy = 0; yy < hh; yy += 1) {
+    const absY = y0 + yy;
+    for (let xx = 0; xx < ww; xx += 1) {
+      const absX = x0 + xx;
+      const i = (absY * w + absX) * 4;
+      const r = data[i];
+      const g = data[i + 1];
+      const b = data[i + 2];
+      if (r >= 235 && g >= 235 && b >= 235) {
+        const max = Math.max(r, g, b);
+        const min = Math.min(r, g, b);
+        if (max - min <= 12) {
+          mask[yy * ww + xx] = 1;
+        }
+      }
+    }
+  }
+
+  // Flood-fill, score components.
+  const labels = new Int32Array(ww * hh);
+  let best: { cx: number; cy: number; area: number; cw: number; ch: number } | null = null;
+  let nextLabel = 1;
+  for (let yy = 0; yy < hh; yy += 1) {
+    for (let xx = 0; xx < ww; xx += 1) {
+      const off = yy * ww + xx;
+      if (mask[off] !== 1 || labels[off] !== 0) continue;
+      const stack: number[] = [xx, yy];
+      let minX = xx, maxX = xx, minY = yy, maxY = yy, area = 0;
+      while (stack.length > 0) {
+        const py = stack.pop()!;
+        const px = stack.pop()!;
+        if (px < 0 || px >= ww || py < 0 || py >= hh) continue;
+        const o = py * ww + px;
+        if (labels[o] !== 0 || mask[o] === 0) continue;
+        labels[o] = nextLabel;
+        area += 1;
+        if (px < minX) minX = px;
+        if (px > maxX) maxX = px;
+        if (py < minY) minY = py;
+        if (py > maxY) maxY = py;
+        stack.push(px - 1, py, px + 1, py, px, py - 1, px, py + 1);
+      }
+      nextLabel += 1;
+      const cw = maxX - minX + 1;
+      const ch = maxY - minY + 1;
+      // Cursor footprint: ~10w x 16h at GUI scale 1. Allow a generous range.
+      if (area < 6 || area > 90) continue;
+      if (cw < 4 || cw > 16) continue;
+      if (ch < 6 || ch > 22) continue;
+      // Cursor is taller than wide.
+      if (ch < cw * 0.7) continue;
+      const candidate = {
+        cx: x0 + (minX + maxX) / 2,
+        cy: y0 + (minY + maxY) / 2,
+        area, cw, ch,
+      };
+      if (!best || candidate.area > best.area) best = candidate;
+    }
+  }
+  return best ? { x: Math.round(best.cx), y: Math.round(best.cy) } : null;
+}
+
 /** Discover every interactable slot in the inventory window without
  *  assuming any specific GUI layout. Returns null if no window is found
  *  or no slot-shaped components are detected.

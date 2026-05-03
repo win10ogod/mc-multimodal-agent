@@ -409,7 +409,64 @@ export type ClosedLoopCraftPlan = {
   done: boolean;
   /** Cap the number of probe iterations so a confused VLM can't loop forever. */
   maxIterations: number;
+  /** Pending click target — when set, the policy is servoing the cursor to
+   *  this slot. Cleared once the click fires. */
+  pendingClick: { slot: number; button: "attack" | "use" } | null;
+  /** How many servo steps we've spent on the current pendingClick. Capped
+   *  so a misbehaving cursor (or detection failure) doesn't deadlock. */
+  servoSteps: number;
 };
+
+/** Servo control law: given current cursor + target slot pixel center,
+ *  emit a single MCU env action — either a camera correction (if cursor
+ *  not yet on target) or a click (if within tolerance). Caller passes the
+ *  click button ("attack" for left-click, "use" for right-click).
+ *  Returns null if the cursor wasn't detected and we should noop this
+ *  frame and re-observe. */
+export function servoCursorStep(opts: {
+  cursor: { x: number; y: number } | null;
+  target: { x: number; y: number };
+  button: "attack" | "use";
+  hitThresholdPx?: number;
+}): { action: McuEnvAction; click: boolean; reason: string } | null {
+  if (!opts.cursor) return null;
+  const ex = opts.target.x - opts.cursor.x;
+  const ey = opts.target.y - opts.cursor.y;
+  const errMag = Math.hypot(ex, ey);
+  const hit = opts.hitThresholdPx ?? 5;
+  if (errMag <= hit) {
+    const action = defaultMcuAction();
+    action[opts.button] = 1;
+    return { action, click: true, reason: `click err=${errMag.toFixed(1)}px` };
+  }
+  // Camera-delta proportional to pixel error. Clamp + quantize per frame.
+  let yawDeg = ex / PX_PER_CAM_YAW;
+  let pitchDeg = ey / PX_PER_CAM_PITCH;
+  // Clamp + bin
+  yawDeg = Math.max(-MAX_CAM_DEG, Math.min(MAX_CAM_DEG, yawDeg));
+  pitchDeg = Math.max(-MAX_CAM_DEG, Math.min(MAX_CAM_DEG, pitchDeg));
+  let dy = quantizeCam(yawDeg);
+  let dp = quantizeCam(pitchDeg);
+  // Pitch deadzone: if remaining error is below half the deadzone, drop
+  // it so we don't oscillate.
+  if (dp !== 0 && Math.abs(dp) < PITCH_DEADZONE_MIN) {
+    dp = Math.sign(dp) * PITCH_DEADZONE_MIN;
+  }
+  if (Math.abs(pitchDeg) * PX_PER_CAM_PITCH < PITCH_DEADZONE_MIN / 2) dp = 0;
+  if (dy === 0 && dp === 0) {
+    // Within deadzone in both axes -- treat as on-target and click
+    const action = defaultMcuAction();
+    action[opts.button] = 1;
+    return { action, click: true, reason: `click stuck err=${errMag.toFixed(1)}px` };
+  }
+  const action = defaultMcuAction();
+  action.camera = [dp, dy];
+  return {
+    action,
+    click: false,
+    reason: `servo err=(${ex},${ey})px cam=[${dp},${dy}]`,
+  };
+}
 
 /** Returns null if the task is not a single-ingredient 2x2 craft we handle. */
 export function planClosedLoopCraft(taskText: string): ClosedLoopCraftPlan | null {
@@ -427,6 +484,8 @@ export function planClosedLoopCraft(taskText: string): ClosedLoopCraftPlan | nul
     iteration: 0,
     done: false,
     maxIterations: 8,
+    pendingClick: null,
+    servoSteps: 0,
   };
 }
 

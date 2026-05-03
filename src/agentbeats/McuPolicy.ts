@@ -17,13 +17,14 @@ import {
   type McuPolicyDecision,
 } from "./McuPrompt";
 import {
-  buildClosedLoopActionFrames,
   buildCraftOpenInventoryFrames,
   planClosedLoopCraft,
+  servoCursorStep,
   type ClosedLoopCraftPlan,
   type UiFastControlFrame,
 } from "./UiFastControl";
 import { probeNextCraftAction } from "./InventoryProbe";
+import { detectCursor, detectGuiLayout } from "./SlotDetector";
 
 type McuInitPayload = {
   type: "init";
@@ -669,57 +670,93 @@ export class McuVisualPolicy {
       return emitMacroFrame(frame);
     }
 
-    // Closed-loop crafting: when no frames are queued and a closed-loop plan
-    // is active, take the current obs, ask the VLM what action to take next,
-    // then queue the cursor+click frames for that action. Repeats until the
-    // VLM says "done" or we hit the iteration cap.
+    // Closed-loop crafting (Image-Based Visual Servoing):
+    //   - Each obs: detect layout + cursor.
+    //   - If no pendingClick: probe VLM for next action, set the click target.
+    //   - With a pendingClick: emit ONE camera correction toward the slot,
+    //     OR a click frame when the cursor is within tolerance of the target.
+    //   - Repeats until VLM says "done" or iteration cap is hit.
     const plan = state.closedLoopCraft;
     if (plan && !plan.done && plan.iteration < plan.maxIterations && payload.obs) {
-      try {
-        const result = await probeNextCraftAction({
-          client: this.client,
-          model: this.config.openai.model,
-          obsBase64: payload.obs,
-          taskTarget: plan.target,
-          ingredient: plan.ingredient,
-          iteration: plan.iteration,
-          recentActions: state.closedLoopHistory,
-        });
-        plan.iteration += 1;
-        const probed = result.action;
-        const layout = result.layout;
-        if (!probed) {
-          console.log(`[agentbeats] closed-loop probe returned no action at iter=${plan.iteration}; deferring to LLM`);
-          plan.done = true;
-        } else if (probed.action === "done") {
-          console.log(`[agentbeats] closed-loop probe says done iter=${plan.iteration} reason=${probed.reason ?? ""}`);
-          plan.done = true;
-        } else {
-          const button: "attack" | "use" = probed.action === "place_one" ? "use" : "attack";
-          const built = buildClosedLoopActionFrames({
-            fromCursor: plan.cursor,
-            toSlot: probed.slot,
-            mouseButton: button,
-            label: `cl_${plan.iteration}_${probed.action}_s${probed.slot}`,
-            layout,
-          });
-          plan.cursor = built.newCursor;
-          state.pendingMacroFrames.push(...built.frames);
-          state.closedLoopHistory.unshift(`${probed.action} slot=${probed.slot}`);
-          state.closedLoopHistory = state.closedLoopHistory.slice(0, 5);
-          console.log(
-            `[agentbeats] closed-loop iter=${plan.iteration} ${probed.action} slot=${probed.slot} reason=${probed.reason ?? ""} layout=${layout ? `win(${layout.windowX},${layout.windowY},${layout.windowW}x${layout.windowH})` : "fallback"} -> ${built.frames.length} frames`,
-          );
-        }
-      } catch (error) {
-        console.warn(`[agentbeats] closed-loop probe failed: ${formatModelProviderError(error)} -- ending closed-loop`);
+      const layout = detectGuiLayout(payload.obs);
+      if (!layout) {
+        console.log(`[agentbeats] closed-loop: no inventory window in obs at step=${step}; deferring to LLM`);
         plan.done = true;
+      } else {
+        const cursor = detectCursor(payload.obs, layout);
+        plan.cursor = cursor ?? plan.cursor;
+
+        // If we have no current click target, ask the VLM for one.
+        if (plan.pendingClick === null) {
+          try {
+            const result = await probeNextCraftAction({
+              client: this.client,
+              model: this.config.openai.model,
+              obsBase64: payload.obs,
+              taskTarget: plan.target,
+              ingredient: plan.ingredient,
+              iteration: plan.iteration,
+              recentActions: state.closedLoopHistory,
+            });
+            plan.iteration += 1;
+            const probed = result.action;
+            if (!probed) {
+              console.log(`[agentbeats] closed-loop probe returned no action; deferring to LLM`);
+              plan.done = true;
+            } else if (probed.action === "done") {
+              console.log(`[agentbeats] closed-loop probe says done reason=${probed.reason ?? ""}`);
+              plan.done = true;
+            } else {
+              const button: "attack" | "use" = probed.action === "place_one" ? "use" : "attack";
+              plan.pendingClick = { slot: probed.slot, button };
+              plan.servoSteps = 0;
+              state.closedLoopHistory.unshift(`${probed.action} slot=${probed.slot}`);
+              state.closedLoopHistory = state.closedLoopHistory.slice(0, 5);
+              console.log(
+                `[agentbeats] closed-loop probe iter=${plan.iteration}: ${probed.action} slot=${probed.slot} reason=${probed.reason ?? ""}`,
+              );
+            }
+          } catch (error) {
+            console.warn(`[agentbeats] closed-loop probe failed: ${formatModelProviderError(error)} -- ending closed-loop`);
+            plan.done = true;
+          }
+        }
+
+        // Servo step toward the pending click target.
+        if (plan.pendingClick !== null && !plan.done) {
+          const targetSlot = layout.slots[plan.pendingClick.slot];
+          if (!targetSlot) {
+            console.warn(`[agentbeats] closed-loop: pending slot ${plan.pendingClick.slot} not in layout (only ${layout.slots.length}); aborting click`);
+            plan.pendingClick = null;
+          } else {
+            const stepResult = servoCursorStep({
+              cursor,
+              target: { x: targetSlot.cx, y: targetSlot.cy },
+              button: plan.pendingClick.button,
+              hitThresholdPx: 5,
+            });
+            plan.servoSteps += 1;
+            const SERVO_STEP_CAP = 10;
+            if (plan.servoSteps > SERVO_STEP_CAP) {
+              console.warn(`[agentbeats] closed-loop: servo cap hit on slot ${plan.pendingClick.slot}; clicking anyway`);
+              const action = defaultMcuAction();
+              action[plan.pendingClick.button] = 1;
+              plan.pendingClick = null;
+              return { ...ACTION_PAYLOAD_PREFIX, action, hold_steps: 1 };
+            }
+            if (stepResult) {
+              console.log(
+                `[agentbeats] servo step=${step} cursor=(${cursor?.x},${cursor?.y}) target=(${targetSlot.cx},${targetSlot.cy}) ${stepResult.reason}`,
+              );
+              if (stepResult.click) plan.pendingClick = null;
+              return { ...ACTION_PAYLOAD_PREFIX, action: stepResult.action, hold_steps: 1 };
+            }
+            // Cursor not detected this frame — emit a noop and re-observe next obs.
+            console.log(`[agentbeats] servo step=${step}: no cursor detected; noop`);
+            return { ...ACTION_PAYLOAD_PREFIX, action: defaultMcuAction(), hold_steps: 1 };
+          }
+        }
       }
-      if (state.pendingMacroFrames.length > 0) {
-        const frame = state.pendingMacroFrames.shift()!;
-        return emitMacroFrame(frame);
-      }
-      // Nothing queued (probe was "done" or failed) -- fall through to LLM.
     }
 
     if (!this.config.openai.apiKey) {
