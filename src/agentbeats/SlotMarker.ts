@@ -35,28 +35,13 @@ const GLYPH_W = 3;
 const GLYPH_H = 5;
 
 type RGBA = [number, number, number, number];
-const MARK_FG: RGBA = [255, 255, 0, 255];   // yellow (fully opaque digits)
-const MARK_BG_ALPHA = 0.55;                  // semi-transparent backdrop -- item icon stays visible
-const MARK_SCALE = 1;                        // tight: 3x5 glyph fits in slot corner
-const MARK_CORNER_OFFSET = 7;                // shift from slot center toward top-left corner
-
-function setPixel(buf: Buffer, w: number, x: number, y: number, color: RGBA): void {
-  if (x < 0 || y < 0 || x >= w) return;
-  const idx = (y * w + x) * 4;
-  if (idx < 0 || idx + 3 >= buf.length) return;
-  buf[idx] = color[0];
-  buf[idx + 1] = color[1];
-  buf[idx + 2] = color[2];
-  buf[idx + 3] = color[3];
-}
-
-function fillRect(buf: Buffer, w: number, x0: number, y0: number, ww: number, hh: number, color: RGBA): void {
-  for (let y = y0; y < y0 + hh; y += 1) {
-    for (let x = x0; x < x0 + ww; x += 1) {
-      setPixel(buf, w, x, y, color);
-    }
-  }
-}
+const MARK_FG: RGBA = [255, 255, 0, 255];   // yellow base color (digits)
+const MARK_BBOX: RGBA = [120, 255, 120, 255]; // light green slot outline
+const MARK_BG_ALPHA = 0.35;                  // grey wash behind the digits for contrast
+const MARK_FG_ALPHA = 0.85;                  // digits mostly opaque (top-left, doesn't cover item center)
+const MARK_BBOX_ALPHA = 0.5;                 // bbox stroke 50% so item icon edges still hint through
+const MARK_SCALE = 1;                        // 3x5 glyph footprint - small, fits comfortably in slot corner
+const MARK_DIGIT_GAP = 1;                    // pixels between adjacent digits
 
 /** Darken a rectangle by mixing each pixel toward black using `alpha` (0..1).
  *  This keeps the underlying item icon visible while improving contrast for
@@ -93,8 +78,6 @@ function blendRect(buf: Buffer, w: number, x0: number, y0: number, ww: number, h
   }
 }
 
-const MARK_FG_ALPHA = 0.85;  // digits at 85% opacity so item icon hints through
-
 function drawGlyph(buf: Buffer, w: number, originX: number, originY: number, char: string, scale: number): void {
   const glyph = FONT_3X5[char];
   if (!glyph) return;
@@ -108,20 +91,50 @@ function drawGlyph(buf: Buffer, w: number, originX: number, originY: number, cha
   }
 }
 
-function drawNumber(buf: Buffer, w: number, h: number, centerX: number, centerY: number, num: number, scale: number): void {
+/** 1px alpha-blended rectangle outline. */
+function strokeRect(buf: Buffer, w: number, x0: number, y0: number, ww: number, hh: number, color: RGBA, alpha: number): void {
+  // top + bottom edges
+  blendRect(buf, w, x0,             y0,           ww, 1, color, alpha);
+  blendRect(buf, w, x0,             y0 + hh - 1,  ww, 1, color, alpha);
+  // left + right edges
+  blendRect(buf, w, x0,             y0,           1,  hh, color, alpha);
+  blendRect(buf, w, x0 + ww - 1,    y0,           1,  hh, color, alpha);
+}
+
+/**
+ * Draw a slot mark: a light-green semi-transparent bbox outline around
+ * the slot, with the index drawn as digits in the slot's TOP-LEFT corner
+ * (over a small darken wash for contrast). The slot center stays clear
+ * so the item icon underneath remains visible.
+ */
+function drawSlotMark(
+  buf: Buffer,
+  w: number,
+  h: number,
+  slot: { cx: number; cy: number; w: number; h: number },
+  num: number,
+  scale: number,
+): void {
+  // 1. Light green slot bbox outline
+  const halfW = Math.max(6, Math.round(slot.w / 2));
+  const halfH = Math.max(6, Math.round(slot.h / 2));
+  const bx = slot.cx - halfW;
+  const by = slot.cy - halfH;
+  strokeRect(buf, w, bx, by, halfW * 2, halfH * 2, MARK_BBOX, MARK_BBOX_ALPHA);
+
+  // 2. Digits at the slot's top-left corner
   const text = String(num);
   const glyphsW = GLYPH_W * scale;
   const glyphsH = GLYPH_H * scale;
-  // No inter-digit gap and no backdrop padding -- keep the badge as small
-  // as possible so the underlying item icon stays visible. The semi-
-  // transparent darken still goes BEHIND the digits for contrast.
-  const totalW = text.length * glyphsW;
-  let x = Math.round(centerX - MARK_CORNER_OFFSET);
-  const y = Math.round(centerY - MARK_CORNER_OFFSET);
-  darkenRect(buf, w, x, y, totalW, glyphsH, MARK_BG_ALPHA);
+  const totalW = text.length * glyphsW + Math.max(0, text.length - 1) * MARK_DIGIT_GAP;
+  const x0 = bx + 1;
+  const y0 = by + 1;
+  // Small darken under the digits for contrast against bright items
+  darkenRect(buf, w, x0 - 1, y0 - 1, totalW + 2, glyphsH + 2, MARK_BG_ALPHA);
+  let x = x0;
   for (const ch of text) {
-    drawGlyph(buf, w, x, y, ch, scale);
-    x += glyphsW;
+    drawGlyph(buf, w, x, y0, ch, scale);
+    x += glyphsW + MARK_DIGIT_GAP;
   }
   void h;
 }
@@ -162,7 +175,7 @@ export function markInventoryFrame(jpegBase64: string): MarkedFrameResult {
   const drawn: number[] = [];
   if (layout) {
     for (const slot of layout.slots) {
-      drawNumber(px, w, h, slot.cx, slot.cy, slot.index, MARK_SCALE);
+      drawSlotMark(px, w, h, slot, slot.index, MARK_SCALE);
       drawn.push(slot.index);
     }
   }
