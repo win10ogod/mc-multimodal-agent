@@ -161,8 +161,8 @@ export async function probeNextCraftAction(opts: {
   taskTarget: string;        // e.g. "oak_planks"
   ingredient: string;        // e.g. "oak_log"
   iteration: number;         // for logging / nudging the model
-  /** Last few actions executed (most recent first) so the VLM doesn't
-   *  repeat itself. Each entry is a short label like "pickup slot 0". */
+  /** Session-locked layout so marks stay at fixed positions/indices. */
+  sessionLayout?: GuiLayout | null;
   recentActions?: string[];
 }): Promise<CraftProbeResult> {
   // Set-of-Mark: render the obs frame with numbered badges drawn at every
@@ -172,7 +172,7 @@ export async function probeNextCraftAction(opts: {
   let imgMime: "image/png" | "image/jpeg";
   let detectedLayout: GuiLayout | null = null;
   try {
-    const marked = markInventoryFrame(opts.obsBase64);
+    const marked = markInventoryFrame(opts.obsBase64, opts.sessionLayout ?? null);
     imgBase64 = marked.pngBase64;
     imgMime = "image/png";
     detectedLayout = marked.layout;

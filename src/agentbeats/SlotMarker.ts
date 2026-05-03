@@ -122,15 +122,15 @@ function drawSlotMark(
   const by = slot.cy - halfH;
   strokeRect(buf, w, bx, by, halfW * 2, halfH * 2, MARK_BBOX, MARK_BBOX_ALPHA);
 
-  // 2. Digits at the slot's top-left corner
+  // 2. Digits at the slot's top-left corner. No backdrop padding -- darken
+  //    is exactly the digit footprint to keep the mark as small as possible.
   const text = String(num);
   const glyphsW = GLYPH_W * scale;
   const glyphsH = GLYPH_H * scale;
   const totalW = text.length * glyphsW + Math.max(0, text.length - 1) * MARK_DIGIT_GAP;
   const x0 = bx + 1;
   const y0 = by + 1;
-  // Small darken under the digits for contrast against bright items
-  darkenRect(buf, w, x0 - 1, y0 - 1, totalW + 2, glyphsH + 2, MARK_BG_ALPHA);
+  darkenRect(buf, w, x0, y0, totalW, glyphsH, MARK_BG_ALPHA);
   let x = x0;
   for (const ch of text) {
     drawGlyph(buf, w, x, y0, ch, scale);
@@ -152,15 +152,19 @@ export type MarkedFrameResult = {
 };
 
 /**
- * Decode a base64 JPEG obs frame, run the unified GUI detector
- * (`detectGuiLayout`) to find every interactable slot at its actually
- * rendered pixel position, draw numbered marks at each, and return the
- * marked image plus the detected layout.
+ * Decode a base64 JPEG obs frame and draw numbered slot marks.
  *
- * Returns `layout: null` and an unmodified frame when no inventory window
- * is visible -- prevents painting bogus marks on a world-view obs.
+ * If `sessionLayout` is provided, the marks are placed at the SESSION-
+ * LOCKED slot positions (stable across all frames in a UI session) — the
+ * agent and the VLM see the same indices at the same pixels for the
+ * entire session. If null, the function falls back to per-frame
+ * detection via `detectGuiLayout` (used for the first frame to capture
+ * a session layout).
+ *
+ * Returns `layout: null` when no inventory window is visible -- prevents
+ * painting bogus marks on a world-view obs.
  */
-export function markInventoryFrame(jpegBase64: string): MarkedFrameResult {
+export function markInventoryFrame(jpegBase64: string, sessionLayout?: GuiLayout | null): MarkedFrameResult {
   const cleaned = jpegBase64.startsWith("data:image/")
     ? jpegBase64.replace(/^data:image\/[a-z]+;base64,/, "")
     : jpegBase64;
@@ -170,7 +174,9 @@ export function markInventoryFrame(jpegBase64: string): MarkedFrameResult {
   const h = decoded.height;
   const px = Buffer.from(decoded.data.buffer, decoded.data.byteOffset, decoded.data.byteLength);
 
-  const layout = detectGuiLayout(cleaned);
+  // Prefer the session-locked layout (stable marks across frames). Only
+  // run fresh detection when the caller hasn't supplied one.
+  const layout = sessionLayout ?? detectGuiLayout(cleaned);
 
   const drawn: number[] = [];
   if (layout) {

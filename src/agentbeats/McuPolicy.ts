@@ -678,10 +678,28 @@ export class McuVisualPolicy {
     //   - Repeats until VLM says "done" or iteration cap is hit.
     const plan = state.closedLoopCraft;
     if (plan && !plan.done && plan.iteration < plan.maxIterations && payload.obs) {
-      const layout = detectGuiLayout(payload.obs);
-      if (!layout) {
-        console.log(`[agentbeats] closed-loop: no inventory window in obs at step=${step}; deferring to LLM`);
+      // Each obs: detect the inventory window FRESH (CV-cheap) -- this is
+      // how we know if the GUI is still open. If yes and we have a session
+      // layout already, REUSE it so slot indices stay stable. If yes and
+      // no session yet, capture one. If no window detected, RESET the
+      // session (UI closed) and end the closed-loop.
+      const liveLayout = detectGuiLayout(payload.obs, plan.layoutHint ?? undefined);
+      if (!liveLayout) {
+        console.log(`[agentbeats] closed-loop: inventory window no longer visible at step=${step}; resetting session`);
+        plan.sessionLayout = null;
+        plan.layoutHint = null;
+        plan.pendingClick = null;
+        plan.awaitingVerify = null;
         plan.done = true;
+      } else if (plan.sessionLayout === null) {
+        // First detection in this session -- lock it.
+        plan.sessionLayout = liveLayout;
+        plan.layoutHint = liveLayout.matchedLayoutId;
+        console.log(`[agentbeats] closed-loop session locked: layout=${liveLayout.matchedLayoutId ?? "unknown"} slots=${liveLayout.slots.length}`);
+      }
+      const layout = (plan.sessionLayout as ReturnType<typeof detectGuiLayout> | null) ?? liveLayout;
+      if (!layout) {
+        // Already handled above (plan.done=true path)
       } else {
         const cursor = detectCursor(payload.obs, layout);
         plan.cursor = cursor ?? plan.cursor;
@@ -696,6 +714,7 @@ export class McuVisualPolicy {
               taskTarget: plan.target,
               ingredient: plan.ingredient,
               iteration: plan.iteration,
+              sessionLayout: layout, // session-locked; same marks all session
               recentActions: state.closedLoopHistory,
             });
             plan.iteration += 1;

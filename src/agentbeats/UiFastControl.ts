@@ -413,21 +413,38 @@ export type ClosedLoopCraftPlan = {
   done: boolean;
   /** Cap the number of probe iterations so a confused VLM can't loop forever. */
   maxIterations: number;
+  /** Layout id locked at first successful detection in this UI session.
+   *  Reset when the inventory window is no longer visible. */
+  layoutHint: string | null;
+  /** Full GuiLayout snapshot captured at session start. Reused for slot
+   *  lookups so raster indices and slot positions stay stable for the
+   *  duration of one UI session. Reset on window-not-detected. Stored
+   *  as `unknown` to avoid a circular import; cast at use site. */
+  sessionLayout: unknown | null;
   /** Pending click target — when set, the policy is servoing the cursor to
-   *  this slot. Cleared once the click fires.
-   *  - rasterIndex: the index VLM picked from the marked frame (used as
-   *    the LAST-RESORT lookup if name/role can't be resolved).
-   *  - slotName: semantic name from the matched layout (e.g. "hotbar_0")
-   *    -- stable across frames; preferred lookup key.
-   *  - slotRole: semantic role (e.g. "result") -- second-choice fallback.
-   *  - frozenTarget: pixel position captured at probe time, used if all
-   *    lookups fail (e.g. layout matching is now degraded). */
+   *  this slot. Cleared once the click fires. */
   pendingClick: {
     rasterIndex: number;
     slotName?: string;
     slotRole?: string;
     frozenTarget: { x: number; y: number };
     button: "attack" | "use";
+    /** What we expect of the slot AFTER the click, used for verification.
+     *  Optional: callers that don't need verification can omit it. */
+    expectAfter?: "should_empty" | "should_fill";
+    /** Fingerprint of the target slot patch sampled at probe time. */
+    prePatch?: { meanR: number; meanG: number; meanB: number; stddev: number };
+  } | null;
+  /** Awaiting click verification: when set, the click was JUST emitted on
+   *  the previous frame and we're checking whether the slot state changed
+   *  in the expected direction. Cleared after one verification pass. */
+  awaitingVerify: {
+    slotName?: string;
+    slotRole?: string;
+    rasterIndex: number;
+    frozenTarget: { x: number; y: number };
+    expectAfter: "should_empty" | "should_fill";
+    prePatch: { meanR: number; meanG: number; meanB: number; stddev: number };
   } | null;
   /** How many servo steps we've spent on the current pendingClick. Capped
    *  so a misbehaving cursor (or detection failure) doesn't deadlock. */
@@ -471,10 +488,15 @@ export function servoCursorStep(opts: {
   }
   if (Math.abs(pitchDeg) * PX_PER_CAM_PITCH < PITCH_DEADZONE_MIN / 2) dp = 0;
   if (dy === 0 && dp === 0) {
-    // Within deadzone in both axes -- treat as on-target and click
-    const action = defaultMcuAction();
-    action[opts.button] = 1;
-    return { action, click: true, reason: `click stuck err=${errMag.toFixed(1)}px` };
+    // Servo can't compute a meaningful next move. DON'T blindly click --
+    // the cursor is in the deadzone but may still be outside the slot's
+    // hit region. Return a noop and let the caller bump the iteration cap
+    // and either retry or give up.
+    return {
+      action: defaultMcuAction(),
+      click: false,
+      reason: `noop stuck err=${errMag.toFixed(1)}px (caller should retry/abort)`,
+    };
   }
   const action = defaultMcuAction();
   action.camera = [dp, dy];
@@ -502,7 +524,10 @@ export function planClosedLoopCraft(taskText: string): ClosedLoopCraftPlan | nul
     done: false,
     maxIterations: 8,
     pendingClick: null,
+    awaitingVerify: null,
     servoSteps: 0,
+    layoutHint: null,
+    sessionLayout: null,
   };
 }
 

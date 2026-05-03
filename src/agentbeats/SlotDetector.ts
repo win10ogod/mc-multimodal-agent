@@ -576,14 +576,14 @@ function aspect(w: number, h: number): number {
  *  geometry. Lower score = better match. Returns +Infinity for layouts
  *  that don't match aspect/slot-count basics at all. */
 function scoreLayout(disc: DiscoveredLayout, layout: LogicalLayout): number {
+  // Cheap pre-filter: only reject layouts with grossly wrong window
+  // aspect; let annotation + match-ratio scoring (see detectGuiLayout) do
+  // the real selection. A scoreLayout return value of 0 means "passes
+  // pre-filter, evaluate further".
   const aDisc = aspect(disc.windowW, disc.windowH);
   const aLayout = aspect(layout.windowW, layout.windowH);
-  if (Math.abs(aDisc - aLayout) > 0.25) return Infinity;
-  const slotDelta = Math.abs(layout.slots.length - disc.slots.length);
-  // Allow a few missing/extra slots (items in slot can darken interior
-  // beyond our threshold; recipe-book panel can add pseudo-slots).
-  if (slotDelta > 6) return Infinity;
-  return slotDelta * 10 + Math.abs(aDisc - aLayout) * 50;
+  if (Math.abs(aDisc - aLayout) > 0.3) return Infinity;
+  return 0;
 }
 
 /** Match discovered slots against a logical layout, then backfill any
@@ -784,18 +784,39 @@ export function detectGuiLayout(
     }
   }
   if (!bestLayout) {
+    // Score by how many of THIS LAYOUT's slots were actually matched
+    // (not just by total slot count delta -- two layouts can both have
+    // 41-46 slots but with totally different positions). Prefer the
+    // layout with the highest match ratio; tie-break by fewer unmatched
+    // discovered slots.
     let bestScore = Infinity;
+    const debug = process.env.SLOT_DEBUG === "1";
     for (const layout of ALL_LAYOUTS) {
-      const s = scoreLayout(disc, layout);
-      if (s < bestScore) {
-        const annotated = annotateWithLayout(disc, layout);
-        if (annotated) {
-          bestScore = s;
-          bestLayout = layout;
-          bestSlots = annotated;
-        }
+      const prefilter = scoreLayout(disc, layout);
+      if (prefilter === Infinity) {
+        if (debug) console.log(`  ${layout.id}: prefilter rejected`);
+        continue;
+      }
+      const annotated = annotateWithLayout(disc, layout);
+      if (!annotated) {
+        if (debug) console.log(`  ${layout.id}: annotated rejected`);
+        continue;
+      }
+      // Count how many slots have name (= matched to this layout's logical slots)
+      const namedCount = annotated.filter((s) => s.name !== undefined).length;
+      const matchRatio = namedCount / layout.slots.length;
+      // Score: invert match ratio (so high ratio = low score) + small
+      // penalty for excess detected components.
+      const extras = Math.max(0, annotated.length - layout.slots.length);
+      const score = (1 - matchRatio) * 1000 + extras * 2;
+      if (debug) console.log(`  ${layout.id}: matched=${namedCount}/${layout.slots.length} (${(matchRatio * 100).toFixed(0)}%) extras=${extras} score=${score.toFixed(1)}`);
+      if (score < bestScore) {
+        bestScore = score;
+        bestLayout = layout;
+        bestSlots = annotated;
       }
     }
+    if (debug) console.log(`  -> chose ${bestLayout?.id ?? "none"} score=${bestScore.toFixed(1)}`);
   }
 
   let slots: GuiSlot[];
