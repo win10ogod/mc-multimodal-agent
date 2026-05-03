@@ -164,6 +164,11 @@ export async function probeNextCraftAction(opts: {
   /** Session-locked layout so marks stay at fixed positions/indices. */
   sessionLayout?: GuiLayout | null;
   recentActions?: string[];
+  /** CV-derived cursor state (true = cursor is carrying an item icon). */
+  cursorHolding?: boolean | null;
+  /** Slot the agent originally picked the ingredient up from, so the VLM
+   *  can return leftover items to the same place after place_one. */
+  pickupSourceSlot?: { index: number; name?: string } | null;
 }): Promise<CraftProbeResult> {
   // Set-of-Mark: render the obs frame with numbered badges drawn at every
   // slot's pixel center so the VLM grounds slot indices visually instead of
@@ -193,6 +198,15 @@ export async function probeNextCraftAction(opts: {
     ? "(none yet)"
     : historyLines.map((a, i) => `  ${i === 0 ? "most recent" : `${i + 1} ago`}: ${a}`).join("\n");
 
+  const cursorState = opts.cursorHolding === true
+    ? "CURSOR IS CARRYING AN ITEM (CV-detected)."
+    : opts.cursorHolding === false
+      ? "CURSOR IS EMPTY (CV-detected)."
+      : "CURSOR STATE UNKNOWN.";
+  const sourceLine = opts.pickupSourceSlot
+    ? `Original pickup source slot: index ${opts.pickupSourceSlot.index}${opts.pickupSourceSlot.name ? ` (${opts.pickupSourceSlot.name})` : ""}. Return leftover ingredients to THIS slot.`
+    : "No pickup source recorded yet.";
+
   const promptText = [
     `You are controlling a Minecraft inventory GUI (640x360 image) to craft ${opts.taskTarget} from ${opts.ingredient}.`,
     "",
@@ -200,25 +214,34 @@ export async function probeNextCraftAction(opts: {
     `Use the visible numbers to choose a slot. Pick the index of the slot you mean.`,
     buildSlotDescription(detectedLayout),
     "",
+    `State:`,
+    `  ${cursorState}`,
+    `  ${sourceLine}`,
+    "",
     `Recent actions you've already executed (do NOT repeat the same one if state hasn't changed):`,
     historyText,
     "",
     "Look at the image and decide the SINGLE NEXT action that best advances the task.",
     "",
     "Respond with strict JSON only (no markdown fences, no commentary):",
-    `  {"action": "pickup",    "slot": N, "reason": "..."}  -- left-click slot N to grab whole stack`,
+    `  {"action": "pickup",    "slot": N, "reason": "..."}  -- left-click slot N to grab whole stack. REQUIRES cursor empty.`,
     `  {"action": "place_one", "slot": N, "reason": "..."}  -- right-click slot N to drop ONE item from cursor`,
-    `  {"action": "place_all", "slot": N, "reason": "..."}  -- left-click slot N to drop whole held stack`,
-    `  {"action": "take",      "slot": N, "reason": "..."}  -- left-click slot N (use this for a RESULT slot)`,
-    `  {"action": "done",                  "reason": "..."} -- task complete; ${opts.taskTarget} is in inventory`,
+    `  {"action": "place_all", "slot": N, "reason": "..."}  -- left-click slot N to drop whole held stack (use for cleanup)`,
+    `  {"action": "take",      "slot": N, "reason": "..."}  -- left-click result slot to grab crafted output. REQUIRES cursor empty.`,
+    `  {"action": "done",                  "reason": "..."} -- task complete; ${opts.taskTarget} is in inventory and cursor is empty`,
     "",
-    `Standard crafting flow for ${opts.taskTarget}:`,
-    `  1. If craft grid is empty: pickup the ${opts.ingredient} stack from whichever slot contains it`,
-    `  2. If cursor is holding ${opts.ingredient}: place_one into a craft grid slot (role=craft_2x2 or craft_3x3)`,
-    `  3. If a RESULT slot (role=result) contains ${opts.taskTarget}: take from that slot`,
-    `  4. If cursor STILL holds leftover ${opts.ingredient} after taking the result:`,
-    `     issue place_all into any EMPTY main inventory slot (role=main_inv) to drop the rest. Cursor must be empty before "done".`,
-    `  5. Only return "done" when (a) ${opts.taskTarget} is visible in inventory AND (b) the cursor holds nothing.`,
+    `IMPORTANT (MCU sim quirks):`,
+    `  - Shift+click DOES NOT WORK. "take" is a plain left-click.`,
+    `  - "pickup" only works when the cursor is empty -- otherwise it swaps and breaks the flow.`,
+    `  - "take" on a result slot only works when the cursor is empty -- otherwise it swaps.`,
+    "",
+    `Required flow for ${opts.taskTarget}:`,
+    `  1. Cursor empty + craft grid empty -> "pickup" the ${opts.ingredient} stack from a hotbar/main_inv slot.`,
+    `  2. Cursor holding ${opts.ingredient} + craft grid empty -> "place_one" into a craft slot (role=craft_2x2 or craft_3x3).`,
+    `  3. Cursor STILL holding leftover ${opts.ingredient} after place_one -> "place_all" BACK to the original pickup source slot to free the cursor.`,
+    `  4. Cursor empty + result slot has ${opts.taskTarget} -> "take" from result slot.`,
+    `  5. Cursor holding ${opts.taskTarget} -> "place_all" into any EMPTY main_inv slot to stash it.`,
+    `  6. Only return "done" when ${opts.taskTarget} is visible in inventory AND cursor is empty.`,
     "",
     `This is iteration ${opts.iteration}. Return ONLY the JSON action.`,
   ].join("\n");

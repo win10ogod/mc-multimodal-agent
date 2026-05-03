@@ -24,7 +24,7 @@ import {
   type UiFastControlFrame,
 } from "./UiFastControl";
 import { probeNextCraftAction } from "./InventoryProbe";
-import { detectCursor, detectGuiLayout, samplePatchFingerprint } from "./SlotDetector";
+import { detectCursor, detectCursorHolding, detectGuiLayout, samplePatchFingerprint } from "./SlotDetector";
 
 type McuInitPayload = {
   type: "init";
@@ -706,6 +706,7 @@ export class McuVisualPolicy {
 
         // If we have no current click target, ask the VLM for one.
         if (plan.pendingClick === null) {
+          const cursorHolding = detectCursorHolding(payload.obs, plan.cursor);
           try {
             const result = await probeNextCraftAction({
               client: this.client,
@@ -716,6 +717,8 @@ export class McuVisualPolicy {
               iteration: plan.iteration,
               sessionLayout: layout, // session-locked; same marks all session
               recentActions: state.closedLoopHistory,
+              cursorHolding,
+              pickupSourceSlot: plan.pickupSourceSlot ?? null,
             });
             plan.iteration += 1;
             const probed = result.action;
@@ -730,15 +733,32 @@ export class McuVisualPolicy {
               //   pickup    -> attack (left-click): grab whole stack
               //   place_one -> use    (right-click): drop 1 item, keep rest
               //   place_all -> attack (left-click): drop whole stack
-              //   take      -> shift+attack (shift left-click): transfer
-              //                crafted output to inventory regardless of
-              //                what cursor holds (bypasses incompat check)
+              //   take      -> attack (left-click). NOTE: shift+click is
+              //                broken in the MCU sim, so we never use sneak
+              //                here; the VLM is told to ensure cursor empty
+              //                before issuing "take" or "pickup".
               const button: "attack" | "use" = probed.action === "place_one" ? "use" : "attack";
-              const shift = probed.action === "take";
+              const shift = false;
               const probedSlot = layout.slots[probed.slot];
               if (!probedSlot) {
                 console.warn(`[agentbeats] probe returned slot ${probed.slot} but layout only has ${layout.slots.length}; skipping`);
+              } else if (probed.action === "pickup" && cursorHolding === true) {
+                // Hard guard: cursor is already carrying an item, so a
+                // "pickup" would actually swap stacks and corrupt state.
+                // Skip this probe; next iteration the VLM will see the
+                // updated cursor_holding=yes hint and choose place_all.
+                console.warn(`[agentbeats] probe asked for pickup at slot ${probed.slot} but CV says cursor is HOLDING; refusing -- will reprobe`);
+                state.closedLoopHistory.unshift(`refused pickup slot=${probed.slot} (cursor not empty)`);
+                state.closedLoopHistory = state.closedLoopHistory.slice(0, 5);
+              } else if (probed.action === "take" && cursorHolding === true) {
+                console.warn(`[agentbeats] probe asked for take at slot ${probed.slot} but CV says cursor is HOLDING; refusing -- will reprobe`);
+                state.closedLoopHistory.unshift(`refused take slot=${probed.slot} (cursor not empty)`);
+                state.closedLoopHistory = state.closedLoopHistory.slice(0, 5);
               } else {
+                if (probed.action === "pickup") {
+                  plan.pickupSourceSlot = { index: probed.slot, name: probedSlot.name };
+                  console.log(`[agentbeats] recorded pickupSourceSlot=${probed.slot} (${probedSlot.name ?? "?"})`);
+                }
                 const expectAfter: "should_empty" | "should_fill" =
                   (probed.action === "place_one" || probed.action === "place_all") ? "should_fill" : "should_empty";
                 plan.pendingClick = {

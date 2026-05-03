@@ -403,6 +403,22 @@ export function detectCursor(jpegBase64: string, layout: GuiLayout): { x: number
   return best ? { x: Math.round(best.cx), y: Math.round(best.cy) } : null;
 }
 
+/** Detect whether the GUI cursor is currently carrying an item icon.
+ *  The held-item sprite is centered roughly 8px down-right of the cursor
+ *  TIP. Sample a 12x12 patch there: high stddev (item icon edges) means
+ *  carrying, low stddev (uniform GUI background) means empty. Returns
+ *  null when we can't sample (no cursor / off-frame). */
+export function detectCursorHolding(
+  jpegBase64: string,
+  cursor: { x: number; y: number } | null,
+  threshold = 30,
+): boolean | null {
+  if (!cursor) return null;
+  const patch = samplePatchFingerprint(jpegBase64, cursor.x + 8, cursor.y + 8, 12);
+  if (!patch) return null;
+  return patch.stddev >= threshold;
+}
+
 /** Sample a small RGB patch around a pixel and return mean+stddev as a
  *  fingerprint. Used by the closed-loop click verifier to compare a
  *  slot's appearance before vs after a click (filled vs empty). */

@@ -459,6 +459,9 @@ export type ClosedLoopCraftPlan = {
   /** How many servo steps we've spent on the current pendingClick. Capped
    *  so a misbehaving cursor (or detection failure) doesn't deadlock. */
   servoSteps: number;
+  /** Slot from which the agent first picked up the ingredient stack. Used
+   *  to instruct the VLM to return leftover items here after place_one. */
+  pickupSourceSlot: { index: number; name?: string } | null;
 };
 
 /** Servo control law: given current cursor + target slot pixel center,
@@ -542,6 +545,7 @@ export function planClosedLoopCraft(taskText: string): ClosedLoopCraftPlan | nul
     servoSteps: 0,
     layoutHint: null,
     sessionLayout: null,
+    pickupSourceSlot: null,
   };
 }
 
