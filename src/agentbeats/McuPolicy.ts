@@ -707,7 +707,13 @@ export class McuVisualPolicy {
               console.log(`[agentbeats] closed-loop probe says done reason=${probed.reason ?? ""}`);
               plan.done = true;
             } else {
-              const button: "attack" | "use" = probed.action === "place_one" ? "use" : "attack";
+              // MinecraftSim GUI mode: `use=1` (right-click) does not appear to
+              // register as a slot interaction — pickups via `attack` work but
+              // place_one with `use` left the slot empty (verified visually).
+              // Use `attack` for ALL slot operations: a left-click on an
+              // empty craft slot drops the full held stack, which still
+              // satisfies the recipe (any 1 log in the 2x2 grid -> planks).
+              const button: "attack" | "use" = "attack";
               const probedSlot = layout.slots[probed.slot];
               if (!probedSlot) {
                 console.warn(`[agentbeats] probe returned slot ${probed.slot} but layout only has ${layout.slots.length}; skipping`);
