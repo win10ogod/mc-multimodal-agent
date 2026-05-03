@@ -43,9 +43,13 @@ export type ProbeRequest = {
 // and it regressed to 1.50 because cursor undershoots on short moves. K=4
 // (som7) scored 4.00 with very high criterion scores -- best so far. Until
 // we add CV cursor verification, stick with K=4.
+// Empirical from servo run som11: pitch=-8 moved cursor -39 px ->
+// K_pitch ~= 4.9 px/deg. Setting K_pitch=5 makes a 16-px error compute
+// to cam=3.2 -> quantized to 4 -> moves ~20 px (lands within hit
+// tolerance), preventing the oscillation seen in som11.
 const PX_PER_CAM_YAW = 8.5;
-const PX_PER_CAM_PITCH = 4.0;
-const PITCH_DEADZONE_MIN = 8;
+const PX_PER_CAM_PITCH = 5.0;
+const PITCH_DEADZONE_MIN = 4;        // smallest pitch cmd that actually moves the cursor; lowered from 8 to allow convergence
 const CAM_BIN_DEG = 2;
 const MAX_CAM_DEG = 10;
 

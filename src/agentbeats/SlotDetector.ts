@@ -399,6 +399,67 @@ export function detectCursor(jpegBase64: string, layout: GuiLayout): { x: number
   return best ? { x: Math.round(best.cx), y: Math.round(best.cy) } : null;
 }
 
+/** Debug variant: return ALL plausible cursor components (useful for
+ *  triaging false positives during calibration). */
+export function detectCursorCandidates(
+  jpegBase64: string,
+  layout: GuiLayout,
+): Array<{ x: number; y: number; w: number; h: number; area: number }> {
+  const cleaned = jpegBase64.startsWith("data:image/")
+    ? jpegBase64.replace(/^data:image\/[a-z]+;base64,/, "")
+    : jpegBase64;
+  const buf = Buffer.from(cleaned, "base64");
+  let decoded;
+  try { decoded = jpeg.decode(buf, { useTArray: true, formatAsRGBA: true }); } catch { return []; }
+  const { width: w, data } = decoded;
+  const x0 = layout.windowX, y0 = layout.windowY, ww = layout.windowW, hh = layout.windowH;
+
+  const mask = new Uint8Array(ww * hh);
+  for (let yy = 0; yy < hh; yy += 1) {
+    for (let xx = 0; xx < ww; xx += 1) {
+      const i = ((y0 + yy) * w + (x0 + xx)) * 4;
+      const r = data[i], g = data[i + 1], b = data[i + 2];
+      if (r >= 235 && g >= 235 && b >= 235 && (Math.max(r, g, b) - Math.min(r, g, b)) <= 12) {
+        mask[yy * ww + xx] = 1;
+      }
+    }
+  }
+  const labels = new Int32Array(ww * hh);
+  const out: Array<{ x: number; y: number; w: number; h: number; area: number }> = [];
+  let nextLabel = 1;
+  for (let yy = 0; yy < hh; yy += 1) {
+    for (let xx = 0; xx < ww; xx += 1) {
+      const off = yy * ww + xx;
+      if (mask[off] !== 1 || labels[off] !== 0) continue;
+      const stack: number[] = [xx, yy];
+      let minX = xx, maxX = xx, minY = yy, maxY = yy, area = 0;
+      while (stack.length > 0) {
+        const py = stack.pop()!;
+        const px = stack.pop()!;
+        if (px < 0 || px >= ww || py < 0 || py >= hh) continue;
+        const o = py * ww + px;
+        if (labels[o] !== 0 || mask[o] === 0) continue;
+        labels[o] = nextLabel;
+        area += 1;
+        if (px < minX) minX = px;
+        if (px > maxX) maxX = px;
+        if (py < minY) minY = py;
+        if (py > maxY) maxY = py;
+        stack.push(px - 1, py, px + 1, py, px, py - 1, px, py + 1);
+      }
+      nextLabel += 1;
+      out.push({
+        x: x0 + Math.round((minX + maxX) / 2),
+        y: y0 + Math.round((minY + maxY) / 2),
+        w: maxX - minX + 1,
+        h: maxY - minY + 1,
+        area,
+      });
+    }
+  }
+  return out.sort((a, b) => b.area - a.area);
+}
+
 /** Discover every interactable slot in the inventory window without
  *  assuming any specific GUI layout. Returns null if no window is found
  *  or no slot-shaped components are detected.
