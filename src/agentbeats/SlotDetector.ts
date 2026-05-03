@@ -388,9 +388,13 @@ export function detectCursor(jpegBase64: string, layout: GuiLayout): { x: number
       if (ch < 6 || ch > 22) continue;
       // Cursor is taller than wide.
       if (ch < cw * 0.7) continue;
+      // The Minecraft GUI cursor's hotspot (the pixel that registers the
+      // click) is at the arrow TIP, which is the top-LEFT corner of the
+      // sprite. Return that point, not the bbox centroid -- the servo
+      // needs to align the hotspot with the slot center.
       const candidate = {
-        cx: x0 + (minX + maxX) / 2,
-        cy: y0 + (minY + maxY) / 2,
+        cx: x0 + minX,
+        cy: y0 + minY,
         area, cw, ch,
       };
       if (!best || candidate.area > best.area) best = candidate;
