@@ -19,7 +19,7 @@ import minecraftData from "minecraft-data";
 import { defaultMcuAction, type McuEnvAction } from "./McuPrompt";
 import { detectedSlotPixel, type DetectedLayout } from "./SlotDetector";
 
-export type CraftMacroFrame = {
+export type UiFastControlFrame = {
   action: McuEnvAction;
   holdSteps: number;
   label: string;
@@ -39,12 +39,13 @@ export type ProbeRequest = {
 
 // --- Calibration constants (640x360 obs, MC GUI scale auto) ---------------
 
-// Empirical K from fix4 evaluation run, which scored 4.0/10 (best so far).
-// Asymmetric: yaw stronger than pitch in GUI mode. fix5 tried averaging both
-// to ~6 and regressed to 1.5/10, so the asymmetry matters more than absolute
-// accuracy.
+// Empirical K is non-linear with magnitude in GUI mode. Measured from som7
+// frames: K_pitch at large magnitudes (cmd=-30 deg over 3 frames) was ~6
+// px/deg (cursor moved -180 px when target was -120). Bumping K_pitch from
+// 4 -> 6 keeps full-stroke moves on target; small moves still rely on the
+// deadzone boost to clear the GUI's pitch dead band.
 const PX_PER_CAM_YAW = 8.5;
-const PX_PER_CAM_PITCH = 4.0;
+const PX_PER_CAM_PITCH = 6.0;
 const PITCH_DEADZONE_MIN = 8;
 const CAM_BIN_DEG = 2;
 const MAX_CAM_DEG = 10;
@@ -275,8 +276,8 @@ function buildSingleSlot2x2Macro(
   ingredientHotbarSlot: number,
   label: string,
   options: { assumeInventoryOpen?: boolean } = {},
-): CraftMacroFrame[] {
-  const frames: CraftMacroFrame[] = [];
+): UiFastControlFrame[] {
+  const frames: UiFastControlFrame[] = [];
   const push = (action: McuEnvAction, holdSteps: number, frameLabel: string) =>
     frames.push({ action, holdSteps, label: `${label}:${frameLabel}` });
 
@@ -360,10 +361,10 @@ export function buildClosedLoopActionFrames(opts: {
   mouseButton: "attack" | "use";
   label: string;
   layout?: DetectedLayout | null;
-}): { frames: CraftMacroFrame[]; newCursor: { x: number; y: number } } {
+}): { frames: UiFastControlFrame[]; newCursor: { x: number; y: number } } {
   const target = slotIndexToPixel(opts.toSlot, opts.layout ?? null);
   if (!target) return { frames: [], newCursor: opts.fromCursor };
-  const out: CraftMacroFrame[] = [];
+  const out: UiFastControlFrame[] = [];
   const baseLabel = opts.label;
 
   // Cursor moves
@@ -384,9 +385,9 @@ export function buildClosedLoopActionFrames(opts: {
 
 /** Minimal start frames for closed-loop crafting: just open inventory + settle.
  *  The McuPolicy then drives a probe-action-probe loop until "done". */
-export function buildCraftOpenInventoryFrames(target: string): CraftMacroFrame[] {
+export function buildCraftOpenInventoryFrames(target: string): UiFastControlFrame[] {
   const label = `craft_${target}`;
-  const frames: CraftMacroFrame[] = [];
+  const frames: UiFastControlFrame[] = [];
   const push = (action: McuEnvAction, holdSteps: number, frameLabel: string) =>
     frames.push({ action, holdSteps, label: `${label}:${frameLabel}` });
   const openAct = defaultMcuAction();
@@ -427,7 +428,7 @@ export function planClosedLoopCraft(taskText: string): ClosedLoopCraftPlan | nul
 }
 
 /** Legacy phase 1 for backwards-compat tests; now equivalent to open+settle. */
-export function buildCraftMacroPhase1(taskText: string): CraftMacroFrame[] | null {
+export function buildUiFastControlPhase1(taskText: string): UiFastControlFrame[] | null {
   const plan = planClosedLoopCraft(taskText);
   if (!plan) return null;
   return buildCraftOpenInventoryFrames(plan.target);
@@ -439,11 +440,11 @@ export function buildCraftMacroPhase1(taskText: string): CraftMacroFrame[] | nul
  * back to assuming slot 0 (the legacy /give-order heuristic) so the macro
  * still tries something rather than abandoning.
  */
-export function buildCraftMacroPhase2(opts: {
+export function buildUiFastControlPhase2(opts: {
   recipeTarget: string;
   ingredientName: string;
   hotbarSlot: number;
-}): CraftMacroFrame[] {
+}): UiFastControlFrame[] {
   // Phase 1 already opened the inventory and settled the GUI; phase 2 must
   // NOT toggle inventory again (that would close it and run subsequent
   // clicks in world mode).
@@ -454,7 +455,7 @@ export function buildCraftMacroPhase2(opts: {
  * Legacy entry point kept for tests: builds the full macro assuming the
  * ingredient is in hotbar slot 0. New callers should use Phase1 + Phase2.
  */
-export function buildCraftMacro(taskText: string): CraftMacroFrame[] | null {
+export function buildUiFastControl(taskText: string): UiFastControlFrame[] | null {
   const target = parseTargetItem(taskText);
   if (!target) return null;
   const recipe = lookupRecipe(target);

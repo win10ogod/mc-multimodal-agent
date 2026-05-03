@@ -4,7 +4,7 @@
  * marked image as a base64 PNG for the VLM. Pure JS; relies on jpeg-js for
  * decode and pngjs for encode (both already deps).
  *
- * Numbering convention matches CraftMacro.slotIndexToPixel:
+ * Numbering convention matches UiFastControl.slotIndexToPixel:
  *   0..8   hotbar
  *   9..35  main inventory (3 rows of 9)
  *   36..39 craft 2x2 grid
@@ -12,7 +12,7 @@
  */
 import jpeg from "jpeg-js";
 import { PNG } from "pngjs";
-import { slotIndexToPixel } from "./CraftMacro";
+import { slotIndexToPixel } from "./UiFastControl";
 import { detectInventoryLayout, type DetectedLayout } from "./SlotDetector";
 
 // 3x5 bitmap font for digits 0-9 (rows = 5, cols = 3).

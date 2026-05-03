@@ -21,8 +21,8 @@ import {
   buildCraftOpenInventoryFrames,
   planClosedLoopCraft,
   type ClosedLoopCraftPlan,
-  type CraftMacroFrame,
-} from "./CraftMacro";
+  type UiFastControlFrame,
+} from "./UiFastControl";
 import { probeNextCraftAction } from "./InventoryProbe";
 
 type McuInitPayload = {
@@ -44,7 +44,7 @@ type McuContextState = {
   holdUntilStep: number;
   recentActions: McuEnvAction[];
   recentObservationImages: string[];
-  pendingMacroFrames: CraftMacroFrame[];
+  pendingMacroFrames: UiFastControlFrame[];
   closedLoopCraft: ClosedLoopCraftPlan | null;
   /** Short labels of the most recent closed-loop probe actions (newest first),
    *  passed back to the VLM each iteration so it doesn't repeat itself. */
@@ -560,7 +560,7 @@ export class McuVisualPolicy {
     const taskText = payload.text?.trim() || "";
     const promptText = payload.prompt?.trim() || "";
     const closedLoopCraft = planClosedLoopCraft(taskText);
-    const pendingMacroFrames: CraftMacroFrame[] = closedLoopCraft
+    const pendingMacroFrames: UiFastControlFrame[] = closedLoopCraft
       ? buildCraftOpenInventoryFrames(closedLoopCraft.target)
       : [];
     this.contexts.set(contextId, {
@@ -645,7 +645,7 @@ export class McuVisualPolicy {
       state.recentObservationImages = state.recentObservationImages.slice(-3);
     }
 
-    const emitMacroFrame = (frame: CraftMacroFrame): McuPolicyDecision => {
+    const emitMacroFrame = (frame: UiFastControlFrame): McuPolicyDecision => {
       const holdSteps = Math.max(
         1,
         Math.min(this.config.agentbeats.maxHoldSteps, frame.holdSteps),

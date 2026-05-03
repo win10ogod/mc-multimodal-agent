@@ -15,7 +15,7 @@ import { markInventoryFrame } from "./SlotMarker";
 import type { DetectedLayout } from "./SlotDetector";
 
 // Hotbar slot pixel centers when the inventory GUI is open at 640x360 obs.
-// Mirrors the SLOT.hotbarX0/Dx/Y constants in CraftMacro.
+// Mirrors the SLOT.hotbarX0/Dx/Y constants in UiFastControl.
 const HOTBAR_X0 = 215;
 const HOTBAR_DX = 18;
 const HOTBAR_Y = 218;
