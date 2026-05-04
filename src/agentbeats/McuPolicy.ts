@@ -1316,7 +1316,13 @@ export class McuVisualPolicy {
             // is left on the slot for MC to render its tooltip in the
             // next probe image.
             if ((pc.kind as string) === "hover") {
-              const arrived = !!cursor && Math.hypot(cursor.x - slotCenter.cx, cursor.y - slotCenter.cy) < 12;
+              // Slots are ~18 px apart on screen; a 12 px arrival
+              // tolerance let the cursor settle on the EDGE of the
+              // target slot, where MC would render the NEIGHBOR slot's
+              // tooltip and OCR would correctly read the wrong slot's
+              // item -- corrupting slotMemory. 3 px keeps the cursor
+              // pixel inside the intended slot.
+              const arrived = !!cursor && Math.hypot(cursor.x - slotCenter.cx, cursor.y - slotCenter.cy) < 3;
               if (arrived || plan.servoSteps > SERVO_STEP_CAP) {
                 console.log(`[agentbeats] hover arrived at ${pc.slotName ?? pc.rasterIndex} cursor=(${cursor?.x},${cursor?.y}); leaving cursor for tooltip; clearing pendingClick`);
                 state.closedLoopHistory.unshift(`hover slot=${pc.rasterIndex}${pc.slotName ? `(${pc.slotName})` : ""} done`);
@@ -1324,7 +1330,15 @@ export class McuVisualPolicy {
                 plan.pendingClick = null;
                 return emit(defaultMcuAction(), 2);
               }
-              if (stepResult) return emit(stepResult.action);
+              if (stepResult) {
+                // servoCursorStep can return click=true with the button
+                // pressed once cursor is within its hit threshold (~5 px),
+                // but for hover we must NEVER click -- a click would
+                // pickup/place the item and corrupt slot state. Strip
+                // any attack/use buttons before emitting.
+                const cameraOnly = { ...stepResult.action, attack: 0 as 0 | 1, use: 0 as 0 | 1 };
+                return emit(cameraOnly);
+              }
               return emit(defaultMcuAction());
             }
             const shouldClickNow = plan.servoSteps > SERVO_STEP_CAP || (stepResult && stepResult.click);
