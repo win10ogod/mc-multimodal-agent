@@ -810,6 +810,41 @@ export class McuVisualPolicy {
                   plan.pickupSourceSlot = { index: probed.slot, name: probedSlot.name };
                   console.log(`[agentbeats] recorded pickupSourceSlot=${probed.slot} (${probedSlot.name ?? "?"})`);
                 }
+                // Pre-take auto-return: "take" requires an empty cursor
+                // (otherwise it does nothing in MC). If we have a
+                // recorded pickup source, schedule a place_all back to
+                // it FIRST. Next probe will re-issue take when result
+                // slot is still filled and cursor is now empty.
+                // Putting auto-return here (just in front of crafting)
+                // instead of after every place_one keeps multi-slot
+                // recipes working: leftover stays in the cursor across
+                // multiple place_one calls until the recipe is ready.
+                if (probed.action === "take"
+                    && plan.pickupSourceSlot
+                    && plan.pickupSourceSlot.name
+                    && cursorHolding !== false) {
+                  const ret = layout.slots.find((s) => s.name === plan.pickupSourceSlot!.name);
+                  if (ret) {
+                    console.log(`[agentbeats] PRE-TAKE AUTO_RETURN: scheduling place_all back to ${ret.name} (raster=${ret.index}) before take`);
+                    plan.pendingClick = {
+                      rasterIndex: ret.index,
+                      slotName: ret.name,
+                      slotRole: ret.role,
+                      frozenTarget: { x: ret.cx, y: ret.cy },
+                      button: "attack",
+                      shift: false,
+                      expectAfter: "should_fill",
+                      phase: "servo",
+                      retries: 0,
+                      kind: "auto_return",
+                      actionKind: "place_all",
+                    };
+                    plan.servoSteps = 0;
+                    state.closedLoopHistory.unshift(`auto_return -> ${ret.name} (before take)`);
+                    state.closedLoopHistory = state.closedLoopHistory.slice(0, 5);
+                    return { ...ACTION_PAYLOAD_PREFIX, action: defaultMcuAction(), hold_steps: 1 };
+                  }
+                }
                 const expectAfter: "should_empty" | "should_fill" =
                   (probed.action === "place_one" || probed.action === "place_all") ? "should_fill" : "should_empty";
                 plan.pendingClick = {
@@ -995,36 +1030,6 @@ export class McuVisualPolicy {
             if (matched) {
               state.closedLoopHistory.unshift(`${pc.kind ?? "click"} slot=${pc.rasterIndex}${pc.slotName ? `(${pc.slotName})` : ""} OK`);
               state.closedLoopHistory = state.closedLoopHistory.slice(0, 5);
-              // Auto-return: after a successful place_one, the cursor
-              // still holds the leftover stack. Deterministically
-              // schedule a place_all back to the original pickup source
-              // slot so the cursor is freed before the LLM is asked
-              // anything else. Prevents the held item from being
-              // dropped to the world via an off-window click.
-              if (pc.kind === "click"
-                  && pc.actionKind === "place_one"
-                  && plan.pickupSourceSlot
-                  && plan.pickupSourceSlot.name) {
-                const ret = layout.slots.find((s) => s.name === plan.pickupSourceSlot!.name);
-                if (ret) {
-                  console.log(`[agentbeats] AUTO_RETURN: scheduling place_all back to ${ret.name} (raster=${ret.index}) after successful place_one`);
-                  plan.pendingClick = {
-                    rasterIndex: ret.index,
-                    slotName: ret.name,
-                    slotRole: ret.role,
-                    frozenTarget: { x: ret.cx, y: ret.cy },
-                    button: "attack",
-                    shift: false,
-                    expectAfter: "should_fill",
-                    phase: "servo",
-                    retries: 0,
-                    kind: "auto_return",
-                    actionKind: "place_all",
-                  };
-                  plan.servoSteps = 0;
-                  return { ...ACTION_PAYLOAD_PREFIX, action: defaultMcuAction(), hold_steps: 1 };
-                }
-              }
               plan.pendingClick = null;
               return { ...ACTION_PAYLOAD_PREFIX, action: defaultMcuAction(), hold_steps: 1 };
             }
