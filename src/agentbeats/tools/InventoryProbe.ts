@@ -332,9 +332,19 @@ export async function probeNextCraftAction(opts: {
     const ing = recipeInfo.ingredients.map((it) => `${it.count}x ${it.name}`).join(" + ");
     const lines = [`RECIPE (from minecraft-data): produces ${recipeInfo.target}. Required ingredients: ${ing}. You MUST place EXACTLY this set into the craft grid -- placing extras of one ingredient and missing another yields nothing.`];
     if (opts.knownSlots && opts.knownSlots.length > 0) {
+      // Match Known item names against recipe ingredient names with
+      // tolerant rules: minecraft-data may call something "quartz" while
+      // the OCR sub-agent (and player vocabulary) returns
+      // "nether_quartz". Accept exact match, or one ending in
+      // "_<other>", or one containing the other as a whole word.
+      const matchKnown = (ing: string) => opts.knownSlots!.find((k) => {
+        if (k.item === ing) return true;
+        if (k.item.endsWith("_" + ing) || ing.endsWith("_" + k.item)) return true;
+        return false;
+      });
       const sources: Array<{ ingredient: string; count: number; slot: number; name?: string } | { ingredient: string; count: number; slot: null }> = [];
       for (const it of recipeInfo.ingredients) {
-        const found = opts.knownSlots.find((k) => k.item === it.name);
+        const found = matchKnown(it.name);
         if (found) sources.push({ ingredient: it.name, count: it.count, slot: found.index, name: found.name });
         else sources.push({ ingredient: it.name, count: it.count, slot: null });
       }
