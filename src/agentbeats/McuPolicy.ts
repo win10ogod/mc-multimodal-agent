@@ -28,7 +28,7 @@ import { probeNextCraftAction, vlmVerifySlotState } from "./tools/InventoryProbe
 import { detectCursorWithExpectation, detectGuiLayout, samplePatchFingerprint } from "./tools/SlotDetector";
 import { getDebugRecorder } from "./tools/DebugRecorder";
 import { dispatchObservation } from "./agents/Dispatcher";
-import type { EpisodeState, SubAgent, SubAgentKind, SubAgentStep } from "./agents/SubAgent";
+import type { EpisodeState, SubAgent, SubAgentKind } from "./agents/SubAgent";
 import { makeEpisodeState } from "./agents/SubAgent";
 import { createWorldExplorer } from "./agents/subagents/WorldExplorer";
 import { createMining } from "./agents/subagents/Mining";
@@ -1075,10 +1075,24 @@ export class McuVisualPolicy {
               if (queue.length === 0) {
                 console.warn(`[agentbeats] verify_slots: no resolvable slots in [${probed.slots.join(",")}]; skipping`);
               } else {
-                const { TooltipOCR } = { TooltipOCR: (await import("./tools/TooltipOCR")) };
-                console.log(`[agentbeats] verify_slots batch=${queue.length} slots=${queue.map((q) => `${q.slot}(${q.name ?? "?"})`).join(",")}`);
-                const results = await Promise.all(queue.map((q) =>
-                  TooltipOCR.readTooltip({
+                const SlotPerception = await import("./tools/SlotPerception");
+                // CV fast-path: if a slot's patch looks visually empty
+                // (uniform low-stddev background), skip the perception
+                // LLM call. ~half the verify_slots batches are wasted
+                // on slots the agent over-eagerly listed.
+                const decided: Array<{ q: typeof queue[0]; r: { item: string } }> = [];
+                const needLlm: typeof queue = [];
+                for (const q of queue) {
+                  const patch = samplePatchFingerprint(payload.obs, q.x, q.y, 6);
+                  if (patch && patch.stddev < 25) {
+                    decided.push({ q, r: { item: "empty" } });
+                  } else {
+                    needLlm.push(q);
+                  }
+                }
+                console.log(`[agentbeats] verify_slots batch=${queue.length} cv_empty=${decided.length} llm=${needLlm.length} slots=${queue.map((q) => `${q.slot}(${q.name ?? "?"})`).join(",")}`);
+                const llmResults = await Promise.all(needLlm.map((q) =>
+                  SlotPerception.perceiveSlot({
                     client: this.client,
                     model: this.config.openai.model,
                     obsBase64: payload.obs ?? "",
@@ -1086,6 +1100,7 @@ export class McuVisualPolicy {
                     slotName: q.name,
                   }).then((r) => ({ q, r }))
                 ));
+                const results = [...decided, ...llmResults];
                 for (const { q, r } of results) {
                   plan.slotMemory.record(q.x, q.y, r.item, plan.iteration);
                   console.log(`[agentbeats] slot_id slot=${q.slot}(${q.name ?? "?"}) -> ${r.item}`);

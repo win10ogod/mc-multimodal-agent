@@ -1,25 +1,18 @@
 /**
- * Slot-content identifier sub-agent.
+ * Slot perception sub-agent.
  *
- * Earlier this was a tooltip-OCR design that required hovering the
- * cursor over each slot so MC would render a tooltip. That had two
- * unfixable failure modes: (1) cursor servo precision could not reliably
- * land on the right slot when slots are 18 px apart, so MC would render
- * the *neighbor's* tooltip and we'd record memory for the wrong slot;
- * (2) every slot inspected was a full hover round-trip (N policy ticks)
- * which dominated long-horizon cost.
- *
- * The new design: crop a zoomed-in patch around each requested slot's
- * pixel center and ask the VLM "what item is in this slot?" directly.
- * No cursor movement, no tooltip dependency, no timing race. We can
- * batch all crops from a single obs frame and run the OCR calls in
- * parallel for the whole verify_slots batch.
+ * For each requested slot the runtime crops the slot's BBOX (with a
+ * small outer margin so the slot frame is visible) from the current
+ * obs frame, upscales it for legibility, and asks the VLM "what item
+ * is in this slot?". No cursor movement, no tooltip dependency, no
+ * timing race. All slots in a verify_slots batch run in parallel
+ * from a single obs frame.
  */
 import type OpenAI from "openai";
 import * as fs from "node:fs";
 import * as path from "node:path";
 
-export type SlotIdOpts = {
+export type SlotPerceptionOpts = {
   client: OpenAI;
   model: string;
   obsBase64: string;
@@ -29,11 +22,11 @@ export type SlotIdOpts = {
   slotName?: string;
 };
 
-export type SlotIdResult = { item: string };
+export type SlotPerceptionResult = { item: string };
 
-const SYSTEM_PROMPT = `You are a Minecraft slot-content identifier sub-agent.
+const SYSTEM_PROMPT = `You are a Minecraft slot perception sub-agent.
 
-You are shown a small ZOOMED-IN crop of one inventory slot from a Minecraft GUI. Identify the item icon visible in the slot.
+You are shown a small ZOOMED-IN crop of one inventory slot from a Minecraft GUI. The slot's full bounding box is visible with a small outer margin (you can see the slot frame). Identify the item icon in the slot.
 
 STRICT RULES:
 - Return JSON: {"item": "<snake_case_identifier>"}.
@@ -42,16 +35,16 @@ STRICT RULES:
 - If the icon is too small / blurry / ambiguous to identify: {"item": "unknown"}.
 - Do NOT add markdown fences, do NOT add commentary. Output ONLY the JSON object.`;
 
-const ZOOM = 4; // 4x upscale so the LLM sees a ~64x64 slot icon clearly
-const SRC_W = 18;
-const SRC_H = 18;
+const ZOOM = 6; // upscale so the LLM sees a clear ~150 px crop
+const SRC_W = 26; // slot bbox (~18 px) + small outer margin
+const SRC_H = 26;
 
-export async function readTooltip(opts: SlotIdOpts): Promise<SlotIdResult> {
+export async function perceiveSlot(opts: SlotPerceptionOpts): Promise<SlotPerceptionResult> {
   let cropB64 = opts.obsBase64;
   try {
     cropB64 = cropAndZoomSlot(opts.obsBase64, opts.slotPos.x, opts.slotPos.y);
   } catch (e) {
-    console.warn(`[slot-id] crop failed (${e instanceof Error ? e.message : String(e)}); falling back to full frame`);
+    console.warn(`[slot-perception] crop failed (${e instanceof Error ? e.message : String(e)}); falling back to full frame`);
   }
   const url = cropB64.startsWith("data:image/")
     ? cropB64
@@ -78,10 +71,10 @@ export async function readTooltip(opts: SlotIdOpts): Promise<SlotIdResult> {
     raw = (resp as unknown as { choices?: Array<{ message?: { content?: string } }> })
       .choices?.[0]?.message?.content ?? "";
   } catch (e) {
-    console.warn(`[slot-id] LLM call failed: ${e instanceof Error ? e.message : String(e)}`);
+    console.warn(`[slot-perception] LLM call failed: ${e instanceof Error ? e.message : String(e)}`);
     return { item: "unknown" };
   }
-  const parsed: SlotIdResult = (() => {
+  const parsed: SlotPerceptionResult = (() => {
     const cleanedRaw = raw.trim().replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "");
     try {
       const obj = JSON.parse(cleanedRaw) as Record<string, unknown>;
@@ -91,30 +84,27 @@ export async function readTooltip(opts: SlotIdOpts): Promise<SlotIdResult> {
         : "unknown";
       return { item };
     } catch {
-      // Loose match if model didn't follow JSON.
       const m = cleanedRaw.toLowerCase().match(/[a-z][a-z0-9_]+/);
       return { item: m ? m[0] : "unknown" };
     }
   })();
-  // Persist debug crops directly (no DebugRecorder, which would re-swap
-  // the R/B channels of our already-correct PNG and produce BGR output).
   const debugDir = process.env.AGENTBEATS_DEBUG_DIR;
   if (debugDir) {
     try {
       const seq = String(++DEBUG_SEQ).padStart(5, "0");
-      const fname = `${seq}_slot_id.png`;
+      const fname = `${seq}_perception.png`;
       const pngBytes = Buffer.from(cropB64, "base64");
       fs.writeFileSync(path.join(debugDir, fname), pngBytes);
       const line = JSON.stringify({
         seq: DEBUG_SEQ,
         ts: new Date().toISOString(),
-        type: "slot_id",
+        type: "perception",
         imageFile: fname,
         data: { slotPos: opts.slotPos, slotName: opts.slotName, raw, parsed },
       });
       fs.appendFileSync(path.join(debugDir, "events.jsonl"), line + "\n");
     } catch (e) {
-      console.warn(`[slot-id] debug write failed: ${e instanceof Error ? e.message : String(e)}`);
+      console.warn(`[slot-perception] debug write failed: ${e instanceof Error ? e.message : String(e)}`);
     }
   }
   return parsed;
@@ -134,15 +124,14 @@ function cropAndZoomSlot(obsBase64: string, slotX: number, slotY: number): strin
   const decoded = jpegLib.decode(inBuf, { useTArray: true, formatAsRGBA: true });
   const w = decoded.width as number;
   const h = decoded.height as number;
-  // Source crop window centered on the slot.
   const sx0 = Math.max(0, Math.min(w - SRC_W, Math.round(slotX) - Math.floor(SRC_W / 2)));
   const sy0 = Math.max(0, Math.min(h - SRC_H, Math.round(slotY) - Math.floor(SRC_H / 2)));
   const outW = SRC_W * ZOOM;
   const outH = SRC_H * ZOOM;
   const out = new PNG({ width: outW, height: outH });
   // Nearest-neighbor upscale + R/B swap (MC sim outputs BGR-encoded
-  // JPEG; jpeg-js with formatAsRGBA returns the bytes in BGR order, so
-  // we swap channels here once so the LLM sees true colors).
+  // JPEG; jpeg-js with formatAsRGBA returns the bytes in BGR order,
+  // so we swap channels here once so the LLM sees true colors).
   for (let oy = 0; oy < outH; oy += 1) {
     const sy = sy0 + Math.floor(oy / ZOOM);
     for (let ox = 0; ox < outW; ox += 1) {
