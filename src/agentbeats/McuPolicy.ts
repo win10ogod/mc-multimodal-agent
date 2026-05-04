@@ -945,13 +945,12 @@ export class McuVisualPolicy {
           // time we know the cursor is empty (initial park).
           const PARK_X = layout.windowX + 4;
           const PARK_Y = layout.windowY + 4;
-          const cursorAtPark = !!cursor && Math.hypot(cursor.x - PARK_X, cursor.y - PARK_Y) < 6;
-          // Held-item icon renders ~+4..+12 px right and down from
-          // cursor tip. Sample a small patch in that offset region.
+          // Tolerance must match the park-step's own 12-px arrival
+          // gate -- park rarely lands within 6 px because cam moves
+          // are quantized.
+          const cursorAtPark = !!cursor && Math.hypot(cursor.x - PARK_X, cursor.y - PARK_Y) < 14;
           const HELD_OFF_X = 7;
           const HELD_OFF_Y = 9;
-          const heldSampleX = (cursor?.x ?? PARK_X) + HELD_OFF_X;
-          const heldSampleY = (cursor?.y ?? PARK_Y) + HELD_OFF_Y;
           const cursorHolding: boolean | null = (() => {
             // Baseline capture at first park (cursor is empty there).
             if (cursorAtPark && plan.parkEmptyBaseline === null) {
@@ -962,9 +961,7 @@ export class McuVisualPolicy {
               }
               return false;
             }
-            // Baseline-compare path: only valid when cursor is at park
-            // (the held-item region is then at PARK + HELD_OFF, where
-            // the baseline was sampled).
+            // Compare live park patch to baseline (most reliable).
             if (cursorAtPark && plan.parkEmptyBaseline) {
               const live = samplePatchFingerprint(payload.obs, PARK_X + HELD_OFF_X, PARK_Y + HELD_OFF_Y, 4);
               if (live) {
@@ -976,19 +973,14 @@ export class McuVisualPolicy {
                   return true;
                 }
                 if (dist < 12) return false;
+                console.log(`[agentbeats] cursorHolding=null (park-held dist=${dist.toFixed(1)} ambiguous)`);
+                return null;
               }
             }
-            // Cursor not at park (mid-chain): sample the held-item
-            // offset region away from the cursor arrow. Strict bounds
-            // because we cannot tell if the offset lands on a slot
-            // icon (false positive risk).
-            if (cursor) {
-              const patch = samplePatchFingerprint(payload.obs, heldSampleX, heldSampleY, 4);
-              if (patch) {
-                if (patch.stddev > 60) return true;
-                if (patch.stddev < 8) return false;
-              }
-            }
+            // Cursor not at park OR no baseline yet -> we cannot decide
+            // reliably. Returning null tells the prompt "UNKNOWN" rather
+            // than guessing from cursor-pixel stddev (which routinely
+            // false-positives on inventory slot icons).
             return null;
           })();
           try {
