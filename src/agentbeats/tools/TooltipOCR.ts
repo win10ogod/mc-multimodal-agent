@@ -26,20 +26,23 @@ export type TooltipOCROpts = {
 
 const SYSTEM_PROMPT = `You are an OCR-only sub-agent for Minecraft tooltips.
 
-You are shown a SMALL CROPPED REGION around the player's cursor. If a Minecraft tooltip box (a dark rectangle with white item name text floating near the cursor) is visible IN THIS CROP, read the item name line.
+You are shown a SMALL CROPPED REGION around the player's cursor. The crop also contains CYAN NUMBERED BADGES drawn at the corner of each slot (e.g. "40", "41"). If a Minecraft tooltip box (a dark rectangle with white item name text floating near the cursor) is visible IN THIS CROP, the tooltip belongs to whichever slot the cursor is currently OVER -- read the slot's cyan badge number AND the item name from the tooltip.
 
 STRICT RULES:
-- If you see a clear floating tooltip box with readable text, return the item identifier in snake_case (e.g. "Cobblestone" -> cobblestone, "Nether Quartz" -> nether_quartz, "Oak Planks" -> oak_planks).
-- If the crop shows only a slot icon with NO floating tooltip text box visible -> return exactly: empty
-- If the crop is too blurry / text is unreadable -> return exactly: unknown
-- NEVER guess from the slot icon alone. NEVER infer from window labels. NEVER make up an item name. Only return a name if you can READ the tooltip text letter by letter.
+- If you can read both the slot's cyan badge AND a clear tooltip item name, return JSON: {"slot": <integer>, "item": "<snake_case_item>"} (e.g. {"slot": 42, "item": "cobblestone"}).
+- If the crop shows only a slot icon with NO floating tooltip text box visible: {"slot": <integer or null>, "item": "empty"}.
+- If you cannot identify the slot badge OR the tooltip text is unreadable: {"slot": null, "item": "unknown"}.
+- NEVER guess the item from the slot icon alone. NEVER infer from window labels. Only return an item name if you can READ the tooltip text letter by letter.
+- Item names: "Cobblestone" -> cobblestone, "Nether Quartz" -> nether_quartz, "Oak Planks" -> oak_planks, "Crafting Table" -> crafting_table.
 
-Output exactly one token. No quotes. No commentary.`;
+Output exactly one JSON object. No commentary, no markdown fences.`;
 
 const CROP_W = 140;
 const CROP_H = 70;
 
-export async function readTooltip(opts: TooltipOCROpts): Promise<string> {
+export type TooltipOCRResult = { slot: number | null; item: string };
+
+export async function readTooltip(opts: TooltipOCROpts): Promise<TooltipOCRResult> {
   // Crop the obs frame to a band centered on the cursor pos. MC tooltips
   // render to the right + below cursor, so anchor the crop's top-left at
   // (cursor.x - 20, cursor.y - 20) -- gives us 20px to the left of the
@@ -76,18 +79,36 @@ export async function readTooltip(opts: TooltipOCROpts): Promise<string> {
       .choices?.[0]?.message?.content ?? "";
   } catch (e) {
     console.warn(`[tooltip-ocr] LLM call failed: ${e instanceof Error ? e.message : String(e)}`);
-    return "unknown";
+    return { slot: null, item: "unknown" };
   }
-  const out = raw.trim().toLowerCase().replace(/[^a-z0-9_]/g, "");
+  // Parse the JSON {slot, item} response. Tolerate stray whitespace and
+  // accidental markdown fences.
+  const parsed: TooltipOCRResult = (() => {
+    const cleanedRaw = raw.trim().replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "");
+    try {
+      const obj = JSON.parse(cleanedRaw) as Record<string, unknown>;
+      const slotRaw = obj.slot;
+      const itemRaw = obj.item;
+      const slot = typeof slotRaw === "number" && Number.isFinite(slotRaw) ? Math.round(slotRaw) : null;
+      const item = typeof itemRaw === "string"
+        ? itemRaw.trim().toLowerCase().replace(/[^a-z0-9_]/g, "") || "unknown"
+        : "unknown";
+      return { slot, item };
+    } catch {
+      // Tolerate the legacy "just an item word" output if the model slips.
+      const fallback = cleanedRaw.toLowerCase().replace(/[^a-z0-9_]/g, "");
+      return { slot: null, item: fallback || "unknown" };
+    }
+  })();
   // Debug: persist the crop + the raw response so we can audit OCR errors.
   const dbg = getDebugRecorder();
   if (dbg.isEnabled()) {
     dbg.record({
       type: "tooltip_ocr",
-      data: { slotPos: opts.slotPos, raw, parsed: out || "unknown" },
+      data: { slotPos: opts.slotPos, raw, parsed },
     }, croppedB64, "png");
   }
-  return out || "unknown";
+  return parsed;
 }
 
 async function cropToCursor(obsBase64: string, cursorX: number, cursorY: number): Promise<string> {

@@ -830,16 +830,34 @@ export class McuVisualPolicy {
               const { TooltipOCR } = { TooltipOCR: (await import("./tools/TooltipOCR")) };
               const target = plan.pendingTooltipRead;
               try {
-                const item = await TooltipOCR.readTooltip({
+                const ocr = await TooltipOCR.readTooltip({
                   client: this.client,
                   model: this.config.openai.model,
                   obsBase64: payload.obs ?? "",
                   slotPos: { x: target.x, y: target.y },
                 });
-                plan.slotMemory.record(target.x, target.y, item, plan.iteration);
-                state.closedLoopHistory.unshift(`tooltip slot=${target.slotIndex}(${item})`);
+                // OCR can also report which SoM-badge slot the cursor is
+                // actually over, since tooltip belongs to whichever slot
+                // the cursor lands on -- not necessarily the slot we
+                // ASKED for (cursor may have settled on a neighbor edge).
+                // Trust the OCR-reported slot when valid; that is the
+                // physical slot whose item we just read. Fall back to
+                // the original target only if OCR didn't report a slot.
+                let recordX = target.x;
+                let recordY = target.y;
+                let resolvedSlot: number = target.slotIndex;
+                if (ocr.slot != null) {
+                  const corrected = layout.slots[ocr.slot];
+                  if (corrected) {
+                    recordX = corrected.cx;
+                    recordY = corrected.cy;
+                    resolvedSlot = ocr.slot;
+                  }
+                }
+                plan.slotMemory.record(recordX, recordY, ocr.item, plan.iteration);
+                state.closedLoopHistory.unshift(`tooltip slot=${resolvedSlot}(${ocr.item})${ocr.slot != null && ocr.slot !== target.slotIndex ? ` [cursor on neighbor; intended ${target.slotIndex}]` : ""}`);
                 state.closedLoopHistory = state.closedLoopHistory.slice(0, 5);
-                console.log(`[agentbeats] tooltip OCR slot=${target.slotIndex} pos=(${target.x},${target.y}) -> ${item}`);
+                console.log(`[agentbeats] tooltip OCR intended_slot=${target.slotIndex} ocr_slot=${ocr.slot ?? "?"} pos=(${recordX},${recordY}) -> ${ocr.item}`);
               } catch (e) {
                 console.warn(`[agentbeats] tooltip OCR failed: ${e instanceof Error ? e.message : String(e)}`);
               }
