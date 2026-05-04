@@ -861,6 +861,7 @@ export class McuVisualPolicy {
                     phase: "servo", retries: 0, kind: "hover" as "click",
                     actionKind: "pickup" as "pickup",
                   };
+                  plan.servoSteps = 0;     // critical: new servo starts fresh, not under prior cap
                   plan.skipNextPark = true;
                   plan.pendingTooltipRead = { slotIndex: next.slot, x: next.x, y: next.y, slotName: next.name };
                   console.log(`[agentbeats] verify_slots OCR advance idx=${plan.pendingOcrBatch.idx}/${plan.pendingOcrBatch.slots.length} slot=${next.slot}`);
@@ -877,6 +878,7 @@ export class McuVisualPolicy {
                   phase: "servo", retries: 0, kind: "hover" as "click",
                   actionKind: "pickup" as "pickup",
                 };
+                plan.servoSteps = 0;
                 plan.skipNextPark = true;
                 plan.pendingOcrBatch.parking = true;
                 console.log(`[agentbeats] verify_slots OCR done; servoing cursor to park (${parkSpot.x},${parkSpot.y})`);
