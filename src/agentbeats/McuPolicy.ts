@@ -1350,7 +1350,11 @@ export class McuVisualPolicy {
                 state.closedLoopHistory.unshift(`hover slot=${pc.rasterIndex}${pc.slotName ? `(${pc.slotName})` : ""} done`);
                 state.closedLoopHistory = state.closedLoopHistory.slice(0, 5);
                 plan.pendingClick = null;
-                return emit(defaultMcuAction(), 2);
+                // Hold for several frames so MC has time to actually
+                // render the tooltip box before we capture the next obs
+                // for OCR. Two frames was not enough -- tooltip didn't
+                // appear and OCR returned "empty" for non-empty slots.
+                return emit(defaultMcuAction(), 8);
               }
               if (stepResult) {
                 // servoCursorStep can return click=true with the button
