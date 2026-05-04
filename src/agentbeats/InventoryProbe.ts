@@ -12,7 +12,7 @@
  */
 import type OpenAI from "openai";
 import { markInventoryFrame } from "./SlotMarker";
-import type { GuiLayout } from "./SlotDetector";
+import { samplePatchFingerprint, type GuiLayout } from "./SlotDetector";
 
 // Hotbar slot pixel centers when the inventory GUI is open at 640x360 obs.
 // Mirrors the SLOT.hotbarX0/Dx/Y constants in UiFastControl.
@@ -109,16 +109,37 @@ export async function probeHotbar(opts: {
  *  each visible slot's raster index and (when known) its semantic role.
  *  This replaces the previous hard-coded "0..8 = hotbar" mapping which
  *  only worked for one specific GUI numbering scheme. */
-function buildSlotDescription(layout: GuiLayout): string {
+/** Build a textual slot listing annotated with CV-detected fill state
+ *  (`*` = filled, `.` = empty). Lets the VLM pick a known-empty
+ *  destination slot when storing crafted output instead of accidentally
+ *  picking the source slot (which was just refilled by auto-return) and
+ *  triggering an item swap. */
+function buildSlotDescription(layout: GuiLayout, jpegBase64?: string): string {
+  // Sample a 12x12 patch at every slot center to classify filled/empty.
+  // Threshold matches the verify check in McuPolicy: stddev > 35 = filled.
+  const fillByIndex = new Map<number, "filled" | "empty">();
+  if (jpegBase64) {
+    for (const s of layout.slots) {
+      const patch = samplePatchFingerprint(jpegBase64, s.cx, s.cy, 12);
+      if (!patch) continue;
+      fillByIndex.set(s.index, patch.stddev > 35 ? "filled" : "empty");
+    }
+  }
+  const tag = (i: number): string => {
+    const f = fillByIndex.get(i);
+    if (f === "filled") return `${i}*`;
+    if (f === "empty") return `${i}.`;
+    return `${i}`;
+  };
+
   const lines: string[] = [
-    `${layout.slots.length} slots are marked on the image with yellow numbered badges (raster order).`,
+    `${layout.slots.length} slots are marked on the image with yellow numbered badges (raster order). Fill state: '*' = slot has an item, '.' = slot is empty.`,
   ];
   if (layout.matchedLayoutId) {
     lines.push(`Detected GUI: ${layout.matchedLayoutId}.`);
   } else {
     lines.push(`Detected GUI: unknown — slots numbered in raster order.`);
   }
-  // Group slots by role for compact listing.
   const byRole = new Map<string, number[]>();
   const anonymous: number[] = [];
   for (const s of layout.slots) {
@@ -131,10 +152,10 @@ function buildSlotDescription(layout: GuiLayout): string {
     }
   }
   for (const [role, idxs] of byRole) {
-    lines.push(`  role=${role}: indices ${idxs.join(", ")}`);
+    lines.push(`  role=${role}: ${idxs.map(tag).join(", ")}`);
   }
   if (anonymous.length > 0) {
-    lines.push(`  unrecognized slots: indices ${anonymous.join(", ")}`);
+    lines.push(`  unrecognized slots: ${anonymous.map(tag).join(", ")}`);
   }
   return lines.join("\n");
 }
@@ -211,7 +232,7 @@ export async function probeNextCraftAction(opts: {
       ? "CURSOR IS EMPTY (CV-detected)."
       : "CURSOR STATE UNKNOWN.";
   const sourceLine = opts.pickupSourceSlot
-    ? `Original pickup source slot: index ${opts.pickupSourceSlot.index}${opts.pickupSourceSlot.name ? ` (${opts.pickupSourceSlot.name})` : ""}. Return leftover ingredients to THIS slot.`
+    ? `Original ingredient source slot: index ${opts.pickupSourceSlot.index}${opts.pickupSourceSlot.name ? ` (${opts.pickupSourceSlot.name})` : ""}. The tool already returns leftover ingredient back to this slot automatically -- do NOT use it as a destination for the crafted result; pick a DIFFERENT empty slot (look for a "." mark in the slot listing) for the result.`
     : "No pickup source recorded yet.";
 
   const promptText = [
@@ -219,7 +240,7 @@ export async function probeNextCraftAction(opts: {
     "",
     `The image has YELLOW NUMBERED BADGES drawn at the corner of each slot.`,
     `Use the visible numbers to choose a slot. Pick the index of the slot you mean.`,
-    buildSlotDescription(detectedLayout),
+    buildSlotDescription(detectedLayout, opts.obsBase64),
     "",
     `State:`,
     `  ${cursorState}`,

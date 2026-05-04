@@ -796,6 +796,21 @@ export class McuVisualPolicy {
               const toSlot = layoutForProbe.slots[probed.to];
               if (!fromSlot || !toSlot) {
                 console.warn(`[agentbeats] move from=${probed.from} to=${probed.to}: slot(s) not in layout (have ${layoutForProbe.slots.length}); skipping`);
+              } else if (
+                plan.pickupSourceSlot
+                && plan.pickupSourceSlot.name
+                && toSlot.name === plan.pickupSourceSlot.name
+                && fromSlot.name !== plan.pickupSourceSlot.name
+              ) {
+                // Hard guard: VLM is asking to dump cursor contents into
+                // the slot we just refilled with the original ingredient
+                // via auto-return. This always triggers an item swap
+                // (e.g. crafted planks <-> log stack). Refuse and force
+                // the VLM to pick a different empty slot. Exception:
+                // a self-move (from==to) is the legit auto-return itself.
+                console.warn(`[agentbeats] move to=${probed.to}(${toSlot.name}) refused: that's the recorded pickup source slot which still holds the original ingredient -- placing here would swap items. Reprobe`);
+                state.closedLoopHistory.unshift(`refused move to=${probed.to}(${toSlot.name}) (would swap with returned ingredient stack)`);
+                state.closedLoopHistory = state.closedLoopHistory.slice(0, 5);
               } else {
                 const mkClick = (s: { index: number; name?: string; role?: string; cx: number; cy: number }, button: "attack" | "use", expectAfter: "should_empty" | "should_fill", actionKind: "pickup" | "place_one" | "place_all" | "take", kind: "click" | "auto_return"): import("./UiFastControl").PendingClick => ({
                   rasterIndex: s.index, slotName: s.name, slotRole: s.role,
