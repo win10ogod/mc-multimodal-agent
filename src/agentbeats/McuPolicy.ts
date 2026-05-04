@@ -374,7 +374,7 @@ export function taskSpecificGuidance(taskText: string): string {
     case "crafting":
       return [
         "Task strategy: ingredients (and a crafting_table item if needed) are pre-given in inventory.",
-        "Done condition: the task is complete ONLY when the requested crafted ITEM is visible in your INVENTORY (main inventory or hotbar). Recipe completion alone is not enough -- the result must be moved into your inventory and verified visually before you set task_done=true.",
+        "DONE CONDITION (CRITICAL): set task_done=true ONLY when the requested crafted item is VISIBLE in your MAIN INVENTORY GRID or HOTBAR row. The result slot inside the crafting GUI does NOT count -- the item is not yours until you take it out AND store it in an inventory slot. A common mistake: seeing oak_planks appear in the small result slot to the right of the 2x2 grid and immediately declaring done. That is wrong -- the planks must be moved into a real inventory slot first. If you only see the item in the result slot, keep working: take it out and place it in the inventory.",
         "Open inventory ONCE with inventory=1 (single frame); after it is open, do NOT press inventory again until you are done — repeated inventory presses just toggle the GUI off and waste steps.",
         "IMPORTANT: a CV-driven UI helper takes over cursor control automatically when the inventory is open for handled 2x2 recipes (oak_planks, crafting_table). Manual VLM cursor control runs at ~3% success rate. If the inventory is open and the helper is operating, emit a NO-OP action (no buttons pressed, camera=[0,0]) so the helper can run uninterrupted; do NOT issue camera deltas yourself.",
         "For 3x3 recipes (furnace, cake, enchanting_table, ladder, bell, diorite, clock, bee_nest, stonecut): you must FIRST place the crafting_table block in the world. Select the hotbar slot holding the crafting_table, tilt camera down so a clear ground tile is centered, use=1 to place it, then use=1 again on the placed block to open the 3x3 GUI before placing ingredients.",
@@ -774,8 +774,16 @@ export class McuVisualPolicy {
               plan.sessionLayout = null;
               plan.layoutHint = null;
             } else if (probed.action === "done") {
-              console.log(`[agentbeats] closed-loop probe says done reason=${probed.reason ?? ""}`);
-              plan.done = true;
+              // The closed-loop probe is too imprecise to judge task
+              // completion (it routinely hallucinates that the result
+              // is already in the hotbar). Ignore "done" entirely;
+              // only the regular VLM (with task_done in its action
+              // schema) is allowed to declare completion. Closed-loop
+              // keeps iterating until the iteration cap is hit, after
+              // which control falls through to the regular VLM.
+              console.log(`[agentbeats] closed-loop probe said done -- IGNORED (only the regular VLM decides task completion via task_done)`);
+              state.closedLoopHistory.unshift(`probe done ignored; keep planning the next move`);
+              state.closedLoopHistory = state.closedLoopHistory.slice(0, 5);
             } else if (probed.action === "fallback_manual") {
               console.log(`[agentbeats] closed-loop probe says fallback_manual reason=${probed.reason ?? ""} -- handing control to manual LLM cursor`);
               plan.done = true;
