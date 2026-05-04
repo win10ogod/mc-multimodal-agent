@@ -320,94 +320,71 @@ export async function probeNextCraftAction(opts: {
       opts.knownSlots.map((k) => `  slot ${k.index}${k.name ? `(${k.name})` : ""} = ${k.item} (read ${k.ageIters} iters ago)`).join("\n")
     : null;
 
-  // Recipe hint: cross-reference required ingredients with the known
-  // slots so we can tell the agent EXACTLY which slot to draw each
-  // ingredient from. When all ingredient sources are identified, also
-  // emit an explicit per-placement plan -- the agent's job becomes
-  // executing one labeled step at a time rather than reasoning about
-  // alternation. This eliminates the "kept placing only cobblestone"
-  // failure mode for multi-ingredient recipes.
+  // Recipe hint: present ingredients + (when present) the recipe's
+  // grid pattern in semantic Row/Col coordinates (1-indexed). The LLM
+  // handles the ingredient name -> Known slot mapping itself --
+  // rule-based string matching is fragile (e.g. "quartz" vs
+  // "nether_quartz" naming variants) and the LLM does this trivially.
   const recipeHint = (() => {
     if (!recipeInfo) return null;
     const ing = recipeInfo.ingredients.map((it) => `${it.count}x ${it.name}`).join(" + ");
     const lines = [`RECIPE (from minecraft-data): produces ${recipeInfo.target}. Required ingredients: ${ing}. You MUST place EXACTLY this set into the craft grid -- placing extras of one ingredient and missing another yields nothing.`];
-    if (opts.knownSlots && opts.knownSlots.length > 0) {
-      // Match Known item names against recipe ingredient names with
-      // tolerant rules: minecraft-data may call something "quartz" while
-      // the OCR sub-agent (and player vocabulary) returns
-      // "nether_quartz". Accept exact match, or one ending in
-      // "_<other>", or one containing the other as a whole word.
-      const matchKnown = (ing: string) => opts.knownSlots!.find((k) => {
-        if (k.item === ing) return true;
-        if (k.item.endsWith("_" + ing) || ing.endsWith("_" + k.item)) return true;
-        return false;
-      });
-      const sources: Array<{ ingredient: string; count: number; slot: number; name?: string } | { ingredient: string; count: number; slot: null }> = [];
-      for (const it of recipeInfo.ingredients) {
-        const found = matchKnown(it.name);
-        if (found) sources.push({ ingredient: it.name, count: it.count, slot: found.index, name: found.name });
-        else sources.push({ ingredient: it.name, count: it.count, slot: null });
+
+    const craftSlots = detectedLayout.slots.filter((s) => s.role === "craft_2x2" || s.role === "craft_3x3");
+    const gridCols = craftSlots.length === 9 ? 3 : (craftSlots.length === 4 ? 2 : 0);
+    const gridRows = craftSlots.length === 9 ? 3 : (craftSlots.length === 4 ? 2 : 0);
+    if (gridCols > 0) {
+      lines.push(`Craft grid: ${gridRows} rows x ${gridCols} cols. Cells are 1-indexed row-major (Row 1 Col 1 is top-left).`);
+      // Map Row/Col -> raster slot index so the LLM can resolve the
+      // semantic position to a slot number when it issues "move".
+      const cellLines: string[] = [];
+      for (let r = 0; r < gridRows; r += 1) {
+        for (let c = 0; c < gridCols; c += 1) {
+          const cell = craftSlots[r * gridCols + c];
+          if (cell) cellLines.push(`  Row ${r + 1} Col ${c + 1} = slot ${cell.index}${cell.name ? `(${cell.name})` : ""}`);
+        }
       }
-      lines.push("Source slots for each required ingredient:");
-      for (const s of sources) {
-        if (s.slot != null) lines.push(`  - ${s.count}x ${s.ingredient}: take from slot ${s.slot}${s.name ? `(${s.name})` : ""}`);
-        else lines.push(`  - ${s.count}x ${s.ingredient}: NOT yet identified in Known -- emit verify_slots over candidate inventory slots first`);
-      }
-      // Emit an explicit per-step placement plan when all sources are
-      // identified AND the craft grid has enough cells. Two cases:
-      //   (a) recipe.inShape != null -> SHAPED. Map each non-null cell
-      //       in inShape to a craft slot in row-major order; fill that
-      //       cell from the matching ingredient's source slot.
-      //   (b) shapeless -> round-robin interleave through ingredients,
-      //       walking craft slots in raster order (Z direction).
-      const allKnown = sources.every((s) => s.slot != null);
-      const craftSlots = detectedLayout.slots.filter((s) => s.role === "craft_2x2" || s.role === "craft_3x3");
-      const totalNeeded = recipeInfo.ingredients.reduce((acc, it) => acc + it.count, 0);
-      if (allKnown && craftSlots.length >= totalNeeded) {
-        const placements: Array<{ ingredient: string; from: number; fromName?: string; to: number; toName?: string }> = [];
-        if (recipeInfo.inShape) {
-          // Shaped: walk inShape row-major; map each non-null cell to
-          // the i-th craft slot. inShape rows match the craft grid's
-          // top-to-bottom rows; cells match left-to-right.
-          const rows = recipeInfo.inShape;
-          const gridCols = craftSlots.length === 9 ? 3 : (craftSlots.length === 4 ? 2 : Math.max(...rows.map((r) => r.length)));
-          for (let r = 0; r < rows.length; r += 1) {
-            for (let c = 0; c < rows[r].length; c += 1) {
-              const ing = rows[r][c];
-              if (!ing) continue;
-              const slotIdxInGrid = r * gridCols + c;
-              const cell = craftSlots[slotIdxInGrid];
-              if (!cell) continue;
-              const src = sources.find((s) => s.ingredient === ing) as { slot: number; name?: string } | undefined;
-              if (!src) continue;
-              placements.push({ ingredient: ing, from: src.slot, fromName: src.name, to: cell.index, toName: cell.name });
-            }
-          }
-        } else {
-          // Shapeless: round-robin interleave through ingredients.
-          const queues: Array<{ ingredient: string; slot: number; name?: string; remaining: number }> = sources.map((s) => ({
-            ingredient: s.ingredient, slot: (s as { slot: number }).slot, name: (s as { name?: string }).name, remaining: s.count,
-          }));
-          let ci = 0;
-          while (queues.some((q) => q.remaining > 0)) {
-            const q = queues[ci % queues.length];
-            if (q.remaining > 0) {
-              const cell = craftSlots[placements.length];
-              placements.push({ ingredient: q.ingredient, from: q.slot, fromName: q.name, to: cell.index, toName: cell.name });
-              q.remaining -= 1;
-            }
-            ci += 1;
+      lines.push(...cellLines);
+    }
+
+    // Placement plan: always emit when we have a craft grid. For shaped
+    // recipes, follow the recipe's inShape exactly; for shapeless, walk
+    // cells in raster order interleaving ingredients.
+    if (gridCols > 0) {
+      const plan: Array<{ ingredient: string; row: number; col: number }> = [];
+      if (recipeInfo.inShape) {
+        const rows = recipeInfo.inShape;
+        for (let r = 0; r < rows.length; r += 1) {
+          for (let c = 0; c < rows[r].length; c += 1) {
+            const ing = rows[r][c];
+            if (ing) plan.push({ ingredient: ing, row: r + 1, col: c + 1 });
           }
         }
-        if (placements.length > 0) {
-          lines.push(`Suggested placement plan (${recipeInfo.inShape ? "SHAPED" : "shapeless"}; execute one step per probe iteration; emit move{from,to,count:'one'}):`);
-          for (let i = 0; i < placements.length; i += 1) {
-            const p = placements[i];
-            lines.push(`  Step ${i + 1}: move from=${p.from}${p.fromName ? `(${p.fromName})` : ""} to=${p.to}${p.toName ? `(${p.toName})` : ""}  // place ${p.ingredient}`);
+      } else {
+        // Shapeless: round-robin over ingredients, walking cells row-major.
+        const queues = recipeInfo.ingredients.map((it) => ({ ingredient: it.name, remaining: it.count }));
+        let ci = 0;
+        let cellIdx = 0;
+        while (queues.some((q) => q.remaining > 0) && cellIdx < gridRows * gridCols) {
+          const q = queues[ci % queues.length];
+          if (q.remaining > 0) {
+            const r = Math.floor(cellIdx / gridCols) + 1;
+            const c = (cellIdx % gridCols) + 1;
+            plan.push({ ingredient: q.ingredient, row: r, col: c });
+            q.remaining -= 1;
+            cellIdx += 1;
           }
-          lines.push(`After all ${placements.length} placements, take the crafted result from the result slot.`);
-          lines.push(`Use Recent actions to count how many steps you have already executed; do NOT repeat a step that has already verified OK in Recent.`);
+          ci += 1;
         }
+      }
+      if (plan.length > 0) {
+        lines.push(`Placement plan (${recipeInfo.inShape ? "SHAPED" : "shapeless"}; execute one step per probe iteration):`);
+        for (let i = 0; i < plan.length; i += 1) {
+          const p = plan[i];
+          lines.push(`  Step ${i + 1}: place 1x ${p.ingredient} at Row ${p.row} Col ${p.col}`);
+        }
+        lines.push(`Resolve each Step by: (1) find the source slot in "Known slot contents" whose item matches the ingredient (handle naming variants like "quartz" <-> "nether_quartz"), then emit move{from=<source slot>, to=<Row/Col slot index above>, count:"one"}. After all steps, take the crafted result from the result slot.`);
+        lines.push(`Use Recent actions to count completed steps; never repeat a step that already verified OK.`);
       }
     }
     return lines.join("\n");
