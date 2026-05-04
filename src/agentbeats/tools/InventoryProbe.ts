@@ -266,18 +266,29 @@ export async function probeNextCraftAction(opts: {
     ? "(none yet)"
     : historyLines.map((a, i) => `  ${i === 0 ? "most recent" : `${i + 1} ago`}: ${a}`).join("\n");
 
-  // CV cursorHolding is the source of truth (state change is real).
-  // The logical cursorItem is just a "best guess at identity" attached
-  // when CV agrees the cursor is holding something.
-  const cursorState = opts.cursorHolding === true
-    ? (opts.cursorItem
-        ? `CURSOR IS HOLDING (CV-detected). Item identity (logical, from last successful pickup): ${opts.cursorItem}.`
-        : "CURSOR IS HOLDING (CV-detected); item identity unknown -- check Recent actions for the most recent pickup.")
-    : opts.cursorHolding === false
-      ? "CURSOR IS EMPTY (CV-detected)."
-      : opts.cursorItem
-        ? `CURSOR holding state UNKNOWN (CV undetermined); logical pickup tracked: ${opts.cursorItem} -- treat with caution.`
-        : "CURSOR STATE UNKNOWN.";
+  // CV cursorHolding is the state-change ground truth. Logical
+  // cursorItem is the best guess at identity. CONFLICT (logical says
+  // holding but CV says empty, or vice-versa) -> report UNKNOWN
+  // explicitly rather than trusting either source. Agreement adds the
+  // identity annotation.
+  const cursorState = (() => {
+    if (opts.cursorHolding === true && opts.cursorItem) {
+      return `CURSOR IS HOLDING (CV-confirmed). Item identity (last pickup): ${opts.cursorItem}.`;
+    }
+    if (opts.cursorHolding === true && !opts.cursorItem) {
+      return "CURSOR IS HOLDING (CV-confirmed); item identity unknown -- check Recent actions.";
+    }
+    if (opts.cursorHolding === false && !opts.cursorItem) {
+      return "CURSOR IS EMPTY (CV-confirmed).";
+    }
+    if (opts.cursorHolding === false && opts.cursorItem) {
+      return `CURSOR STATE UNKNOWN: CV says empty but logical pickup recorded '${opts.cursorItem}'. Conflict -- do NOT assume what cursor holds; verify before placing.`;
+    }
+    if (opts.cursorHolding == null && opts.cursorItem) {
+      return `CURSOR STATE UNKNOWN: logical pickup tracked '${opts.cursorItem}' but CV undetermined. Treat with caution.`;
+    }
+    return "CURSOR STATE UNKNOWN.";
+  })();
   const sourceLine = opts.pickupSourceSlot
     ? `Original ingredient source slot: index ${opts.pickupSourceSlot.index}${opts.pickupSourceSlot.name ? ` (${opts.pickupSourceSlot.name})` : ""}. The tool already returns leftover ingredient back to this slot automatically -- do NOT use it as a destination for the crafted result; pick a DIFFERENT empty slot (look for a "." mark in the slot listing) for the result.`
     : "No pickup source recorded yet.";
