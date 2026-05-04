@@ -530,7 +530,7 @@ export type ClosedLoopCraftPlan = {
   cursorItem: string | null;
   /** When non-null, an OCR-on-settle is expected for the next obs frame
    *  (cursor was just hovered onto a slot; tooltip should be rendered). */
-  pendingTooltipRead: { slotIndex: number; x: number; y: number; slotName?: string } | null;
+  pendingTooltipRead: { slotIndex: number; x: number; y: number; slotName?: string; retries?: number } | null;
   /** Active verify_slots batch: queue of non-empty slots to hover + OCR
    *  in sequence. After the last slot, the runtime servos cursor back to
    *  a park position before falling through to the next probe call so

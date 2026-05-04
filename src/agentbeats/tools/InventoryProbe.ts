@@ -22,6 +22,11 @@ const HOTBAR_X0 = 215;
 const HOTBAR_DX = 18;
 const HOTBAR_Y = 218;
 
+/** Module-scoped monotonic counter for probe-prompt debug dumps so the
+ *  filename is unique across the whole episode (plan.iteration resets
+ *  whenever the UI session resets). */
+let PROBE_PROMPT_SEQ = 0;
+
 function buildHotbarOnlyDescription(): string {
   const lines = ["The bottom row inside the inventory window is the HOTBAR with 9 slots numbered 0-8 from LEFT to RIGHT."];
   lines.push("Approximate pixel centers of each hotbar slot in this 640x360 image:");
@@ -473,8 +478,12 @@ export async function probeNextCraftAction(opts: {
         const fs = require("node:fs") as typeof import("node:fs");
         // eslint-disable-next-line @typescript-eslint/no-require-imports
         const pathMod = require("node:path") as typeof import("node:path");
-        const stamp = String(opts.iteration).padStart(4, "0");
-        fs.writeFileSync(pathMod.join(debugDir, `probe_${stamp}_prompt.txt`), promptText);
+        // Monotonic stamp across the whole episode so multiple UI
+        // sessions (each resetting plan.iteration) don't overwrite
+        // earlier dumps. Plus the per-session iteration as a hint.
+        const seq = String(++PROBE_PROMPT_SEQ).padStart(5, "0");
+        const sess = String(opts.iteration).padStart(3, "0");
+        fs.writeFileSync(pathMod.join(debugDir, `probe_${seq}_iter${sess}_prompt.txt`), promptText);
       }
     } catch (e) {
       console.warn(`[probe-debug] prompt dump failed: ${e instanceof Error ? e.message : String(e)}`);

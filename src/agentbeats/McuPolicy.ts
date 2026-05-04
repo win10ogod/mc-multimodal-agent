@@ -828,6 +828,8 @@ export class McuVisualPolicy {
             if (plan.pendingTooltipRead) {
               const { readTooltip } = await import("./tools/SlotOcr");
               const target = plan.pendingTooltipRead;
+              const OCR_MAX_RETRIES = 3;
+              const tries = target.retries ?? 0;
               try {
                 const r = await readTooltip({
                   client: this.client,
@@ -836,8 +838,21 @@ export class McuVisualPolicy {
                   slotPos: { x: target.x, y: target.y },
                   slotName: target.slotName,
                 });
-                plan.slotMemory.record(target.x, target.y, r.item, plan.iteration);
-                console.log(`[agentbeats] slot_ocr slot=${target.slotIndex}(${target.slotName ?? "?"}) -> ${r.item}`);
+                // Retry on LLM "empty" or "unknown" -- the tooltip box
+                // may simply not have rendered yet. CV stddev > 25 at
+                // the slot patch confirms the slot really has an icon,
+                // so an LLM "empty" reply is almost certainly the
+                // tooltip being late. Wait a few more frames and re-OCR.
+                const slotPatch = samplePatchFingerprint(payload.obs ?? "", target.x, target.y, 6);
+                const slotLooksFilled = !!slotPatch && slotPatch.stddev > 25;
+                if ((r.item === "empty" || r.item === "unknown") && slotLooksFilled && tries < OCR_MAX_RETRIES) {
+                  console.log(`[agentbeats] slot_ocr retry ${tries + 1}/${OCR_MAX_RETRIES} slot=${target.slotIndex}(${target.slotName ?? "?"}) -> '${r.item}' but CV says filled (stddev=${slotPatch?.stddev.toFixed(1)})`);
+                  plan.pendingTooltipRead = { ...target, retries: tries + 1 };
+                  // Stay parked; emit a settle frame, next tick will retry.
+                  return { ...ACTION_PAYLOAD_PREFIX, action: defaultMcuAction(), hold_steps: 4 };
+                }
+                plan.slotMemory.record(target.x, target.y, r.item, plan.iteration, slotPatch ?? undefined);
+                console.log(`[agentbeats] slot_ocr slot=${target.slotIndex}(${target.slotName ?? "?"}) -> ${r.item}${slotPatch ? ` fp=${slotPatch.stddev.toFixed(1)}` : ""}${tries > 0 ? ` (after ${tries} retries)` : ""}`);
               } catch (e) {
                 console.warn(`[agentbeats] slot OCR failed: ${e instanceof Error ? e.message : String(e)}`);
               }
@@ -1353,11 +1368,11 @@ export class McuVisualPolicy {
                 state.closedLoopHistory.unshift(`hover slot=${pc.rasterIndex}${pc.slotName ? `(${pc.slotName})` : ""} done`);
                 state.closedLoopHistory = state.closedLoopHistory.slice(0, 5);
                 plan.pendingClick = null;
-                // Hold for several frames so MC has time to actually
-                // render the tooltip box before we capture the next obs
-                // for OCR. Two frames was not enough -- tooltip didn't
-                // appear and OCR returned "empty" for non-empty slots.
-                return emit(defaultMcuAction(), 8);
+                // Brief settle frame; if MC hasn't rendered the tooltip
+                // yet, the OCR retry loop in the next handleObservation
+                // tick will re-fire the OCR up to 3 times before giving
+                // up.
+                return emit(defaultMcuAction(), 4);
               }
               if (stepResult) {
                 // servoCursorStep can return click=true with the button

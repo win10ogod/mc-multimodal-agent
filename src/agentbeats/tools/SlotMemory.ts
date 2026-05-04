@@ -18,6 +18,12 @@ export type SlotMemoryEntry = {
   y: number;
   item: string;
   step: number;
+  /** RGB-mean+stddev fingerprint of the slot patch when the item was
+   *  last verified by OCR. Used by the cross-frame material-tracker
+   *  to decide whether the item is still at this anchor, has moved to
+   *  another slot, is on the cursor, or is missing -- without paying
+   *  another OCR call. */
+  fingerprint?: { meanR: number; meanG: number; meanB: number; stddev: number };
 };
 
 const MATCH_RADIUS_PX = 8;
@@ -27,12 +33,13 @@ export class SlotMemory {
   private entries: SlotMemoryEntry[] = [];
 
   /** Record (or update) what is at an absolute pixel position. */
-  record(x: number, y: number, item: string, step: number): void {
+  record(x: number, y: number, item: string, step: number, fingerprint?: SlotMemoryEntry["fingerprint"]): void {
     const idx = this.findClosestIndex(x, y);
     if (idx >= 0) {
-      this.entries[idx] = { x, y, item, step };
+      const prev = this.entries[idx];
+      this.entries[idx] = { x, y, item, step, fingerprint: fingerprint ?? prev.fingerprint };
     } else {
-      this.entries.push({ x, y, item, step });
+      this.entries.push({ x, y, item, step, fingerprint });
     }
   }
 
