@@ -14,6 +14,7 @@ import type OpenAI from "openai";
 import { markInventoryFrame } from "./SlotMarker";
 import type { GuiLayout } from "./SlotDetector";
 import { getDebugRecorder } from "./DebugRecorder";
+import { lookupRecipe } from "./UiFastControl";
 
 // Hotbar slot pixel centers when the inventory GUI is open at 640x360 obs.
 // Mirrors the SLOT.hotbarX0/Dx/Y constants in UiFastControl.
@@ -279,9 +280,26 @@ export async function probeNextCraftAction(opts: {
     ? `Original ingredient source slot: index ${opts.pickupSourceSlot.index}${opts.pickupSourceSlot.name ? ` (${opts.pickupSourceSlot.name})` : ""}. The tool already returns leftover ingredient back to this slot automatically -- do NOT use it as a destination for the crafted result; pick a DIFFERENT empty slot (look for a "." mark in the slot listing) for the result.`
     : "No pickup source recorded yet.";
 
+  // Recipe-info hint (read-only, derived from minecraft-data). Helps the VLM
+  // disambiguate multi-ingredient placement without surfacing live state.
+  const recipeHint = (() => {
+    const tokens = opts.taskText.toLowerCase().match(/[a-z_]+/g) ?? [];
+    for (let i = tokens.length - 1; i >= 0; i -= 1) {
+      const tok = tokens[i];
+      if (tok === "craft" || tok === "make" || tok === "using" || tok === "and" || tok === "with" || tok === "the" || tok === "a") continue;
+      const r = lookupRecipe(tok);
+      if (r) {
+        const ing = r.ingredients.map((it) => `${it.count}x ${it.name}`).join(" + ");
+        return `RECIPE (from minecraft-data): produces ${r.target}. Ingredients required: ${ing}. You must place EXACTLY this set into the craft grid; placing extras of one ingredient and missing the other yields nothing.`;
+      }
+    }
+    return null;
+  })();
+
   const promptText = [
     `You are operating a Minecraft GUI (640x360 image) to advance the user's task.`,
     `Task: ${opts.taskText}`,
+    ...(recipeHint ? ["", recipeHint] : []),
     "",
     `The image has YELLOW NUMBERED BADGES drawn at the corner of each slot.`,
     `Use the visible numbers to choose a slot. Pick the index of the slot you mean.`,
@@ -307,7 +325,7 @@ export async function probeNextCraftAction(opts: {
     "",
     `Rule: when the cursor is carrying an item, "to" must be either (a) a visually empty slot, OR (b) a slot containing the SAME item as what the cursor holds (will stack). Placing onto a slot with a DIFFERENT item triggers a swap. If you must deposit into a slot occupied by a different item: (1) "put" current held item into an empty side slot, (2) next probe: "move" the blocking item to another empty slot, (3) next probe: "move" the parked item to the now-empty target.`,
     "",
-    `Anti-hallucination rule for crafting with MULTIPLE distinct ingredients (e.g. diorite = cobblestone + nether quartz, granite, andesite, any non-uniform 2x2/3x3 recipe): you cannot reliably tell which ingredient occupies a non-empty grid cell from the raster image alone. Before placing the SECOND ingredient type, you MUST emit one or more "hover" actions over EACH non-empty grid cell to read its tooltip. Only after every occupied grid cell's identity is confirmed via tooltip in a subsequent probe image may you place a different ingredient. Do NOT assume "the other ingredient is already there" -- if you only ever picked up one item type so far, only that type is in the grid.`,
+    `Anti-hallucination rule for MULTI-INGREDIENT recipes: do NOT assume an ingredient is in the grid unless YOU placed it there in your "Recent actions". The image alone cannot disambiguate similar-looking blocks (e.g. cobblestone vs nether quartz block). If the RECIPE line below lists multiple ingredients, count what you have actually placed so far from your "Recent actions" history; only then decide whether the next placement should be ingredient A or ingredient B. If unsure, pick up an unplaced ingredient from your hotbar/inventory rather than placing another of what you already moved.`,
     "",
     `This is iteration ${opts.iteration}. Return ONLY the JSON action.`,
   ].join("\n");
