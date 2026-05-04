@@ -701,50 +701,42 @@ export class McuVisualPolicy {
       if (!layout) {
         // Already handled above (plan.done=true path)
       } else {
-        const rawCursor = detectCursor(payload.obs, layout);
-        // Stale-detection guard. Only INCREMENT when cursor reading is
-        // unchanged AND we just sent non-zero cam (real motion expected
-        // but didn't happen). Only RESET when we observe meaningful
-        // movement. Noop frames leave the counter unchanged so the
-        // counter accumulates across mixed servo/noop sequences.
-        const camLast = plan.lastEmittedCam;
-        const camWasNonZero = Math.abs(camLast[0]) > 0 || Math.abs(camLast[1]) > 0;
-        const cursorMoved = !!(rawCursor && plan.lastCursorRead
-          && (Math.abs(rawCursor.x - plan.lastCursorRead.x) > 2
-              || Math.abs(rawCursor.y - plan.lastCursorRead.y) > 2));
-        if (cursorMoved) {
-          plan.staleCursorFrames = 0;
-        } else if (camWasNonZero && rawCursor && plan.lastCursorRead) {
-          plan.staleCursorFrames += 1;
-          console.warn(`[agentbeats] stale cursor reading (${rawCursor.x},${rawCursor.y}) after cam=[${camLast[0]},${camLast[1]}] (${plan.staleCursorFrames}/3)`);
-        }
-        // Pass cursor through unchanged so servo keeps trying to emit
-        // cam and the cursor has chances to break free. The abort below
-        // catches genuinely stuck cases.
-        const cursor = rawCursor;
-        plan.lastCursorRead = rawCursor ?? plan.lastCursorRead;
+        // Trust the cursor detector: prior stale-detection heuristic
+        // produced false positives (the cursor really was where it was
+        // reported) and aborted legitimate pendingClicks, ruining
+        // runs. Just pass the reading straight through.
+        const cursor = detectCursor(payload.obs, layout);
         plan.cursor = cursor ?? plan.cursor;
-        // Persistent staleness -> the detector is hopeless this round.
-        // Abort the current pendingClick so the next probe replans rather
-        // than spamming clicks on a phantom cursor position.
-        if (plan.staleCursorFrames >= 3 && plan.pendingClick !== null) {
-          console.warn(`[agentbeats] cursor detection stale for 3 frames; aborting pendingClick (${plan.pendingClick.kind ?? "click"} slot=${plan.pendingClick.rasterIndex}); invalidating SoM session for fresh detection`);
-          state.closedLoopHistory.unshift(`abort slot=${plan.pendingClick.rasterIndex} (cursor detection stale; resetting SoM session)`);
-          state.closedLoopHistory = state.closedLoopHistory.slice(0, 5);
-          plan.pendingClick = null;
-          plan.staleCursorFrames = 0;
-          plan.lastEmittedCam = [0, 0];
-          plan.lastCursorRead = null;
-          // Invalidate the session-locked SoM layout so the next frame
-          // re-runs detection from scratch. Keeps the closed-loop in
-          // charge (manual LLM cursor control runs at ~3% success).
-          plan.sessionLayout = null;
-          plan.layoutHint = null;
-          return { ...ACTION_PAYLOAD_PREFIX, action: defaultMcuAction(), hold_steps: 1 };
-        }
 
-        // If we have no current click target, ask the VLM for one.
+        // Before each new probe, park the cursor in a clear left-side
+        // spot inside the inventory window. Two reasons:
+        //   1. SoM detection runs cleanly when the cursor isn't
+        //      occluding a slot (cursor sprite over a slot can break
+        //      slot identification on re-detect).
+        //   2. The VLM gets a stable, easy-to-locate cursor anchor in
+        //      the obs frame so its slot reasoning isn't thrown off.
+        // Run servo open-loop toward the park spot until close enough,
+        // THEN issue the probe. Avoid the closed-loop click machinery
+        // (no click here), just emit cam deltas via servoCursorStep.
         if (plan.pendingClick === null) {
+          const parkSpot = {
+            x: layout.windowX + 8,
+            y: Math.round(layout.windowY + layout.windowH / 2),
+          };
+          const distFromPark = cursor ? Math.hypot(cursor.x - parkSpot.x, cursor.y - parkSpot.y) : Infinity;
+          if (distFromPark > 12) {
+            const stepResult = servoCursorStep({
+              cursor,
+              target: parkSpot,
+              button: "attack",
+              hitThresholdPx: 5,
+            });
+            if (stepResult && !stepResult.click) {
+              console.log(`[agentbeats] park: cursor=(${cursor?.x},${cursor?.y}) -> (${parkSpot.x},${parkSpot.y}) ${stepResult.reason}`);
+              return { ...ACTION_PAYLOAD_PREFIX, action: stepResult.action, hold_steps: 1 };
+            }
+            // No cursor or stuck -> proceed to probe anyway.
+          }
           // CV cursor-holding detection is unreliable: the offset patch
           // (cx+8, cy+8) routinely lands on a real inventory slot's
           // item icon and reports false "holding". Pass null and let
@@ -844,6 +836,14 @@ export class McuVisualPolicy {
                     state.closedLoopHistory = state.closedLoopHistory.slice(0, 5);
                     return { ...ACTION_PAYLOAD_PREFIX, action: defaultMcuAction(), hold_steps: 1 };
                   }
+                  // Original pickup slot is no longer in the layout
+                  // (e.g. layout reset, slot rearranged). Skip the take
+                  // and surface to the LLM so it picks a fallback dump
+                  // slot for the leftover via the next probe.
+                  console.warn(`[agentbeats] PRE-TAKE AUTO_RETURN: original source slot "${plan.pickupSourceSlot.name}" not in current layout; skipping take so next probe can choose a fallback dump slot`);
+                  state.closedLoopHistory.unshift(`auto_return blocked: source ${plan.pickupSourceSlot.name} not in layout; please place_all leftover into any empty main_inv slot before take`);
+                  state.closedLoopHistory = state.closedLoopHistory.slice(0, 5);
+                  return { ...ACTION_PAYLOAD_PREFIX, action: defaultMcuAction(), hold_steps: 1 };
                 }
                 const expectAfter: "should_empty" | "should_fill" =
                   (probed.action === "place_one" || probed.action === "place_all") ? "should_fill" : "should_empty";
@@ -869,8 +869,13 @@ export class McuVisualPolicy {
               }
             }
           } catch (error) {
-            console.warn(`[agentbeats] closed-loop probe failed: ${formatModelProviderError(error)} -- ending closed-loop`);
-            plan.done = true;
+            // Don't surrender to manual LLM control on a transient probe
+            // failure -- closed-loop is enforced. Reset the session and
+            // try again on the next obs frame.
+            console.warn(`[agentbeats] closed-loop probe failed: ${formatModelProviderError(error)} -- resetting SoM session and reprobing next frame (closed-loop enforced)`);
+            plan.sessionLayout = null;
+            plan.layoutHint = null;
+            plan.pendingClick = null;
           }
         }
 
