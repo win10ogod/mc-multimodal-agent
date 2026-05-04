@@ -12,7 +12,7 @@
  */
 import type OpenAI from "openai";
 import { markInventoryFrame } from "./SlotMarker";
-import { samplePatchFingerprint, type GuiLayout } from "./SlotDetector";
+import type { GuiLayout } from "./SlotDetector";
 
 // Hotbar slot pixel centers when the inventory GUI is open at 640x360 obs.
 // Mirrors the SLOT.hotbarX0/Dx/Y constants in UiFastControl.
@@ -109,31 +109,9 @@ export async function probeHotbar(opts: {
  *  each visible slot's raster index and (when known) its semantic role.
  *  This replaces the previous hard-coded "0..8 = hotbar" mapping which
  *  only worked for one specific GUI numbering scheme. */
-/** Build a textual slot listing annotated with CV-detected fill state
- *  (`*` = filled, `.` = empty). Lets the VLM pick a known-empty
- *  destination slot when storing crafted output instead of accidentally
- *  picking the source slot (which was just refilled by auto-return) and
- *  triggering an item swap. */
-function buildSlotDescription(layout: GuiLayout, jpegBase64?: string): string {
-  // Sample a 12x12 patch at every slot center to classify filled/empty.
-  // Threshold matches the verify check in McuPolicy: stddev > 35 = filled.
-  const fillByIndex = new Map<number, "filled" | "empty">();
-  if (jpegBase64) {
-    for (const s of layout.slots) {
-      const patch = samplePatchFingerprint(jpegBase64, s.cx, s.cy, 12);
-      if (!patch) continue;
-      fillByIndex.set(s.index, patch.stddev > 35 ? "filled" : "empty");
-    }
-  }
-  const tag = (i: number): string => {
-    const f = fillByIndex.get(i);
-    if (f === "filled") return `${i}*`;
-    if (f === "empty") return `${i}.`;
-    return `${i}`;
-  };
-
+function buildSlotDescription(layout: GuiLayout): string {
   const lines: string[] = [
-    `${layout.slots.length} slots are marked on the image with yellow numbered badges (raster order). Fill state: '*' = slot has an item, '.' = slot is empty.`,
+    `${layout.slots.length} slots are marked on the image with yellow numbered badges (raster order).`,
   ];
   if (layout.matchedLayoutId) {
     lines.push(`Detected GUI: ${layout.matchedLayoutId}.`);
@@ -152,10 +130,10 @@ function buildSlotDescription(layout: GuiLayout, jpegBase64?: string): string {
     }
   }
   for (const [role, idxs] of byRole) {
-    lines.push(`  role=${role}: ${idxs.map(tag).join(", ")}`);
+    lines.push(`  role=${role}: indices ${idxs.join(", ")}`);
   }
   if (anonymous.length > 0) {
-    lines.push(`  unrecognized slots: ${anonymous.map(tag).join(", ")}`);
+    lines.push(`  unrecognized slots: indices ${anonymous.join(", ")}`);
   }
   return lines.join("\n");
 }
@@ -240,7 +218,7 @@ export async function probeNextCraftAction(opts: {
     "",
     `The image has YELLOW NUMBERED BADGES drawn at the corner of each slot.`,
     `Use the visible numbers to choose a slot. Pick the index of the slot you mean.`,
-    buildSlotDescription(detectedLayout, opts.obsBase64),
+    buildSlotDescription(detectedLayout),
     "",
     `State:`,
     `  ${cursorState}`,
@@ -258,13 +236,11 @@ export async function probeNextCraftAction(opts: {
     "",
     "Do NOT return a 'done' action -- task completion is decided by a different controller, not by you. Always emit the next move or put step that advances the task; if everything is already placed and the result is sitting in role=result, your next step is to move it out into a role=hotbar or role=main_inv slot.",
     "",
-    `Strategy:`,
-    `  Prefer the high-level "move" and "put" actions. The tool handles cursor state, swaps, and remainder-return automatically -- you only describe the intent one step at a time and we execute it. After each step the tool re-shows you the marked image so you can plan the next step.`,
+    `Rule: when the cursor is carrying an item, "to" must be a visually empty slot. Placing onto a filled slot triggers a swap. If you must deposit into an occupied slot S, use this 3-step sequence (cursor empty between pickups): (1) "put" current held item into an empty side slot to park it; (2) next probe: "move" the item from S to another empty slot; (3) next probe: "move" the parked item from the side slot to S.`,
     "",
-    `Required flow for ${opts.taskTarget}:`,
-    `  1. "move" one ${opts.ingredient} from a hotbar/main_inv slot (role=hotbar or main_inv) into a craft grid slot (role=craft_2x2 or craft_3x3) with count="one".`,
-    `  2. "move" the result (role=result, after recipe completes) into any EMPTY main_inv or hotbar slot with count="all".`,
-    `  3. Return "done" when ${opts.taskTarget} is visible in inventory.`,
+    `Flow for ${opts.taskTarget}:`,
+    `  1. move one ${opts.ingredient} from a hotbar/main_inv slot into a craft slot (count=one).`,
+    `  2. move the result (role=result) into an empty main_inv or hotbar slot (count=all).`,
     "",
     `This is iteration ${opts.iteration}. Return ONLY the JSON action.`,
   ].join("\n");

@@ -724,13 +724,35 @@ export class McuVisualPolicy {
         const cursor = detectCursorWithExpectation(payload.obs, layout, null);
         plan.cursor = cursor ?? plan.cursor;
 
-        // No park step. After moveAway from the previous click the
-        // cursor is already at a window-corner safeSpot which is clear
-        // of slot grids, so re-SOM and VLM probe both work fine from
-        // there. Parking added a long detour (cursor: corner -> left
-        // -> next slot) that often got stuck mid-way and shaved no
-        // benefit on detection.
+        // Park the cursor in a clear left-side spot before each new
+        // probe. This is REQUIRED so the VLM can clearly see whether
+        // the cursor is carrying an item (held-item icon overlays the
+        // cursor sprite). With the cursor anywhere over a slot, the
+        // VLM cannot tell holding vs not-holding from the image alone.
         if (plan.pendingClick === null) {
+          const PARK_STEP_CAP = 6;
+          const parkSpot = {
+            x: layout.windowX + 8,
+            y: Math.round(layout.windowY + layout.windowH / 2),
+          };
+          const distFromPark = cursor ? Math.hypot(cursor.x - parkSpot.x, cursor.y - parkSpot.y) : Infinity;
+          if (distFromPark > 12 && plan.parkSteps < PARK_STEP_CAP) {
+            const stepResult = servoCursorStep({
+              cursor,
+              target: parkSpot,
+              button: "attack",
+              hitThresholdPx: 8,
+            });
+            if (stepResult && !stepResult.click) {
+              plan.parkSteps += 1;
+              console.log(`[agentbeats] park step=${plan.parkSteps}/${PARK_STEP_CAP}: cursor=(${cursor?.x},${cursor?.y}) -> (${parkSpot.x},${parkSpot.y}) ${stepResult.reason}`);
+              return { ...ACTION_PAYLOAD_PREFIX, action: stepResult.action, hold_steps: 1 };
+            }
+          }
+          if (plan.parkSteps >= PARK_STEP_CAP) {
+            console.warn(`[agentbeats] park step cap reached (${plan.parkSteps}); proceeding to probe with cursor at (${cursor?.x},${cursor?.y})`);
+          }
+          plan.parkSteps = 0;
           // Re-SOM only NOW, just before calling the VLM. Within an
           // in-flight click sequence the layout stays stable (we keep
           // using the locked session); fresh detection only matters at
