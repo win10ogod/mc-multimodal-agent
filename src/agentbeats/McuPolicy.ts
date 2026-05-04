@@ -731,6 +731,15 @@ export class McuVisualPolicy {
         // cursor sprite). With the cursor anywhere over a slot, the
         // VLM cannot tell holding vs not-holding from the image alone.
         if (plan.pendingClick === null) {
+          // Skip park if a previous "hover" action requested it (cursor
+          // is intentionally on the slot the VLM wants to inspect so
+          // MC's tooltip renders in the next probe image).
+          if (plan.skipNextPark) {
+            plan.skipNextPark = false;
+            plan.parkSteps = 0;
+            console.log(`[agentbeats] skipNextPark consumed; cursor stays at current spot for tooltip-friendly probe`);
+            // Fall through directly to the probe without parking.
+          } else {
           const PARK_STEP_CAP = 6;
           // Park at the TOP-LEFT corner of the window. Cursor sprite
           // tip at (parkSpot) extends down-right ~10x14 px into the
@@ -761,6 +770,7 @@ export class McuVisualPolicy {
             console.warn(`[agentbeats] park step cap reached (${plan.parkSteps}); proceeding to probe with cursor at (${cursor?.x},${cursor?.y})`);
           }
           plan.parkSteps = 0;
+          } // end skipNextPark gate
           // Re-SOM only NOW, just before calling the VLM. Within an
           // in-flight click sequence the layout stays stable (we keep
           // using the locked session); fresh detection only matters at
@@ -951,6 +961,29 @@ export class McuVisualPolicy {
                 state.closedLoopHistory = state.closedLoopHistory.slice(0, 5);
                 console.log(`[agentbeats] closed-loop probe iter=${plan.iteration}: put slot=${probed.slot}(${dest.name ?? "?"}) reason=${probed.reason ?? ""}`);
               }
+            } else if (probed.action === "hover") {
+              // Hover: servo cursor onto the slot, no click. The cursor
+              // is left there so MC renders the item tooltip in the next
+              // probe image. plan.skipNextPark prevents the park step
+              // from yanking the cursor off again.
+              const dest = layoutForProbe.slots[probed.slot];
+              if (!dest) {
+                console.warn(`[agentbeats] hover slot=${probed.slot}: not in layout; skipping`);
+              } else {
+                plan.pendingClick = {
+                  rasterIndex: dest.index, slotName: dest.name, slotRole: dest.role,
+                  frozenTarget: { x: dest.cx, y: dest.cy },
+                  button: "attack", shift: false, expectAfter: "should_fill",
+                  phase: "servo", retries: 0, kind: "hover" as "click",
+                  actionKind: "pickup" as "pickup", // unused for hover
+                };
+                plan.pendingChain = [];
+                plan.servoSteps = 0;
+                plan.skipNextPark = true;
+                state.closedLoopHistory.unshift(`hover -> ${dest.name ?? probed.slot}`);
+                state.closedLoopHistory = state.closedLoopHistory.slice(0, 5);
+                console.log(`[agentbeats] closed-loop probe iter=${plan.iteration}: hover slot=${probed.slot}(${dest.name ?? "?"}) reason=${probed.reason ?? ""}`);
+              }
             } else {
               // Legacy low-level actions: pickup / place_one / place_all / take.
               const button: "attack" | "use" = probed.action === "place_one" ? "use" : "attack";
@@ -1114,6 +1147,21 @@ export class McuVisualPolicy {
               hitThresholdPx: HIT_THRESHOLD_PX,
             });
             plan.servoSteps += 1;
+            // Hover: servo to slot, then exit WITHOUT clicking. Cursor
+            // is left on the slot for MC to render its tooltip in the
+            // next probe image.
+            if ((pc.kind as string) === "hover") {
+              const arrived = !!cursor && Math.hypot(cursor.x - slotCenter.cx, cursor.y - slotCenter.cy) < 12;
+              if (arrived || plan.servoSteps > SERVO_STEP_CAP) {
+                console.log(`[agentbeats] hover arrived at ${pc.slotName ?? pc.rasterIndex} cursor=(${cursor?.x},${cursor?.y}); leaving cursor for tooltip; clearing pendingClick`);
+                state.closedLoopHistory.unshift(`hover slot=${pc.rasterIndex}${pc.slotName ? `(${pc.slotName})` : ""} done`);
+                state.closedLoopHistory = state.closedLoopHistory.slice(0, 5);
+                plan.pendingClick = null;
+                return emit(defaultMcuAction(), 2);
+              }
+              if (stepResult) return emit(stepResult.action);
+              return emit(defaultMcuAction());
+            }
             const shouldClickNow = plan.servoSteps > SERVO_STEP_CAP || (stepResult && stepResult.click);
             if (shouldClickNow) {
               // Safety: clicking outside the inventory window drops the

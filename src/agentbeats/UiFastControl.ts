@@ -494,6 +494,10 @@ export type ClosedLoopCraftPlan = {
   /** How many frames we've spent trying to park the cursor before the
    *  current probe. Capped to avoid dead-loop when cursor can't move. */
   parkSteps: number;
+  /** When true, the next probe round skips the park step. Set after a
+   *  "hover" action so the cursor stays on the slot the VLM asked to
+   *  inspect (so MC renders the tooltip in the next probe image). */
+  skipNextPark: boolean;
 };
 
 /** Servo control law: given current cursor + target slot pixel center,
@@ -597,6 +601,7 @@ export function planClosedLoopCraft(taskText: string): ClosedLoopCraftPlan | nul
     lastEmittedCam: [0, 0],
     staleCursorFrames: 0,
     parkSteps: 0,
+    skipNextPark: false,
   };
 }
 

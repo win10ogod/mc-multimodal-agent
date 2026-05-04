@@ -205,6 +205,7 @@ export type CraftAction =
   // High-level atomic operations the VLM should prefer:
   | { action: "move"; from: number; to: number; count?: "one" | "all"; reason?: string }
   | { action: "put"; slot: number; reason?: string }   // dump whole cursor stack into slot
+  | { action: "hover"; slot: number; reason?: string } // move cursor over slot, no click; reveals MC tooltip
   | { action: "done"; reason?: string }
   | { action: "fallback_manual"; reason?: string }
   // Low-level operations kept for backwards compatibility / fine-grained
@@ -295,6 +296,7 @@ export async function probeNextCraftAction(opts: {
     "Respond with strict JSON only (no markdown fences, no commentary):",
     `  {"action": "move", "from": A, "to": B, "count": "one"|"all", "reason": "..."} -- ATOMIC. Tool picks the stack from A, places into B (one item if count=one, whole stack if count=all), and automatically returns any remainder to A. Use this for the main craft step (count=one to drop one log into a craft slot) and for moving the result into your inventory (count=all).`,
     `  {"action": "put",  "slot": N, "reason": "..."} -- dump whatever the cursor is currently holding into slot N as a whole stack. Use only when the cursor is already holding something and you want to put it down.`,
+    `  {"action": "hover","slot": N, "reason": "..."} -- move the cursor over slot N WITHOUT clicking. MC will then render the item tooltip (item name + count) over that slot, so on the NEXT probe you can read what is actually in it. Use this when the image resolution makes you uncertain what item is in a slot. The cursor is left on the slot for the next probe (no parking).`,
     `  {"action": "fallback_manual", "reason": "..."} -- SoM marks do NOT cover the slot you need (UI too complex for our detector); hand control back to the manual LLM controller`,
     `  {"action": "done", "reason": "..."} -- ONLY when (a) the result slot is EMPTY (no item icon visible inside it) AND (b) the requested ${opts.taskTarget} is visibly stored in a role=hotbar or role=main_inv slot. Tool will CV-verify both conditions before accepting. If you say done while the result slot still has the crafted item visible, you will be ignored.`,
     "",
@@ -399,6 +401,13 @@ export async function probeNextCraftAction(opts: {
       return { action: null, layout: detectedLayout };
     }
     return { action: { action: "put", slot, reason }, layout: detectedLayout };
+  }
+  if (action === "hover") {
+    if (!Number.isFinite(slot) || slot < 0 || slot > maxSlot) {
+      console.warn(`[agentbeats] probe parse: hover slot=${slot} out of range 0..${maxSlot}`);
+      return { action: null, layout: detectedLayout };
+    }
+    return { action: { action: "hover", slot, reason }, layout: detectedLayout };
   }
   if (!Number.isFinite(slot) || slot < 0 || slot > maxSlot) {
     console.warn(`[agentbeats] probe parse: ${action} slot=${slot} out of range 0..${maxSlot}`);
