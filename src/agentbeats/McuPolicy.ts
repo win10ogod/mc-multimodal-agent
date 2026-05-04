@@ -702,25 +702,26 @@ export class McuVisualPolicy {
         // Already handled above (plan.done=true path)
       } else {
         const rawCursor = detectCursor(payload.obs, layout);
-        // Stale-detection guard: the white-blob detector can latch onto a
-        // static GUI feature (slot highlight, item icon) and report the
-        // SAME pixel forever despite the sim moving the cursor. If the
-        // last frame we emitted a non-zero camera delta and the new
-        // reading is within 2px of the previous reading, treat the
-        // detection as stale and pretend we don't see the cursor.
+        // Stale-detection guard. Only INCREMENT when cursor reading is
+        // unchanged AND we just sent non-zero cam (real motion expected
+        // but didn't happen). Only RESET when we observe meaningful
+        // movement. Noop frames leave the counter unchanged so the
+        // counter accumulates across mixed servo/noop sequences.
         const camLast = plan.lastEmittedCam;
         const camWasNonZero = Math.abs(camLast[0]) > 0 || Math.abs(camLast[1]) > 0;
-        const sameAsLast = !!(rawCursor && plan.lastCursorRead
-          && Math.abs(rawCursor.x - plan.lastCursorRead.x) <= 2
-          && Math.abs(rawCursor.y - plan.lastCursorRead.y) <= 2);
-        const isStale = camWasNonZero && sameAsLast;
-        if (isStale) {
-          plan.staleCursorFrames += 1;
-          console.warn(`[agentbeats] stale cursor reading (${rawCursor?.x},${rawCursor?.y}) after cam=[${camLast[0]},${camLast[1]}] (${plan.staleCursorFrames}/3)`);
-        } else {
+        const cursorMoved = !!(rawCursor && plan.lastCursorRead
+          && (Math.abs(rawCursor.x - plan.lastCursorRead.x) > 2
+              || Math.abs(rawCursor.y - plan.lastCursorRead.y) > 2));
+        if (cursorMoved) {
           plan.staleCursorFrames = 0;
+        } else if (camWasNonZero && rawCursor && plan.lastCursorRead) {
+          plan.staleCursorFrames += 1;
+          console.warn(`[agentbeats] stale cursor reading (${rawCursor.x},${rawCursor.y}) after cam=[${camLast[0]},${camLast[1]}] (${plan.staleCursorFrames}/3)`);
         }
-        const cursor = isStale ? null : rawCursor;
+        // Pass cursor through unchanged so servo keeps trying to emit
+        // cam and the cursor has chances to break free. The abort below
+        // catches genuinely stuck cases.
+        const cursor = rawCursor;
         plan.lastCursorRead = rawCursor ?? plan.lastCursorRead;
         plan.cursor = cursor ?? plan.cursor;
         // Persistent staleness -> the detector is hopeless this round.
@@ -822,6 +823,7 @@ export class McuVisualPolicy {
                   phase: "servo",
                   retries: 0,
                   kind: "click",
+                  actionKind: probed.action as "pickup" | "place_one" | "place_all" | "take",
                 };
                 plan.servoSteps = 0;
                 state.closedLoopHistory.unshift(`${probed.action} slot=${probed.slot}${probedSlot.name ? `(${probedSlot.name})` : ""}`);
@@ -993,6 +995,36 @@ export class McuVisualPolicy {
             if (matched) {
               state.closedLoopHistory.unshift(`${pc.kind ?? "click"} slot=${pc.rasterIndex}${pc.slotName ? `(${pc.slotName})` : ""} OK`);
               state.closedLoopHistory = state.closedLoopHistory.slice(0, 5);
+              // Auto-return: after a successful place_one, the cursor
+              // still holds the leftover stack. Deterministically
+              // schedule a place_all back to the original pickup source
+              // slot so the cursor is freed before the LLM is asked
+              // anything else. Prevents the held item from being
+              // dropped to the world via an off-window click.
+              if (pc.kind === "click"
+                  && pc.actionKind === "place_one"
+                  && plan.pickupSourceSlot
+                  && plan.pickupSourceSlot.name) {
+                const ret = layout.slots.find((s) => s.name === plan.pickupSourceSlot!.name);
+                if (ret) {
+                  console.log(`[agentbeats] AUTO_RETURN: scheduling place_all back to ${ret.name} (raster=${ret.index}) after successful place_one`);
+                  plan.pendingClick = {
+                    rasterIndex: ret.index,
+                    slotName: ret.name,
+                    slotRole: ret.role,
+                    frozenTarget: { x: ret.cx, y: ret.cy },
+                    button: "attack",
+                    shift: false,
+                    expectAfter: "should_fill",
+                    phase: "servo",
+                    retries: 0,
+                    kind: "auto_return",
+                    actionKind: "place_all",
+                  };
+                  plan.servoSteps = 0;
+                  return { ...ACTION_PAYLOAD_PREFIX, action: defaultMcuAction(), hold_steps: 1 };
+                }
+              }
               plan.pendingClick = null;
               return { ...ACTION_PAYLOAD_PREFIX, action: defaultMcuAction(), hold_steps: 1 };
             }

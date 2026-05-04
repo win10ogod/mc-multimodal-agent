@@ -447,10 +447,17 @@ export type ClosedLoopCraftPlan = {
     /** How many times this click has been retried after verification failure. */
     retries: number;
     /** Kind of click for logging + cleanup-loop guard.
-     *   "click"   — normal click derived from a VLM probe action
-     *   "cleanup" — auto-scheduled place_all to free the cursor after a
-     *               failed normal click; do NOT recurse into another cleanup. */
-    kind?: "click" | "cleanup";
+     *   "click"        — normal click derived from a VLM probe action
+     *   "cleanup"      — auto-scheduled place_all to free the cursor after a
+     *                    failed normal click
+     *   "auto_return"  — auto-scheduled place_all to return leftover
+     *                    ingredient to the original pickup source slot
+     *                    after a successful place_one
+     *  none of these auto-types should recurse into another auto-type. */
+    kind?: "click" | "cleanup" | "auto_return";
+    /** Probe action this click was derived from (for triggering follow-ups
+     *  like auto-return-to-source after a place_one). */
+    actionKind?: "pickup" | "place_one" | "place_all" | "take";
   } | null;
   /** Awaiting click verification: when set, the click was JUST emitted on
    *  the previous frame and we're checking whether the slot state changed
