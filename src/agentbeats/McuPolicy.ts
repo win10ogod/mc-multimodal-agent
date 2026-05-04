@@ -732,9 +732,16 @@ export class McuVisualPolicy {
         // VLM cannot tell holding vs not-holding from the image alone.
         if (plan.pendingClick === null) {
           const PARK_STEP_CAP = 6;
+          // Park at the TOP-LEFT corner of the window. Cursor sprite
+          // tip at (parkSpot) extends down-right ~10x14 px into the
+          // window header area where no inventory slots live. The
+          // previous park (windowX+8, windowH/2) put the cursor right
+          // ON main_inv_0 in the player_inventory layout, which then
+          // contaminated every pre-check sample of that slot
+          // (cursor + held-item pixels read as "filled" stddev~137).
           const parkSpot = {
-            x: layout.windowX + 8,
-            y: Math.round(layout.windowY + layout.windowH / 2),
+            x: layout.windowX + 4,
+            y: layout.windowY + 4,
           };
           const distFromPark = cursor ? Math.hypot(cursor.x - parkSpot.x, cursor.y - parkSpot.y) : Infinity;
           if (distFromPark > 12 && plan.parkSteps < PARK_STEP_CAP) {
@@ -797,16 +804,23 @@ export class McuVisualPolicy {
               plan.sessionLayout = null;
               plan.layoutHint = null;
             } else if (probed.action === "done") {
-              // The closed-loop probe is too imprecise to judge task
-              // completion (it routinely hallucinates that the result
-              // is already in the hotbar). Ignore "done" entirely;
-              // only the regular VLM (with task_done in its action
-              // schema) is allowed to declare completion. Closed-loop
-              // keeps iterating until the iteration cap is hit, after
-              // which control falls through to the regular VLM.
-              console.log(`[agentbeats] closed-loop probe said done -- IGNORED (only the regular VLM decides task completion via task_done)`);
-              state.closedLoopHistory.unshift(`probe done ignored; keep planning the next move`);
-              state.closedLoopHistory = state.closedLoopHistory.slice(0, 5);
+              // CV-verify the probe's "done" claim: the result slot
+              // must actually be empty AND the cursor must be empty
+              // (we use cursorItemSignature == null as proxy). If
+              // accepted, set plan.done so control falls through to
+              // the regular VLM which can then set task_done.
+              const resultSlot = layoutForProbe.slots.find((s) => s.role === "result");
+              const resultPatch = resultSlot ? samplePatchFingerprint(payload.obs, resultSlot.cx, resultSlot.cy, 12) : null;
+              const resultEmpty = !!resultPatch && resultPatch.stddev < 25;
+              const cursorEmpty = plan.cursorItemSignature === null;
+              if (resultEmpty && cursorEmpty) {
+                console.log(`[agentbeats] closed-loop probe says done; CV-verified (result empty, cursor empty); accepting`);
+                plan.done = true;
+              } else {
+                console.warn(`[agentbeats] closed-loop probe said done but CV-verify failed (resultEmpty=${resultEmpty}, cursorEmpty=${cursorEmpty}); ignoring`);
+                state.closedLoopHistory.unshift(`done IGNORED (resultEmpty=${resultEmpty}, cursorEmpty=${cursorEmpty})`);
+                state.closedLoopHistory = state.closedLoopHistory.slice(0, 5);
+              }
             } else if (probed.action === "fallback_manual") {
               console.log(`[agentbeats] closed-loop probe says fallback_manual reason=${probed.reason ?? ""} -- handing control to manual LLM cursor`);
               plan.done = true;
