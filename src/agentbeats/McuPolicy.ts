@@ -1495,15 +1495,28 @@ export class McuVisualPolicy {
             // Forget it; the agent will re-discover via hover if needed.
             if (matched && pc.kind !== ("hover" as never)) {
               const memBefore = plan.slotMemory.lookup(slotCenter.cx, slotCenter.cy);
-              plan.slotMemory.invalidate(slotCenter.cx, slotCenter.cy);
-              // Logical cursor-item tracking: a successful pickup loads
-              // the cursor with whatever the slot's last known item was;
-              // a successful place / put / take / auto_return clears it.
               if (pc.actionKind === "pickup" || pc.actionKind === "take") {
+                // Pickup: cursor gains the slot's item; slot empties.
                 plan.cursorItem = memBefore?.item ?? plan.cursorItem;
+                plan.slotMemory.invalidate(slotCenter.cx, slotCenter.cy);
                 console.log(`[agentbeats] cursorItem set to '${plan.cursorItem}' after pickup of ${pc.slotName ?? pc.rasterIndex}`);
-              } else if (pc.actionKind === "place_one" || pc.actionKind === "place_all") {
-                console.log(`[agentbeats] cursorItem cleared (was '${plan.cursorItem}') after place at ${pc.slotName ?? pc.rasterIndex}`);
+              } else if (pc.actionKind === "place_one") {
+                // Place ONE from cursor: slot now contains cursor's
+                // item; cursor still holds the rest. Record memory at
+                // dest with the cursor's known item so the agent sees
+                // "ingredient is now in cell N" without re-OCR.
+                if (plan.cursorItem) {
+                  plan.slotMemory.record(slotCenter.cx, slotCenter.cy, plan.cursorItem, plan.iteration);
+                  console.log(`[agentbeats] slotMemory placed '${plan.cursorItem}' at ${pc.slotName ?? pc.rasterIndex}`);
+                }
+                // cursor still holds remaining items.
+              } else if (pc.actionKind === "place_all") {
+                // Place ALL from cursor: slot now has cursor's item;
+                // cursor empties.
+                if (plan.cursorItem) {
+                  plan.slotMemory.record(slotCenter.cx, slotCenter.cy, plan.cursorItem, plan.iteration);
+                  console.log(`[agentbeats] slotMemory placed '${plan.cursorItem}' at ${pc.slotName ?? pc.rasterIndex}; cursor cleared`);
+                }
                 plan.cursorItem = null;
               }
             }
