@@ -24,7 +24,7 @@ import {
   type UiFastControlFrame,
 } from "./UiFastControl";
 import { probeNextCraftAction } from "./InventoryProbe";
-import { detectCursor, detectCursorHolding, detectGuiLayout, samplePatchFingerprint } from "./SlotDetector";
+import { detectCursor, detectGuiLayout, samplePatchFingerprint } from "./SlotDetector";
 
 type McuInitPayload = {
   type: "init";
@@ -791,15 +791,57 @@ export class McuVisualPolicy {
             } else if (probed.action === "fallback_manual") {
               console.log(`[agentbeats] closed-loop probe says fallback_manual reason=${probed.reason ?? ""} -- handing control to manual LLM cursor`);
               plan.done = true;
+            } else if (probed.action === "move") {
+              // High-level atomic move: pickup `from` -> place at `to`
+              // -> auto-return remainder to `from` (when count=one).
+              // Build the click chain; first click goes to pendingClick,
+              // rest queue in plan.pendingChain and promote on verify.
+              const fromSlot = layoutForProbe.slots[probed.from];
+              const toSlot = layoutForProbe.slots[probed.to];
+              if (!fromSlot || !toSlot) {
+                console.warn(`[agentbeats] move from=${probed.from} to=${probed.to}: slot(s) not in layout (have ${layoutForProbe.slots.length}); skipping`);
+              } else {
+                const mkClick = (s: { index: number; name?: string; role?: string; cx: number; cy: number }, button: "attack" | "use", expectAfter: "should_empty" | "should_fill", actionKind: "pickup" | "place_one" | "place_all" | "take", kind: "click" | "auto_return"): import("./UiFastControl").PendingClick => ({
+                  rasterIndex: s.index, slotName: s.name, slotRole: s.role,
+                  frozenTarget: { x: s.cx, y: s.cy },
+                  button, shift: false, expectAfter,
+                  phase: "servo", retries: 0, kind, actionKind,
+                });
+                const chain: import("./UiFastControl").PendingClick[] = [];
+                chain.push(mkClick(fromSlot, "attack", "should_empty", "pickup", "click"));
+                if (probed.count === "all") {
+                  chain.push(mkClick(toSlot, "attack", "should_fill", "place_all", "click"));
+                } else {
+                  chain.push(mkClick(toSlot, "use", "should_fill", "place_one", "click"));
+                  chain.push(mkClick(fromSlot, "attack", "should_fill", "place_all", "auto_return"));
+                }
+                plan.pickupSourceSlot = { index: fromSlot.index, name: fromSlot.name };
+                plan.pendingClick = chain.shift()!;
+                plan.pendingChain = chain;
+                plan.servoSteps = 0;
+                state.closedLoopHistory.unshift(`move ${fromSlot.name ?? probed.from} -> ${toSlot.name ?? probed.to} (count=${probed.count ?? "one"})`);
+                state.closedLoopHistory = state.closedLoopHistory.slice(0, 5);
+                console.log(`[agentbeats] closed-loop probe iter=${plan.iteration}: move from=${probed.from}(${fromSlot.name ?? "?"}) to=${probed.to}(${toSlot.name ?? "?"}) count=${probed.count ?? "one"} reason=${probed.reason ?? ""}; chain=${chain.length + 1} clicks`);
+              }
+            } else if (probed.action === "put") {
+              const dest = layoutForProbe.slots[probed.slot];
+              if (!dest) {
+                console.warn(`[agentbeats] put slot=${probed.slot}: not in layout; skipping`);
+              } else {
+                plan.pendingClick = {
+                  rasterIndex: dest.index, slotName: dest.name, slotRole: dest.role,
+                  frozenTarget: { x: dest.cx, y: dest.cy },
+                  button: "attack", shift: false, expectAfter: "should_fill",
+                  phase: "servo", retries: 0, kind: "click", actionKind: "place_all",
+                };
+                plan.pendingChain = [];
+                plan.servoSteps = 0;
+                state.closedLoopHistory.unshift(`put -> ${dest.name ?? probed.slot}`);
+                state.closedLoopHistory = state.closedLoopHistory.slice(0, 5);
+                console.log(`[agentbeats] closed-loop probe iter=${plan.iteration}: put slot=${probed.slot}(${dest.name ?? "?"}) reason=${probed.reason ?? ""}`);
+              }
             } else {
-              // Click semantics in MC inventory:
-              //   pickup    -> attack (left-click): grab whole stack
-              //   place_one -> use    (right-click): drop 1 item, keep rest
-              //   place_all -> attack (left-click): drop whole stack
-              //   take      -> attack (left-click). NOTE: shift+click is
-              //                broken in the MCU sim, so we never use sneak
-              //                here; the VLM is told to ensure cursor empty
-              //                before issuing "take" or "pickup".
+              // Legacy low-level actions: pickup / place_one / place_all / take.
               const button: "attack" | "use" = probed.action === "place_one" ? "use" : "attack";
               const shift = false;
               const probedSlot = layoutForProbe.slots[probed.slot];
@@ -1053,9 +1095,22 @@ export class McuVisualPolicy {
               `[agentbeats] verify ${pc.slotName ?? pc.rasterIndex}: post.stddev=${post.stddev.toFixed(1)} expect=${pc.expectAfter} -> ${matched ? "OK" : "MISMATCH"} (retry ${pc.retries}/${MAX_RETRIES})`,
             );
             if (matched) {
-              state.closedLoopHistory.unshift(`${pc.kind ?? "click"} slot=${pc.rasterIndex}${pc.slotName ? `(${pc.slotName})` : ""} OK`);
+              state.closedLoopHistory.unshift(`${pc.actionKind ?? pc.kind ?? "click"} slot=${pc.rasterIndex}${pc.slotName ? `(${pc.slotName})` : ""} OK`);
               state.closedLoopHistory = state.closedLoopHistory.slice(0, 5);
-              plan.pendingClick = null;
+              // Advance the chain: if there's a queued follow-up click
+              // (e.g. the place_one or auto_return inside a "move" op),
+              // promote it into pendingClick. Otherwise return to VLM.
+              const next = plan.pendingChain.shift();
+              if (next) {
+                next.phase = "servo";
+                next.retries = 0;
+                next.prePatch = undefined;
+                plan.pendingClick = next;
+                plan.servoSteps = 0;
+                console.log(`[agentbeats] chain advance -> ${next.actionKind ?? next.kind} slot=${next.rasterIndex}(${next.slotName ?? "?"}) (${plan.pendingChain.length} more queued)`);
+              } else {
+                plan.pendingClick = null;
+              }
               return { ...ACTION_PAYLOAD_PREFIX, action: defaultMcuAction(), hold_steps: 1 };
             }
             // Mismatch path
@@ -1066,53 +1121,15 @@ export class McuVisualPolicy {
               console.log(`[agentbeats] RETRY click on ${pc.slotName ?? pc.rasterIndex} (attempt ${pc.retries + 1}/${MAX_RETRIES + 1})`);
               return { ...ACTION_PAYLOAD_PREFIX, action: defaultMcuAction(), hold_steps: 1 };
             }
-            // Retries exhausted. If we were already running a cleanup
-            // click, give up entirely and surface to the LLM. Otherwise
-            // schedule a cleanup: place_all back to the original pickup
-            // source slot (or the first empty main_inv if no source) so
-            // the cursor is empty before the next LLM probe.
-            const failureLabel = `${pc.kind ?? "click"} slot=${pc.rasterIndex}${pc.slotName ? `(${pc.slotName})` : ""} FAILED post.stddev=${post.stddev.toFixed(0)}`;
-            state.closedLoopHistory.unshift(failureLabel);
+            // Retries exhausted (5 attempts total). Surface back to VLM
+            // reasoning -- drop the rest of the chain too so the LLM
+            // can replan from current observed state.
+            const failureLabel = `${pc.actionKind ?? pc.kind ?? "click"} slot=${pc.rasterIndex}${pc.slotName ? `(${pc.slotName})` : ""} FAILED post.stddev=${post.stddev.toFixed(0)}`;
+            state.closedLoopHistory.unshift(`${failureLabel} (chain aborted; ${plan.pendingChain.length} dropped)`);
             state.closedLoopHistory = state.closedLoopHistory.slice(0, 5);
-            console.warn(`[agentbeats] ${failureLabel}; retries exhausted`);
-            const cursorHoldingNow = detectCursorHolding(payload.obs, plan.cursor);
-            if (pc.kind !== "cleanup" && cursorHoldingNow === true) {
-              // Pick a target for the cleanup click: prefer the original
-              // pickup source slot (returns leftover ingredient there), else
-              // the first empty main_inv slot.
-              let cleanupTarget: typeof layout.slots[number] | null = null;
-              if (plan.pickupSourceSlot && plan.pickupSourceSlot.name) {
-                cleanupTarget = layout.slots.find((s) => s.name === plan.pickupSourceSlot!.name) ?? null;
-              }
-              if (!cleanupTarget) {
-                for (const s of layout.slots) {
-                  if (s.role !== "main_inv") continue;
-                  const patch = samplePatchFingerprint(payload.obs, s.cx, s.cy);
-                  if (patch && patch.stddev < 25) { cleanupTarget = s; break; }
-                }
-              }
-              if (cleanupTarget) {
-                console.log(`[agentbeats] CLEANUP: place_all into ${cleanupTarget.name ?? cleanupTarget.index} before reprobing`);
-                plan.pendingClick = {
-                  rasterIndex: cleanupTarget.index,
-                  slotName: cleanupTarget.name,
-                  slotRole: cleanupTarget.role,
-                  frozenTarget: { x: cleanupTarget.cx, y: cleanupTarget.cy },
-                  button: "attack",
-                  shift: false,
-                  expectAfter: "should_fill",
-                  phase: "servo",
-                  retries: 0,
-                  kind: "cleanup",
-                };
-                plan.servoSteps = 0;
-                return { ...ACTION_PAYLOAD_PREFIX, action: defaultMcuAction(), hold_steps: 1 };
-              }
-              console.warn(`[agentbeats] CLEANUP: no viable target; surfacing to LLM`);
-            }
-            // Either cursor empty already, or cleanup itself failed, or no
-            // target — clear and let the next probe replan from scratch.
+            console.warn(`[agentbeats] ${failureLabel}; retries exhausted; clearing chain (${plan.pendingChain.length} dropped) and returning to VLM`);
             plan.pendingClick = null;
+            plan.pendingChain = [];
             return { ...ACTION_PAYLOAD_PREFIX, action: defaultMcuAction(), hold_steps: 1 };
           }
 

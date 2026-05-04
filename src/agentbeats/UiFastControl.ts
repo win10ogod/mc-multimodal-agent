@@ -407,6 +407,33 @@ export function buildCraftOpenInventoryFrames(target: string): UiFastControlFram
 }
 
 /** Plan for the closed-loop driver living in McuPolicy state. */
+/** A single low-level click step the closed-loop state machine drives. */
+export type PendingClick = {
+  rasterIndex: number;
+  slotName?: string;
+  slotRole?: string;
+  frozenTarget: { x: number; y: number };
+  button: "attack" | "use";
+  shift?: boolean;
+  /** Verification post-click. */
+  expectAfter: "should_empty" | "should_fill";
+  /** State machine phase for this click:
+   *   "servo"      — moving cursor toward target slot
+   *   "fired"      — click was just emitted, waiting one frame to settle
+   *   "moveAway"   — moving cursor off the slot to a safe spot
+   *   "verify"     — at safe spot; sample patch and decide
+   *   (cleared on success/abort) */
+  phase: "servo" | "fired" | "moveAway" | "verify";
+  /** Pre-click patch fingerprint of the target slot. */
+  prePatch?: { meanR: number; meanG: number; meanB: number; stddev: number };
+  /** How many times this click has been retried after verification failure. */
+  retries: number;
+  /** Kind of click for logging + cleanup-loop guard. */
+  kind?: "click" | "cleanup" | "auto_return";
+  /** Probe action this click was derived from. */
+  actionKind?: "pickup" | "place_one" | "place_all" | "take";
+};
+
 export type ClosedLoopCraftPlan = {
   target: string;
   ingredient: string;
@@ -425,40 +452,7 @@ export type ClosedLoopCraftPlan = {
   sessionLayout: unknown | null;
   /** Pending click target — when set, the policy is servoing the cursor to
    *  this slot. Cleared once the click fires. */
-  pendingClick: {
-    rasterIndex: number;
-    slotName?: string;
-    slotRole?: string;
-    frozenTarget: { x: number; y: number };
-    button: "attack" | "use";
-    shift?: boolean;
-    /** Verification post-click. */
-    expectAfter: "should_empty" | "should_fill";
-    /** State machine phase for this click:
-     *   "servo"      — moving cursor toward target slot
-     *   "fired"      — click was just emitted, waiting one frame to settle
-     *   "moveAway"   — moving cursor off the slot to a safe spot
-     *   "verify"     — at safe spot; sample patch and decide
-     *   (cleared on success/abort) */
-    phase: "servo" | "fired" | "moveAway" | "verify";
-    /** Pre-click patch fingerprint of the target slot, sampled at the
-     *  moment the click fires. Used to determine "did anything change". */
-    prePatch?: { meanR: number; meanG: number; meanB: number; stddev: number };
-    /** How many times this click has been retried after verification failure. */
-    retries: number;
-    /** Kind of click for logging + cleanup-loop guard.
-     *   "click"        — normal click derived from a VLM probe action
-     *   "cleanup"      — auto-scheduled place_all to free the cursor after a
-     *                    failed normal click
-     *   "auto_return"  — auto-scheduled place_all to return leftover
-     *                    ingredient to the original pickup source slot
-     *                    after a successful place_one
-     *  none of these auto-types should recurse into another auto-type. */
-    kind?: "click" | "cleanup" | "auto_return";
-    /** Probe action this click was derived from (for triggering follow-ups
-     *  like auto-return-to-source after a place_one). */
-    actionKind?: "pickup" | "place_one" | "place_all" | "take";
-  } | null;
+  pendingClick: PendingClick | null;
   /** Awaiting click verification: when set, the click was JUST emitted on
    *  the previous frame and we're checking whether the slot state changed
    *  in the expected direction. Cleared after one verification pass. */
@@ -476,6 +470,12 @@ export type ClosedLoopCraftPlan = {
   /** Slot from which the agent first picked up the ingredient stack. Used
    *  to instruct the VLM to return leftover items here after place_one. */
   pickupSourceSlot: { index: number; name?: string } | null;
+  /** Queued follow-up clicks that should fire after the current pendingClick
+   *  verifies successfully. Used to expand a single high-level VLM action
+   *  (move, put) into a sequence of low-level clicks the existing state
+   *  machine can execute. Each entry is a PendingClick value (sans phase
+   *  and retries -- those are reset when promoted to current). */
+  pendingChain: PendingClick[];
   /** Cursor reading from the previous obs frame, used to detect stale
    *  cursor detections (the white-blob detector sometimes latches onto a
    *  static GUI feature like a slot highlight or item icon). */
@@ -575,6 +575,7 @@ export function planClosedLoopCraft(taskText: string): ClosedLoopCraftPlan | nul
     layoutHint: null,
     sessionLayout: null,
     pickupSourceSlot: null,
+    pendingChain: [],
     lastCursorRead: null,
     lastEmittedCam: [0, 0],
     staleCursorFrames: 0,

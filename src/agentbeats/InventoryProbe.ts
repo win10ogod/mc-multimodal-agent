@@ -140,12 +140,18 @@ function buildSlotDescription(layout: GuiLayout): string {
 }
 
 export type CraftAction =
-  | { action: "pickup"; slot: number; reason?: string }       // attack-click slot to grab whole stack
-  | { action: "place_one"; slot: number; reason?: string }    // use-click slot to drop ONE item from cursor
-  | { action: "place_all"; slot: number; reason?: string }    // attack-click slot to deposit whole held stack
-  | { action: "take"; slot: number; reason?: string }         // attack-click result slot
+  // High-level atomic operations the VLM should prefer:
+  | { action: "move"; from: number; to: number; count?: "one" | "all"; reason?: string }
+  | { action: "put"; slot: number; reason?: string }   // dump whole cursor stack into slot
   | { action: "done"; reason?: string }
-  | { action: "fallback_manual"; reason?: string };           // SoM does not mark the target the VLM needs; let LLM drive cursor manually
+  | { action: "fallback_manual"; reason?: string }
+  // Low-level operations kept for backwards compatibility / fine-grained
+  // control if the VLM still emits them; new prompts steer toward
+  // move / put / done.
+  | { action: "pickup"; slot: number; reason?: string }
+  | { action: "place_one"; slot: number; reason?: string }
+  | { action: "place_all"; slot: number; reason?: string }
+  | { action: "take"; slot: number; reason?: string };
 
 export type CraftProbeResult = {
   action: CraftAction | null;
@@ -225,25 +231,18 @@ export async function probeNextCraftAction(opts: {
     "Look at the image and decide the SINGLE NEXT action that best advances the task.",
     "",
     "Respond with strict JSON only (no markdown fences, no commentary):",
-    `  {"action": "pickup",    "slot": N, "reason": "..."}  -- left-click slot N to grab whole stack. REQUIRES cursor empty.`,
-    `  {"action": "place_one", "slot": N, "reason": "..."}  -- right-click slot N to drop ONE item from cursor`,
-    `  {"action": "place_all", "slot": N, "reason": "..."}  -- left-click slot N to drop whole held stack (use for cleanup)`,
-    `  {"action": "take",      "slot": N, "reason": "..."}  -- left-click result slot to grab crafted output. REQUIRES cursor empty.`,
-    `  {"action": "done",                  "reason": "..."} -- task complete; ${opts.taskTarget} is in inventory and cursor is empty`,
-    `  {"action": "fallback_manual",       "reason": "..."} -- SoM marks do NOT cover the slot you need (UI too complex for our detector); hand control back to the manual LLM controller`,
+    `  {"action": "move", "from": A, "to": B, "count": "one"|"all", "reason": "..."} -- ATOMIC. Tool picks the stack from A, places into B (one item if count=one, whole stack if count=all), and automatically returns any remainder to A. Use this for the main craft step (count=one to drop one log into a craft slot) and for moving the result into your inventory (count=all).`,
+    `  {"action": "put",  "slot": N, "reason": "..."} -- dump whatever the cursor is currently holding into slot N as a whole stack. Use only when the cursor is already holding something and you want to put it down.`,
+    `  {"action": "done",         "reason": "..."} -- task complete; ${opts.taskTarget} is in inventory and cursor is empty`,
+    `  {"action": "fallback_manual", "reason": "..."} -- SoM marks do NOT cover the slot you need (UI too complex for our detector); hand control back to the manual LLM controller`,
     "",
-    `IMPORTANT (MCU sim quirks):`,
-    `  - Shift+click DOES NOT WORK. "take" is a plain left-click.`,
-    `  - "pickup" only works when the cursor is empty -- otherwise it swaps and breaks the flow.`,
-    `  - "take" on a result slot only works when the cursor is empty -- otherwise it swaps.`,
+    `Strategy:`,
+    `  Prefer the high-level "move" and "put" actions. The tool handles cursor state, swaps, and remainder-return automatically -- you only describe the intent one step at a time and we execute it. After each step the tool re-shows you the marked image so you can plan the next step.`,
     "",
     `Required flow for ${opts.taskTarget}:`,
-    `  1. Cursor empty + craft grid empty -> "pickup" the ${opts.ingredient} stack from a hotbar/main_inv slot.`,
-    `  2. Cursor holding ${opts.ingredient} + craft grid empty -> "place_one" into a craft slot (role=craft_2x2 or craft_3x3).`,
-    `  3. Cursor STILL holding leftover ${opts.ingredient} after place_one -> "place_all" BACK to the original pickup source slot to free the cursor.`,
-    `  4. Cursor empty + result slot has ${opts.taskTarget} -> "take" from result slot.`,
-    `  5. Cursor holding ${opts.taskTarget} -> "place_all" into any EMPTY main_inv slot to stash it.`,
-    `  6. Only return "done" when ${opts.taskTarget} is visible in inventory AND cursor is empty.`,
+    `  1. "move" one ${opts.ingredient} from a hotbar/main_inv slot (role=hotbar or main_inv) into a craft grid slot (role=craft_2x2 or craft_3x3) with count="one".`,
+    `  2. "move" the result (role=result, after recipe completes) into any EMPTY main_inv or hotbar slot with count="all".`,
+    `  3. Return "done" when ${opts.taskTarget} is visible in inventory.`,
     "",
     `This is iteration ${opts.iteration}. Return ONLY the JSON action.`,
   ].join("\n");
@@ -289,6 +288,20 @@ export async function probeNextCraftAction(opts: {
   const reason = typeof parsed.reason === "string" ? parsed.reason : undefined;
   if (action === "done") return { action: { action: "done", reason }, layout: detectedLayout };
   if (action === "fallback_manual") return { action: { action: "fallback_manual", reason }, layout: detectedLayout };
+  if (action === "move") {
+    const fromRaw = parsed.from;
+    const toRaw = parsed.to;
+    const from = typeof fromRaw === "number" ? fromRaw : Number(fromRaw);
+    const to = typeof toRaw === "number" ? toRaw : Number(toRaw);
+    if (!Number.isFinite(from) || from < 0 || from > 40) return { action: null, layout: detectedLayout };
+    if (!Number.isFinite(to)   || to   < 0 || to   > 40) return { action: null, layout: detectedLayout };
+    const count: "one" | "all" = parsed.count === "all" ? "all" : "one";
+    return { action: { action: "move", from, to, count, reason }, layout: detectedLayout };
+  }
+  if (action === "put") {
+    if (!Number.isFinite(slot) || slot < 0 || slot > 40) return { action: null, layout: detectedLayout };
+    return { action: { action: "put", slot, reason }, layout: detectedLayout };
+  }
   if (!Number.isFinite(slot) || slot < 0 || slot > 40) {
     return { action: null, layout: detectedLayout };
   }
