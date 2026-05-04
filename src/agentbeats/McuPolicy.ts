@@ -1095,9 +1095,13 @@ export class McuVisualPolicy {
 
           // Helper: emit a closed-loop action and remember the cam delta
           // so the next frame's stale-cursor check has ground truth.
-          const emit = (action: McuEnvAction): McuPolicyDecision => {
+          // hold_steps: 1 by default (servo / click need fresh obs each
+          // env step). For pure noop frames (no buttons, no cam) bump
+          // to 2 so the env runs a couple of steps without us paying
+          // the obs round-trip cost on every one.
+          const emit = (action: McuEnvAction, holdSteps: number = 1): McuPolicyDecision => {
             plan.lastEmittedCam = [action.camera[0], action.camera[1]];
-            return { ...ACTION_PAYLOAD_PREFIX, action, hold_steps: 1 };
+            return { ...ACTION_PAYLOAD_PREFIX, action, hold_steps: holdSteps };
           };
 
           // === Phase: servo === move cursor to slot, then click
@@ -1167,7 +1171,8 @@ export class McuVisualPolicy {
             pc.phase = "moveAway";
             plan.servoSteps = 0;
             console.log(`[agentbeats] click settled; moving cursor away from ${pc.slotName ?? pc.rasterIndex} for verify`);
-            return emit(defaultMcuAction());
+            // Pure settle frame, no input. Run 2 env steps so MC has time to apply the click.
+            return emit(defaultMcuAction(), 2);
           }
 
           // === Phase: moveAway === servo cursor to safe spot
@@ -1184,7 +1189,8 @@ export class McuVisualPolicy {
             if (arrived) {
               pc.phase = "verify";
               console.log(`[agentbeats] cursor at safe spot (${cursor?.x},${cursor?.y}); next frame will verify`);
-              return emit(defaultMcuAction());
+              // Pure noop wait-for-verify frame: bump hold_steps.
+              return emit(defaultMcuAction(), 2);
             }
             if (stepResult && !stepResult.click) {
               return emit(stepResult.action);

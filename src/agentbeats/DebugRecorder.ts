@@ -46,7 +46,12 @@ export class DebugRecorder {
   }
 
   /** Record one event. `imageBase64` is optional; if provided it's
-   *  decoded and written as PNG/JPG next to the JSONL line. */
+   *  decoded and written as PNG/JPG next to the JSONL line. The MC sim
+   *  outputs JPEGs whose YCbCr decodes to BGR-meaning data (tan looks
+   *  blue, blue looks tan). For debug viewing we re-encode the image
+   *  with R/B channels swapped so it displays in true color. The
+   *  pipeline (VLM, CV) keeps using the raw bytes -- this swap is
+   *  cosmetic for human readers only. */
   record(event: DebugEvent, imageBase64?: string, imageExt: "png" | "jpg" = "jpg"): void {
     if (!this.enabled || !this.dir) return;
     this.seq += 1;
@@ -57,8 +62,36 @@ export class DebugRecorder {
         const cleaned = imageBase64.startsWith("data:image/")
           ? imageBase64.replace(/^data:image\/[a-z]+;base64,/, "")
           : imageBase64;
-        const fname = `${seqStr}_${event.type}.${imageExt}`;
-        fs.writeFileSync(path.join(this.dir, fname), Buffer.from(cleaned, "base64"));
+        const fname = `${seqStr}_${event.type}.png`;
+        // Re-encode as PNG with R/B swapped for human-readable colors.
+        try {
+          // Lazy require so non-debug runs don't pay the import cost.
+          // eslint-disable-next-line @typescript-eslint/no-require-imports
+          const jpegLib = require("jpeg-js");
+          // eslint-disable-next-line @typescript-eslint/no-require-imports
+          const { PNG } = require("pngjs");
+          const inBuf = Buffer.from(cleaned, "base64");
+          let decoded;
+          if (imageExt === "jpg") {
+            decoded = jpegLib.decode(inBuf, { useTArray: true, formatAsRGBA: true });
+          } else {
+            const png = PNG.sync.read(inBuf);
+            decoded = { width: png.width, height: png.height, data: png.data };
+          }
+          const w = decoded.width, h = decoded.height;
+          const data = Buffer.from(decoded.data);
+          for (let i = 0; i < data.length; i += 4) {
+            const r = data[i];
+            data[i] = data[i + 2];
+            data[i + 2] = r;
+          }
+          const outPng = new PNG({ width: w, height: h });
+          data.copy(outPng.data);
+          fs.writeFileSync(path.join(this.dir, fname), PNG.sync.write(outPng));
+        } catch {
+          // Fallback: write raw bytes (color may look swapped).
+          fs.writeFileSync(path.join(this.dir, fname.replace(".png", "." + imageExt)), Buffer.from(cleaned, "base64"));
+        }
         imageFile = fname;
       } catch (e) {
         console.warn(`[debug-recorder] image write failed: ${e instanceof Error ? e.message : String(e)}`);
