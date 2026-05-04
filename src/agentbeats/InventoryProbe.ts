@@ -138,6 +138,68 @@ function buildSlotDescription(layout: GuiLayout): string {
   return lines.join("\n");
 }
 
+/** Cheap VLM sub-verify: given an obs frame, a target slot pixel, and
+ *  the expected post-click state ("should_empty" or "should_fill"),
+ *  ask the VLM whether the slot matches. Used as a second-opinion gate
+ *  when CV patch sampling reports a mismatch (CV is fooled by rendering
+ *  noise around freshly-emptied slots, ambiguous icon variance, etc.).
+ *  Returns true iff the VLM agrees the expected state holds. */
+export async function vlmVerifySlotState(opts: {
+  client: OpenAI;
+  model: string;
+  obsBase64: string;
+  slot: { cx: number; cy: number; name?: string };
+  expectAfter: "should_empty" | "should_fill";
+  taskTarget: string;
+}): Promise<boolean | null> {
+  const desc = opts.expectAfter === "should_empty"
+    ? `EMPTY (no item icon visible inside it)`
+    : `FILLED (an item icon is visible inside it)`;
+  const slotLabel = opts.slot.name ? `slot "${opts.slot.name}" near pixel (${opts.slot.cx}, ${opts.slot.cy})` : `the slot at pixel (${opts.slot.cx}, ${opts.slot.cy})`;
+  const prompt = [
+    `In this 640x360 Minecraft inventory frame, look at ${slotLabel}.`,
+    `Is that slot ${desc}?`,
+    `Answer with strict JSON only, no commentary: {"empty": true|false, "filled": true|false}`,
+  ].join(" ");
+  const dataUrl = opts.obsBase64.startsWith("data:image/")
+    ? opts.obsBase64
+    : `data:image/jpeg;base64,${opts.obsBase64}`;
+  const body: Record<string, unknown> = {
+    model: opts.model,
+    temperature: 0,
+    max_completion_tokens: 60,
+    messages: [{
+      role: "user",
+      content: [
+        { type: "text", text: prompt },
+        { type: "image_url", image_url: { url: dataUrl, detail: "low" } },
+      ],
+    }],
+  };
+  type Create = typeof opts.client.chat.completions.create;
+  type CreateParams = Parameters<Create>[0];
+  try {
+    const completion = await opts.client.chat.completions.create(body as unknown as CreateParams) as Awaited<ReturnType<Create>> & {
+      choices: Array<{ message?: { content?: string | null } }>;
+    };
+    const raw = completion.choices[0]?.message?.content ?? "";
+    const cleaned = raw.replace(/```(?:json)?/gi, "").trim();
+    let parsed: { empty?: boolean; filled?: boolean } = {};
+    try { parsed = JSON.parse(cleaned); } catch {
+      const m = cleaned.match(/\{[\s\S]*\}/);
+      if (m) { try { parsed = JSON.parse(m[0]); } catch { /* give up */ } }
+    }
+    if (typeof parsed.empty !== "boolean" && typeof parsed.filled !== "boolean") return null;
+    const isEmpty = parsed.empty === true || parsed.filled === false;
+    const isFilled = parsed.filled === true || parsed.empty === false;
+    if (opts.expectAfter === "should_empty") return isEmpty && !isFilled;
+    return isFilled && !isEmpty;
+  } catch (e) {
+    console.warn(`[agentbeats] vlmVerifySlotState failed: ${e instanceof Error ? e.message : String(e)}`);
+    return null;
+  }
+}
+
 export type CraftAction =
   // High-level atomic operations the VLM should prefer:
   | { action: "move"; from: number; to: number; count?: "one" | "all"; reason?: string }

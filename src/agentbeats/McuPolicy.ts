@@ -23,7 +23,7 @@ import {
   type ClosedLoopCraftPlan,
   type UiFastControlFrame,
 } from "./UiFastControl";
-import { probeNextCraftAction } from "./InventoryProbe";
+import { probeNextCraftAction, vlmVerifySlotState } from "./InventoryProbe";
 import { detectCursorWithExpectation, detectGuiLayout, samplePatchFingerprint } from "./SlotDetector";
 
 type McuInitPayload = {
@@ -1157,7 +1157,44 @@ export class McuVisualPolicy {
               }
               return { ...ACTION_PAYLOAD_PREFIX, action: defaultMcuAction(), hold_steps: 1 };
             }
-            // Mismatch path
+            // Mismatch path: CV said the click did not produce the
+            // expected slot state. CV is fooled by rendering noise
+            // around freshly-emptied slots and ambiguous icon variance.
+            // On the FIRST mismatch only, ask the VLM for a second
+            // opinion before burning a retry. If the VLM agrees the
+            // expected state holds, accept as success and advance the
+            // chain. (Cheap: at most one extra VLM call per click.)
+            if (pc.retries === 0 && this.config.openai.apiKey) {
+              try {
+                const vlmOk = await vlmVerifySlotState({
+                  client: this.client,
+                  model: this.config.openai.model,
+                  obsBase64: payload.obs,
+                  slot: { cx: slotCenter.cx, cy: slotCenter.cy, name: pc.slotName },
+                  expectAfter: pc.expectAfter,
+                  taskTarget: plan.target,
+                });
+                if (vlmOk === true) {
+                  console.log(`[agentbeats] VLM sub-verify says ${pc.expectAfter} HOLDS for ${pc.slotName ?? pc.rasterIndex} (CV was fooled, post.stddev=${post.stddev.toFixed(1)}); accepting as success`);
+                  state.closedLoopHistory.unshift(`${pc.actionKind ?? pc.kind ?? "click"} slot=${pc.rasterIndex}${pc.slotName ? `(${pc.slotName})` : ""} OK (VLM-verified)`);
+                  state.closedLoopHistory = state.closedLoopHistory.slice(0, 5);
+                  const next = plan.pendingChain.shift();
+                  if (next) {
+                    next.phase = "servo";
+                    next.retries = 0;
+                    next.prePatch = undefined;
+                    plan.pendingClick = next;
+                    plan.servoSteps = 0;
+                    console.log(`[agentbeats] chain advance -> ${next.actionKind ?? next.kind} slot=${next.rasterIndex}(${next.slotName ?? "?"}) (${plan.pendingChain.length} more queued)`);
+                  } else {
+                    plan.pendingClick = null;
+                  }
+                  return { ...ACTION_PAYLOAD_PREFIX, action: defaultMcuAction(), hold_steps: 1 };
+                }
+              } catch (e) {
+                console.warn(`[agentbeats] VLM sub-verify call failed: ${e instanceof Error ? e.message : String(e)}; falling through to retry`);
+              }
+            }
             if (pc.retries < MAX_RETRIES) {
               pc.retries += 1;
               pc.phase = "servo";
