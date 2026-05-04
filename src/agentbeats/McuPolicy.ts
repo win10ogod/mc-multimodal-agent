@@ -845,6 +845,35 @@ export class McuVisualPolicy {
               }
               plan.pendingTooltipRead = null;
             }
+            // verify_slots batch advance: if a queue is active and has
+            // more slots to inspect, arm the next hover and SKIP the
+            // probe call this frame. Otherwise clear the batch and let
+            // the probe run with the populated slotMemory snapshot.
+            if (plan.pendingTooltipBatch) {
+              plan.pendingTooltipBatch.idx += 1;
+              if (plan.pendingTooltipBatch.idx < plan.pendingTooltipBatch.slots.length) {
+                const next = plan.pendingTooltipBatch.slots[plan.pendingTooltipBatch.idx];
+                const dest = layout.slots[next.slot];
+                if (dest) {
+                  plan.pendingClick = {
+                    rasterIndex: dest.index, slotName: dest.name, slotRole: dest.role,
+                    frozenTarget: { x: next.x, y: next.y },
+                    button: "attack", shift: false, expectAfter: "should_fill",
+                    phase: "servo", retries: 0, kind: "hover" as "click",
+                    actionKind: "pickup" as "pickup",
+                  };
+                  plan.skipNextPark = true;
+                  plan.pendingTooltipRead = { slotIndex: next.slot, x: next.x, y: next.y };
+                  console.log(`[agentbeats] verify_slots batch advance idx=${plan.pendingTooltipBatch.idx}/${plan.pendingTooltipBatch.slots.length} slot=${next.slot}`);
+                  return { ...ACTION_PAYLOAD_PREFIX, action: defaultMcuAction(), hold_steps: 1 };
+                }
+                console.warn(`[agentbeats] verify_slots advance: slot=${next.slot} no longer in layout; aborting batch`);
+                plan.pendingTooltipBatch = null;
+              } else {
+                console.log(`[agentbeats] verify_slots batch complete (${plan.pendingTooltipBatch.idx} slots read)`);
+                plan.pendingTooltipBatch = null;
+              }
+            }
             // Fall through directly to the probe without parking.
           } else {
           const PARK_STEP_CAP = 6;
@@ -1081,42 +1110,33 @@ export class McuVisualPolicy {
                 state.closedLoopHistory = state.closedLoopHistory.slice(0, 5);
                 console.log(`[agentbeats] closed-loop probe iter=${plan.iteration}: put slot=${probed.slot}(${dest.name ?? "?"}) reason=${probed.reason ?? ""}`);
               }
-            } else if (probed.action === "hover") {
-              // Hover: servo cursor onto the slot, no click. The cursor
-              // is left there so MC renders the item tooltip in the next
-              // probe image. plan.skipNextPark prevents the park step
-              // from yanking the cursor off again.
-              const dest = layoutForProbe.slots[probed.slot];
-              if (!dest) {
-                console.warn(`[agentbeats] hover slot=${probed.slot}: not in layout; skipping`);
-              } else {
-                plan.pendingClick = {
-                  rasterIndex: dest.index, slotName: dest.name, slotRole: dest.role,
-                  frozenTarget: { x: dest.cx, y: dest.cy },
-                  button: "attack", shift: false, expectAfter: "should_fill",
-                  phase: "servo", retries: 0, kind: "hover" as "click",
-                  actionKind: "pickup" as "pickup", // unused for hover
-                };
-                plan.pendingChain = [];
-                plan.servoSteps = 0;
-                plan.skipNextPark = true;
-                plan.pendingTooltipRead = { slotIndex: probed.slot, x: dest.cx, y: dest.cy };
-                state.closedLoopHistory.unshift(`hover -> ${dest.name ?? probed.slot}`);
-                state.closedLoopHistory = state.closedLoopHistory.slice(0, 5);
-                console.log(`[agentbeats] closed-loop probe iter=${plan.iteration}: hover slot=${probed.slot}(${dest.name ?? "?"}) reason=${probed.reason ?? ""}`);
-              }
             } else if (probed.action === "verify_slots") {
-              // Batch tooltip inspection is parsed but not yet wired through
-              // the runtime. Degrade to hovering the FIRST slot so the agent
-              // still gets one tooltip on the next probe instead of stalling.
-              const firstSlot = probed.slots[0];
-              const dest = layoutForProbe.slots[firstSlot];
-              if (!dest) {
-                console.warn(`[agentbeats] verify_slots first slot=${firstSlot}: not in layout; skipping`);
+              // Batch tooltip inspection. Build a queue of {slot, x, y} from
+              // the requested raster indices, then arm the FIRST hover. The
+              // skipNextPark consumed branch (above) handles each settle:
+              // it runs TooltipOCR, writes slotMemory, and either dequeues
+              // the next slot (skipping the main probe) or — once the queue
+              // is empty — falls through to the next probe call. This is
+              // strictly cheaper than emitting per-slot hover actions
+              // because the main probe LLM call is NOT made between
+              // sequential captures inside one batch.
+              const queue = probed.slots
+                .map((s) => {
+                  const d = layoutForProbe.slots[s];
+                  return d ? { slot: s, x: d.cx, y: d.cy, name: d.name, role: d.role, index: d.index } : null;
+                })
+                .filter((e): e is NonNullable<typeof e> => e !== null);
+              if (queue.length === 0) {
+                console.warn(`[agentbeats] verify_slots: no resolvable slots in [${probed.slots.join(",")}]; skipping`);
               } else {
+                plan.pendingTooltipBatch = {
+                  slots: queue.map((q) => ({ slot: q.slot, x: q.x, y: q.y })),
+                  idx: 0,
+                };
+                const first = queue[0];
                 plan.pendingClick = {
-                  rasterIndex: dest.index, slotName: dest.name, slotRole: dest.role,
-                  frozenTarget: { x: dest.cx, y: dest.cy },
+                  rasterIndex: first.index, slotName: first.name, slotRole: first.role,
+                  frozenTarget: { x: first.x, y: first.y },
                   button: "attack", shift: false, expectAfter: "should_fill",
                   phase: "servo", retries: 0, kind: "hover" as "click",
                   actionKind: "pickup" as "pickup",
@@ -1124,9 +1144,10 @@ export class McuVisualPolicy {
                 plan.pendingChain = [];
                 plan.servoSteps = 0;
                 plan.skipNextPark = true;
-                state.closedLoopHistory.unshift(`verify_slots[0] -> hover ${dest.name ?? firstSlot}`);
+                plan.pendingTooltipRead = { slotIndex: first.slot, x: first.x, y: first.y };
+                state.closedLoopHistory.unshift(`verify_slots[${queue.length}] -> ${queue.map((q) => q.name ?? q.slot).join(",")}`);
                 state.closedLoopHistory = state.closedLoopHistory.slice(0, 5);
-                console.log(`[agentbeats] verify_slots degraded to single hover slot=${firstSlot}; batch capture not yet wired`);
+                console.log(`[agentbeats] verify_slots batch=${queue.length}: first slot=${first.slot}(${first.name ?? "?"})`);
               }
             } else {
               // Legacy low-level actions: pickup / place_one / place_all / take.
