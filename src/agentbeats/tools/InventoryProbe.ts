@@ -385,6 +385,7 @@ export async function probeNextCraftAction(opts: {
     ...(knownSlotsText ? ["", knownSlotsText] : []),
     "",
     `The image has YELLOW NUMBERED BADGES drawn at the corner of each slot. Read the badge numbers directly from the image to choose a slot index.`,
+    `When searching for an ingredient that is NOT yet in Known slot contents: scan the HOTBAR (the bottom row of slots) FIRST, then the MAIN INVENTORY (three rows above the hotbar). Tasks typically place ingredients in the hotbar at episode start, so the hotbar should be your primary search region. Cover ALL hotbar slots before assuming an ingredient is missing.`,
     "",
     `State:`,
     `  ${cursorState}`,
