@@ -762,7 +762,7 @@ export function discoverSlots(jpegBase64: string): DiscoveredLayout | null {
 // =========================================================================
 // Unified detection: discoverSlots + LogicalLayout matching.
 // =========================================================================
-import { ALL_LAYOUTS, slotScreenCenter, type LogicalLayout } from "./InventoryLayouts";
+import { ALL_LAYOUTS, slotScreenCenter, type LogicalLayout } from "../InventoryLayouts";
 
 function aspect(w: number, h: number): number {
   return h === 0 ? 0 : w / h;

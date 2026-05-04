@@ -23,10 +23,10 @@ import {
   servoCursorStep,
   type ClosedLoopCraftPlan,
   type UiFastControlFrame,
-} from "./UiFastControl";
-import { probeNextCraftAction, vlmVerifySlotState } from "./InventoryProbe";
-import { detectCursorWithExpectation, detectGuiLayout, samplePatchFingerprint } from "./SlotDetector";
-import { getDebugRecorder } from "./DebugRecorder";
+} from "./tools/UiFastControl";
+import { probeNextCraftAction, vlmVerifySlotState } from "./tools/InventoryProbe";
+import { detectCursorWithExpectation, detectGuiLayout, samplePatchFingerprint } from "./tools/SlotDetector";
+import { getDebugRecorder } from "./tools/DebugRecorder";
 
 type McuInitPayload = {
   type: "init";
@@ -912,13 +912,13 @@ export class McuVisualPolicy {
                 state.closedLoopHistory.unshift(`refused move to=${probed.to}(${toSlot.name}) (would swap with returned ingredient stack)`);
                 state.closedLoopHistory = state.closedLoopHistory.slice(0, 5);
               } else {
-                const mkClick = (s: { index: number; name?: string; role?: string; cx: number; cy: number }, button: "attack" | "use", expectAfter: "should_empty" | "should_fill", actionKind: "pickup" | "place_one" | "place_all" | "take", kind: "click" | "auto_return"): import("./UiFastControl").PendingClick => ({
+                const mkClick = (s: { index: number; name?: string; role?: string; cx: number; cy: number }, button: "attack" | "use", expectAfter: "should_empty" | "should_fill", actionKind: "pickup" | "place_one" | "place_all" | "take", kind: "click" | "auto_return"): import("./tools/UiFastControl").PendingClick => ({
                   rasterIndex: s.index, slotName: s.name, slotRole: s.role,
                   frozenTarget: { x: s.cx, y: s.cy },
                   button, shift: false, expectAfter,
                   phase: "servo", retries: 0, kind, actionKind,
                 });
-                const chain: import("./UiFastControl").PendingClick[] = [];
+                const chain: import("./tools/UiFastControl").PendingClick[] = [];
                 chain.push(mkClick(fromSlot, "attack", "should_empty", "pickup", "click"));
                 if (probed.count === "all") {
                   chain.push(mkClick(toSlot, "attack", "should_fill", "place_all", "click"));

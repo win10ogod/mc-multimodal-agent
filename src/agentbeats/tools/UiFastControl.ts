@@ -16,7 +16,7 @@
  * benchmark's 640x360 obs resolution. No task-name-based hardcoding.
  */
 import minecraftData from "minecraft-data";
-import { defaultMcuAction, type McuEnvAction } from "./McuPrompt";
+import { defaultMcuAction, type McuEnvAction } from "../McuPrompt";
 import type { GuiLayout } from "./SlotDetector";
 
 export type UiFastControlFrame = {
