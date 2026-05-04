@@ -826,7 +826,17 @@ export class McuVisualPolicy {
                   chain.push(mkClick(toSlot, "use", "should_fill", "place_one", "click"));
                   chain.push(mkClick(fromSlot, "attack", "should_fill", "place_all", "auto_return"));
                 }
-                plan.pickupSourceSlot = { index: fromSlot.index, name: fromSlot.name };
+                // Only record pickupSourceSlot when picking from a real
+                // ingredient source (hotbar/main_inv). Moves whose source
+                // is the result slot or a craft grid slot must NOT
+                // overwrite the recorded source -- that source is the
+                // slot we need to AVOID dumping crafted output into.
+                const fromIsIngredientSource =
+                  fromSlot.role === "hotbar" || fromSlot.role === "main_inv";
+                if (fromIsIngredientSource) {
+                  plan.pickupSourceSlot = { index: fromSlot.index, name: fromSlot.name };
+                  console.log(`[agentbeats] recorded pickupSourceSlot=${fromSlot.index} (${fromSlot.name ?? "?"}) for move`);
+                }
                 plan.pendingClick = chain.shift()!;
                 plan.pendingChain = chain;
                 plan.servoSteps = 0;
@@ -871,9 +881,10 @@ export class McuVisualPolicy {
                 state.closedLoopHistory.unshift(`refused take slot=${probed.slot} (cursor not empty)`);
                 state.closedLoopHistory = state.closedLoopHistory.slice(0, 5);
               } else {
-                if (probed.action === "pickup") {
+                if (probed.action === "pickup"
+                    && (probedSlot.role === "hotbar" || probedSlot.role === "main_inv")) {
                   plan.pickupSourceSlot = { index: probed.slot, name: probedSlot.name };
-                  console.log(`[agentbeats] recorded pickupSourceSlot=${probed.slot} (${probedSlot.name ?? "?"})`);
+                  console.log(`[agentbeats] recorded pickupSourceSlot=${probed.slot} (${probedSlot.name ?? "?"}) for legacy pickup`);
                 }
                 // Pre-take auto-return: "take" requires an empty cursor
                 // (otherwise it does nothing in MC). If we have a
