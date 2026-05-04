@@ -316,7 +316,97 @@ export function guiSlotsByRole(layout: GuiLayout, role: string): GuiSlot[] {
  *  ~10x16 footprint and is not at a slot's typical position (helps avoid
  *  matching white items in slots). Returns null if no plausible cursor
  *  is found. */
+// Binary template of the MC GUI cursor sprite at 1x scale: 8 cols x 12
+// rows. 1 = expect white, 0 = expect non-white. The shape is an arrow
+// pointing up-left: dense 1s at the top-left tip with a diagonal tail
+// going down-right. This template lets us match the cursor against the
+// obs frame by pixel-similarity instead of relying on heuristic shape
+// rules (which kept locking onto static white blobs like the avatar
+// or slot highlights).
+const CURSOR_TEMPLATE: number[][] = [
+  [1, 1, 0, 0, 0, 0, 0, 0],
+  [1, 1, 1, 0, 0, 0, 0, 0],
+  [1, 1, 1, 1, 0, 0, 0, 0],
+  [1, 0, 0, 1, 1, 0, 0, 0],
+  [1, 0, 0, 0, 1, 1, 0, 0],
+  [0, 0, 0, 0, 0, 1, 1, 0],
+  [0, 0, 0, 0, 0, 0, 1, 1],
+  [0, 0, 0, 0, 0, 0, 0, 1],
+  [0, 0, 0, 0, 0, 0, 0, 0],
+  [0, 0, 0, 0, 0, 0, 0, 0],
+  [0, 0, 0, 0, 0, 0, 0, 0],
+  [0, 0, 0, 0, 0, 0, 0, 0],
+];
+const TPL_W = 8, TPL_H = 12;
+let TPL_ON_COUNT = 0;
+for (const row of CURSOR_TEMPLATE) for (const v of row) if (v) TPL_ON_COUNT += 1;
+
+/** Pixel-template match for the MC GUI cursor sprite. Slides the
+ *  CURSOR_TEMPLATE across the white-pixel mask of the obs frame and
+ *  returns the (x, y) of the best-scoring top-left position. Returns
+ *  null when no position scores above the minimum confidence
+ *  threshold. */
+export function detectCursorTemplate(jpegBase64: string): { x: number; y: number } | null {
+  const cleaned = jpegBase64.startsWith("data:image/")
+    ? jpegBase64.replace(/^data:image\/[a-z]+;base64,/, "")
+    : jpegBase64;
+  const buf = Buffer.from(cleaned, "base64");
+  let decoded;
+  try { decoded = jpeg.decode(buf, { useTArray: true, formatAsRGBA: true }); } catch { return null; }
+  const { width: w, height: h, data } = decoded;
+  // Build white-pixel mask once.
+  const mask = new Uint8Array(w * h);
+  for (let y = 0; y < h; y += 1) {
+    for (let x = 0; x < w; x += 1) {
+      const i = (y * w + x) * 4;
+      const r = data[i], g = data[i + 1], b = data[i + 2];
+      if (r >= 235 && g >= 235 && b >= 235 && Math.max(r, g, b) - Math.min(r, g, b) <= 12) {
+        mask[y * w + x] = 1;
+      }
+    }
+  }
+  // Slide template; reward template-on hitting white, penalize template-on
+  // missing white and template-off finding white.
+  let bestScore = -Infinity;
+  let bestX = -1, bestY = -1;
+  const xMax = w - TPL_W;
+  const yMax = h - TPL_H;
+  for (let y = 0; y <= yMax; y += 1) {
+    for (let x = 0; x <= xMax; x += 1) {
+      let score = 0;
+      for (let dy = 0; dy < TPL_H; dy += 1) {
+        for (let dx = 0; dx < TPL_W; dx += 1) {
+          const tpl = CURSOR_TEMPLATE[dy][dx];
+          const m = mask[(y + dy) * w + (x + dx)];
+          if (tpl === 1) score += m ? 2 : -2;
+          else if (m) score -= 1;
+        }
+      }
+      if (score > bestScore) {
+        bestScore = score;
+        bestX = x;
+        bestY = y;
+      }
+    }
+  }
+  // Min confidence: the template has TPL_ON_COUNT ON pixels, perfect
+  // score = 2 * TPL_ON_COUNT. Require >=60% of perfect.
+  const minScore = Math.floor(TPL_ON_COUNT * 2 * 0.6);
+  if (bestScore < minScore) return null;
+  return { x: bestX, y: bestY };
+}
+
 export function detectCursor(jpegBase64: string, _layout: GuiLayout): { x: number; y: number } | null {
+  // Try template matching first -- it's far more discriminative than the
+  // shape-heuristic blob detector, which keeps locking onto the avatar
+  // or slot highlights. Fall back to the heuristic only if template
+  // match returns null.
+  const tpl = detectCursorTemplate(jpegBase64);
+  if (tpl) return tpl;
+  return detectCursorBlob(jpegBase64);
+}
+
+function detectCursorBlob(jpegBase64: string): { x: number; y: number } | null {
   const cleaned = jpegBase64.startsWith("data:image/")
     ? jpegBase64.replace(/^data:image\/[a-z]+;base64,/, "")
     : jpegBase64;
@@ -440,31 +530,15 @@ export function detectCursor(jpegBase64: string, _layout: GuiLayout): { x: numbe
 export function detectCursorWithExpectation(
   jpegBase64: string,
   layout: GuiLayout,
-  expected: { x: number; y: number } | null,
-  maxDistPx = 60,
+  _expected: { x: number; y: number } | null,
+  _maxDistPx = 60,
 ): { x: number; y: number } | null {
-  const candidates = detectCursorCandidates(jpegBase64, layout);
-  if (candidates.length === 0) return null;
-  if (!expected) {
-    let best = candidates[0];
-    for (const c of candidates) if (c.area > best.area) best = c;
-    return { x: best.x, y: best.y };
-  }
-  let best: { x: number; y: number; area: number; w: number; h: number; dist: number } | null = null;
-  for (const c of candidates) {
-    const dist = Math.hypot(c.x - expected.x, c.y - expected.y);
-    if (dist > maxDistPx) continue;
-    if (!best || dist < best.dist) {
-      best = { ...c, dist };
-    }
-  }
-  // No in-tolerance candidate -- fall back to largest blob
-  if (!best) {
-    let bigBlob = candidates[0];
-    for (const c of candidates) if (c.area > bigBlob.area) bigBlob = c;
-    return { x: bigBlob.x, y: bigBlob.y };
-  }
-  return { x: best.x, y: best.y };
+  // Currently just delegates to the shape-filtered detectCursor. The
+  // expected-position disambiguation path was never reliable in practice
+  // and tended to lock onto raw white blobs (avatar, slot highlights)
+  // when its candidate source ignored the shape filter. Keep the
+  // signature for API compatibility; route through the shape filter.
+  return detectCursor(jpegBase64, layout);
 }
 
 /** Detect whether the GUI cursor is currently carrying an item icon.
