@@ -11,7 +11,7 @@
  *   to deterministic cursor moves on our side.
  */
 import type OpenAI from "openai";
-import { markInventoryFrame } from "../SlotMarker";
+import { markInventoryFrame } from "./SlotMarker";
 import type { GuiLayout } from "./SlotDetector";
 import { getDebugRecorder } from "./DebugRecorder";
 

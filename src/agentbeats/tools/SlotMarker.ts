@@ -14,7 +14,7 @@
  */
 import jpeg from "jpeg-js";
 import { PNG } from "pngjs";
-import { detectGuiLayout, type GuiLayout } from "./tools/SlotDetector";
+import { detectGuiLayout, type GuiLayout } from "./SlotDetector";
 
 // 3x5 bitmap font for digits 0-9 (rows = 5, cols = 3).
 // Each row's bits are MSB-first across the 3 columns.
