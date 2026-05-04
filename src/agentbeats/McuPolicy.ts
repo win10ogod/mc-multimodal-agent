@@ -954,38 +954,31 @@ export class McuVisualPolicy {
           // gate -- park rarely lands within 6 px because cam moves
           // are quantized.
           const cursorAtPark = !!cursor && Math.hypot(cursor.x - PARK_X, cursor.y - PARK_Y) < 14;
-          const HELD_OFF_X = 7;
-          const HELD_OFF_Y = 9;
           const cursorHolding: boolean | null = (() => {
-            // Baseline capture at first park (cursor is empty by
-            // construction at session start).
-            if (cursorAtPark && plan.parkEmptyBaseline === null) {
-              const fp = samplePatchFingerprint(payload.obs, PARK_X + HELD_OFF_X, PARK_Y + HELD_OFF_Y, 4);
-              if (fp) {
-                plan.parkEmptyBaseline = fp;
-                console.log(`[agentbeats] park baseline captured (held-region): meanR=${fp.meanR.toFixed(0)} G=${fp.meanG.toFixed(0)} B=${fp.meanB.toFixed(0)} stddev=${fp.stddev.toFixed(1)}`);
-              }
+            // Detection happens ONLY when cursor is at park (outside
+            // the GUI). Anywhere else we cannot tell whether a high-
+            // stddev patch is the held-item icon or an underlying slot.
+            if (!cursorAtPark) return null;
+            // Held-item icon renders ~8 px NW of cursor tip; at park
+            // that is in the dimmed world-view region (no slot icons).
+            const HELD_NW_X = -8, HELD_NW_Y = -8;
+            const live = samplePatchFingerprint(payload.obs, PARK_X + HELD_NW_X, PARK_Y + HELD_NW_Y, 4);
+            if (!live) return null;
+            // Baseline capture: first time cursor is at park, cursor is
+            // empty by construction (session start, no prior pickup).
+            if (plan.parkEmptyBaseline === null) {
+              plan.parkEmptyBaseline = live;
+              console.log(`[agentbeats] park baseline captured: meanR=${live.meanR.toFixed(0)} G=${live.meanG.toFixed(0)} B=${live.meanB.toFixed(0)} stddev=${live.stddev.toFixed(1)}`);
               return false;
             }
-            // Pure-CV path: park is now OUTSIDE the inventory window
-            // (dimmed world-view region), so the only thing that can
-            // change the held-item-region patch is an actual held-item
-            // icon overlaid on the cursor sprite at park. Park is
-            // deterministic; baseline compared against live patch.
-            if (cursorAtPark && plan.parkEmptyBaseline) {
-              const live = samplePatchFingerprint(payload.obs, PARK_X + HELD_OFF_X, PARK_Y + HELD_OFF_Y, 4);
-              if (live) {
-                const bl = plan.parkEmptyBaseline;
-                const dr = live.meanR - bl.meanR, dg = live.meanG - bl.meanG, db = live.meanB - bl.meanB;
-                const dist = Math.sqrt(dr * dr + dg * dg + db * db);
-                if (dist > 25) {
-                  console.log(`[agentbeats] cursorHolding=true (park dist=${dist.toFixed(1)})`);
-                  return true;
-                }
-                if (dist < 12) return false;
-                return null;
-              }
+            const bl = plan.parkEmptyBaseline;
+            const dr = live.meanR - bl.meanR, dg = live.meanG - bl.meanG, db = live.meanB - bl.meanB;
+            const dist = Math.sqrt(dr * dr + dg * dg + db * db);
+            if (dist > 15) {
+              console.log(`[agentbeats] cursorHolding=true (park dist=${dist.toFixed(1)})`);
+              return true;
             }
+            if (dist < 8) return false;
             return null;
           })();
           try {
