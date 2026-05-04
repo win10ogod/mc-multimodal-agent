@@ -938,11 +938,23 @@ export class McuVisualPolicy {
               console.log(`[agentbeats] re-detected SoM for fresh probe: ${fresh.matchedLayoutId ?? "unknown"} slots=${fresh.slots.length}`);
             }
           }
-          // CV cursor-holding detection is unreliable: the offset patch
-          // (cx+8, cy+8) routinely lands on a real inventory slot's
-          // item icon and reports false "holding". Pass null and let
-          // the VLM read held-item state visually from the SoM image.
-          const cursorHolding = null;
+          // CV cursor-holding detection: sample a small patch at the
+          // cursor's actual pixel position. An empty cursor is mostly
+          // the arrow sprite (a few light pixels on background) -> low
+          // stddev. A holding cursor adds a 10x10 item-icon overlay
+          // near the cursor -> high stddev. The previous "(cx+8,cy+8)"
+          // offset version landed on neighbor slots and reported false
+          // positives; sampling AT the cursor avoids that.
+          const cursorHolding: boolean | null = (() => {
+            if (!cursor) return null;
+            const patch = samplePatchFingerprint(payload.obs, cursor.x, cursor.y, 5);
+            if (!patch) return null;
+            // Empty cursor patches measure stddev ~ 10-25; holding
+            // with an item icon measures > 40 in observed runs.
+            if (patch.stddev > 40) return true;
+            if (patch.stddev < 25) return false;
+            return null;  // ambiguous band
+          })();
           try {
             // Build slot-memory snapshot keyed to current raster indices so
             // the probe sees "slot 1 = cobblestone (read 4 iters ago)" etc.
