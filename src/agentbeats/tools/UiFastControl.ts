@@ -528,6 +528,12 @@ export type ClosedLoopCraftPlan = {
    *  significant L2 distance means an item icon is overlaid on the
    *  cursor sprite at park, so the cursor is holding. */
   parkEmptyBaseline: { meanR: number; meanG: number; meanB: number; stddev: number } | null;
+  /** True for one probe cycle right after a CV-matched pickup verify
+   *  (slot's pixels confirmed transition filled->empty). The
+   *  cursor-holding signal AND-gates this with a park-baseline pixel
+   *  diff: only when BOTH are true do we report cursorHolding=true.
+   *  Cleared on the next matched place. */
+  recentMatchedPickup: boolean;
   /** When non-null, an OCR-on-settle is expected for the next obs frame
    *  (cursor was just hovered onto a slot; tooltip should be rendered). */
   pendingTooltipRead: { slotIndex: number; x: number; y: number; slotName?: string; retries?: number } | null;
@@ -648,6 +654,7 @@ export function planClosedLoopCraft(taskText: string): ClosedLoopCraftPlan {
     pendingTooltipRead: null,
     pendingOcrBatch: null,
     parkEmptyBaseline: null,
+    recentMatchedPickup: false,
   };
 }
 

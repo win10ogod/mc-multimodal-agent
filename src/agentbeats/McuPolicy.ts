@@ -901,9 +901,14 @@ export class McuVisualPolicy {
           // ON main_inv_0 in the player_inventory layout, which then
           // contaminated every pre-check sample of that slot
           // (cursor + held-item pixels read as "filled" stddev~137).
+          // Park OUTSIDE the inventory window in the dimmed world-view
+          // region. The previous park (windowX+4, windowY+4) actually
+          // lands on the helmet armor slot in player_inventory, which
+          // contaminates samples and clicks. Right-of-window stays
+          // inside the 640px obs and away from any inventory slot.
           const parkSpot = {
-            x: layout.windowX + 4,
-            y: layout.windowY + 4,
+            x: Math.min(630, layout.windowX + layout.windowW + 12),
+            y: layout.windowY + 8,
           };
           const distFromPark = cursor ? Math.hypot(cursor.x - parkSpot.x, cursor.y - parkSpot.y) : Infinity;
           if (distFromPark > 12 && plan.parkSteps < PARK_STEP_CAP) {
@@ -952,7 +957,8 @@ export class McuVisualPolicy {
           const HELD_OFF_X = 7;
           const HELD_OFF_Y = 9;
           const cursorHolding: boolean | null = (() => {
-            // Baseline capture at first park (cursor is empty there).
+            // Baseline capture at first park (cursor is empty by
+            // construction at session start).
             if (cursorAtPark && plan.parkEmptyBaseline === null) {
               const fp = samplePatchFingerprint(payload.obs, PARK_X + HELD_OFF_X, PARK_Y + HELD_OFF_Y, 4);
               if (fp) {
@@ -961,7 +967,11 @@ export class McuVisualPolicy {
               }
               return false;
             }
-            // Compare live park patch to baseline (most reliable).
+            // Pure-CV path: park is now OUTSIDE the inventory window
+            // (dimmed world-view region), so the only thing that can
+            // change the held-item-region patch is an actual held-item
+            // icon overlaid on the cursor sprite at park. Park is
+            // deterministic; baseline compared against live patch.
             if (cursorAtPark && plan.parkEmptyBaseline) {
               const live = samplePatchFingerprint(payload.obs, PARK_X + HELD_OFF_X, PARK_Y + HELD_OFF_Y, 4);
               if (live) {
@@ -969,18 +979,13 @@ export class McuVisualPolicy {
                 const dr = live.meanR - bl.meanR, dg = live.meanG - bl.meanG, db = live.meanB - bl.meanB;
                 const dist = Math.sqrt(dr * dr + dg * dg + db * db);
                 if (dist > 25) {
-                  console.log(`[agentbeats] cursorHolding=true (park-held dist=${dist.toFixed(1)} from baseline)`);
+                  console.log(`[agentbeats] cursorHolding=true (park dist=${dist.toFixed(1)})`);
                   return true;
                 }
                 if (dist < 12) return false;
-                console.log(`[agentbeats] cursorHolding=null (park-held dist=${dist.toFixed(1)} ambiguous)`);
                 return null;
               }
             }
-            // Cursor not at park OR no baseline yet -> we cannot decide
-            // reliably. Returning null tells the prompt "UNKNOWN" rather
-            // than guessing from cursor-pixel stddev (which routinely
-            // false-positives on inventory slot icons).
             return null;
           })();
           try {
@@ -991,9 +996,24 @@ export class McuVisualPolicy {
             // hint, freeing the agent from re-hovering identified slots.
             plan.slotMemory.pruneStale(plan.iteration);
             const knownSlots: Array<{ index: number; name?: string; item: string; ageIters: number }> = [];
+            // CV item-disappearance scan: for each slot we know holds
+            // an item from prior OCR, sample its current pixel patch.
+            // If the patch stddev is now low (slot looks empty), the
+            // item disappeared since OCR. Combined with park cursor
+            // diff, that tells us the cursor likely picked up that
+            // item.
+            const disappearedItems: string[] = [];
             for (const s of layoutForProbe.slots) {
               const mem = plan.slotMemory.lookup(s.cx, s.cy);
               if (mem && mem.item !== "empty" && mem.item !== "unknown") {
+                const live = samplePatchFingerprint(payload.obs, s.cx, s.cy, 6);
+                if (live && live.stddev < 25) {
+                  // Slot was known filled, now visually empty.
+                  disappearedItems.push(mem.item);
+                  plan.slotMemory.invalidate(s.cx, s.cy);
+                  console.log(`[agentbeats] item disappeared: '${mem.item}' was at slot ${s.index}(${s.name ?? "?"}) -- cursor likely holds it`);
+                  continue;  // don't include in knownSlots
+                }
                 knownSlots.push({ index: s.index, name: s.name, item: mem.item, ageIters: plan.iteration - mem.step });
               }
             }
@@ -1007,6 +1027,7 @@ export class McuVisualPolicy {
               recentActions: state.closedLoopHistory,
               cursorHolding,
               pickupSourceSlot: plan.pickupSourceSlot ?? null,
+              disappearedItems,
               knownSlots,
             });
             plan.iteration += 1;

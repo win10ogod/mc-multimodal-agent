@@ -233,6 +233,10 @@ export async function probeNextCraftAction(opts: {
    *  raster indices. Surfaced as a text line in the prompt so the agent
    *  doesn't re-hover slots whose contents have already been read. */
   knownSlots?: Array<{ index: number; name?: string; item: string; ageIters: number }>;
+  /** Items whose previously-known slot is now visually empty -- they
+   *  likely just got picked up onto the cursor. Surfaced to the agent
+   *  as "Cursor likely holds: X". CV-only signal. */
+  disappearedItems?: string[];
 }): Promise<CraftProbeResult> {
   // Set-of-Mark: render the obs frame with numbered badges drawn at every
   // slot's pixel center so the VLM grounds slot indices visually instead of
@@ -262,13 +266,19 @@ export async function probeNextCraftAction(opts: {
     ? "(none yet)"
     : historyLines.map((a, i) => `  ${i === 0 ? "most recent" : `${i + 1} ago`}: ${a}`).join("\n");
 
-  // CV-only cursor state. No rule-based logical tracking -- if CV
-  // hasn't observed it, we don't claim it.
+  // CV-only cursor state. The disappearedItems list (CV-derived)
+  // attaches likely identity when an item visibly left a slot.
+  const disappeared = opts.disappearedItems ?? [];
+  const identityHint = disappeared.length > 0
+    ? ` Likely holding (CV: items that disappeared from their slots): ${disappeared.join(", ")}.`
+    : "";
   const cursorState = opts.cursorHolding === true
-    ? "CURSOR IS HOLDING an item (CV-detected). Identity unknown unless visible in the image."
+    ? `CURSOR IS HOLDING an item (CV-detected).${identityHint || " Identity unknown unless visible in the image."}`
     : opts.cursorHolding === false
       ? "CURSOR IS EMPTY (CV-detected)."
-      : "CURSOR STATE UNKNOWN.";
+      : disappeared.length > 0
+        ? `CURSOR STATE UNKNOWN, but${identityHint}`
+        : "CURSOR STATE UNKNOWN.";
 
   // Recipe-info hint (read-only, derived from minecraft-data). Helps the VLM
   // disambiguate multi-ingredient placement without surfacing live state.
