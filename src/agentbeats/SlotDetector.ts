@@ -403,6 +403,43 @@ export function detectCursor(jpegBase64: string, layout: GuiLayout): { x: number
   return best ? { x: Math.round(best.cx), y: Math.round(best.cy) } : null;
 }
 
+/** Disambiguating cursor detector: returns the cursor candidate closest to
+ *  an EXPECTED position. The plain `detectCursor` picks the largest white
+ *  blob, which can latch onto static GUI features (slot highlights, item
+ *  icon edges) and report the same phantom pixel for many frames despite
+ *  the sim moving the cursor. By tracking an assumed cursor (advanced
+ *  open-loop from emitted cam deltas), we pick the candidate that matches
+ *  motion expectation. Falls back to largest-blob if `expected` is null. */
+export function detectCursorWithExpectation(
+  jpegBase64: string,
+  layout: GuiLayout,
+  expected: { x: number; y: number } | null,
+  maxDistPx = 60,
+): { x: number; y: number } | null {
+  const candidates = detectCursorCandidates(jpegBase64, layout);
+  if (candidates.length === 0) return null;
+  if (!expected) {
+    let best = candidates[0];
+    for (const c of candidates) if (c.area > best.area) best = c;
+    return { x: best.x, y: best.y };
+  }
+  let best: { x: number; y: number; area: number; w: number; h: number; dist: number } | null = null;
+  for (const c of candidates) {
+    const dist = Math.hypot(c.x - expected.x, c.y - expected.y);
+    if (dist > maxDistPx) continue;
+    if (!best || dist < best.dist) {
+      best = { ...c, dist };
+    }
+  }
+  // No in-tolerance candidate -- fall back to largest blob
+  if (!best) {
+    let bigBlob = candidates[0];
+    for (const c of candidates) if (c.area > bigBlob.area) bigBlob = c;
+    return { x: bigBlob.x, y: bigBlob.y };
+  }
+  return { x: best.x, y: best.y };
+}
+
 /** Detect whether the GUI cursor is currently carrying an item icon.
  *  The held-item sprite is centered roughly 8px down-right of the cursor
  *  TIP. Sample a 12x12 patch there: high stddev (item icon edges) means

@@ -24,7 +24,7 @@ import {
   type UiFastControlFrame,
 } from "./UiFastControl";
 import { probeNextCraftAction } from "./InventoryProbe";
-import { detectCursor, detectGuiLayout, samplePatchFingerprint } from "./SlotDetector";
+import { detectCursorWithExpectation, detectGuiLayout, samplePatchFingerprint } from "./SlotDetector";
 
 type McuInitPayload = {
   type: "init";
@@ -701,11 +701,22 @@ export class McuVisualPolicy {
       if (!layout) {
         // Already handled above (plan.done=true path)
       } else {
-        // Trust the cursor detector: prior stale-detection heuristic
-        // produced false positives (the cursor really was where it was
-        // reported) and aborted legitimate pendingClicks, ruining
-        // runs. Just pass the reading straight through.
-        const cursor = detectCursor(payload.obs, layout);
+        // Cursor detection with motion-expectation disambiguation.
+        // The plain largest-white-blob detector latches onto static GUI
+        // features (slot highlights, item icon edges) and reports a
+        // phantom pixel for many frames. Track an EXPECTED position
+        // open-loop from the cam deltas we emitted, and prefer the
+        // candidate closest to that expectation.
+        const PX_PER_CAM_PITCH_OL = 5.0;
+        const PX_PER_CAM_YAW_OL = 8.5;
+        let expected: { x: number; y: number } | null = plan.cursor;
+        if (expected && (plan.lastEmittedCam[0] !== 0 || plan.lastEmittedCam[1] !== 0)) {
+          expected = {
+            x: expected.x + plan.lastEmittedCam[1] * PX_PER_CAM_YAW_OL,
+            y: expected.y + plan.lastEmittedCam[0] * PX_PER_CAM_PITCH_OL,
+          };
+        }
+        const cursor = detectCursorWithExpectation(payload.obs, layout, expected);
         plan.cursor = cursor ?? plan.cursor;
 
         // Before each new probe, park the cursor in a clear left-side
