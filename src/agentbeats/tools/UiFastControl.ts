@@ -203,10 +203,15 @@ export function parseTargetItem(taskText: string): string | null {
 }
 
 type RecipeIngredient = { name: string; count: number };
-type RecipeInfo = {
+export type RecipeInfo = {
   target: string;
   ingredients: RecipeIngredient[];
   requiresTable: boolean;
+  /** When non-null, the recipe is SHAPED -- each cell is identified by
+   *  ingredient name (or null for empty). Row-major. Caller can map this
+   *  to the craft grid's raster slots to emit a position-correct plan.
+   *  When null, the recipe is shapeless and any cell arrangement works. */
+  inShape: Array<Array<string | null>> | null;
 };
 
 export function lookupRecipe(target: string, version = "1.20.4"): RecipeInfo | null {
@@ -263,10 +268,21 @@ export function lookupRecipe(target: string, version = "1.20.4"): RecipeInfo | n
     const def = data.items[id];
     if (def) ingredients.push({ name: def.name, count });
   }
+  // Build inShape with item-name strings for shaped recipes; null for
+  // shapeless. Caller maps row/col to raster craft-grid cells.
+  let inShape: Array<Array<string | null>> | null = null;
+  if (recipe.inShape) {
+    inShape = recipe.inShape.map((row) => row.map((id) => {
+      if (typeof id !== "number" || id <= 0) return null;
+      const def = data.items[id];
+      return def ? def.name : null;
+    }));
+  }
   return {
     target: resolvedName,
     ingredients,
     requiresTable: !!recipe.requiresTable,
+    inShape,
   };
 }
 

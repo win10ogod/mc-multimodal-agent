@@ -343,34 +343,61 @@ export async function probeNextCraftAction(opts: {
         if (s.slot != null) lines.push(`  - ${s.count}x ${s.ingredient}: take from slot ${s.slot}${s.name ? `(${s.name})` : ""}`);
         else lines.push(`  - ${s.count}x ${s.ingredient}: NOT yet identified in Known -- emit verify_slots over candidate inventory slots first`);
       }
-      // If all sources are identified AND we have at least sum(count)
-      // craft-grid slots available, emit an explicit interleaved plan.
+      // Emit an explicit per-step placement plan when all sources are
+      // identified AND the craft grid has enough cells. Two cases:
+      //   (a) recipe.inShape != null -> SHAPED. Map each non-null cell
+      //       in inShape to a craft slot in row-major order; fill that
+      //       cell from the matching ingredient's source slot.
+      //   (b) shapeless -> round-robin interleave through ingredients,
+      //       walking craft slots in raster order (Z direction).
       const allKnown = sources.every((s) => s.slot != null);
       const craftSlots = detectedLayout.slots.filter((s) => s.role === "craft_2x2" || s.role === "craft_3x3");
       const totalNeeded = recipeInfo.ingredients.reduce((acc, it) => acc + it.count, 0);
       if (allKnown && craftSlots.length >= totalNeeded) {
-        // Interleave ingredients: e.g. [cobble, quartz, cobble, quartz].
-        const queues: Array<{ ingredient: string; slot: number; name?: string; remaining: number }> = sources.map((s) => ({
-          ingredient: s.ingredient, slot: (s as { slot: number }).slot, name: (s as { name?: string }).name, remaining: s.count,
-        }));
         const placements: Array<{ ingredient: string; from: number; fromName?: string; to: number; toName?: string }> = [];
-        let ci = 0;
-        while (queues.some((q) => q.remaining > 0)) {
-          const q = queues[ci % queues.length];
-          if (q.remaining > 0) {
-            const cell = craftSlots[placements.length];
-            placements.push({ ingredient: q.ingredient, from: q.slot, fromName: q.name, to: cell.index, toName: cell.name });
-            q.remaining -= 1;
+        if (recipeInfo.inShape) {
+          // Shaped: walk inShape row-major; map each non-null cell to
+          // the i-th craft slot. inShape rows match the craft grid's
+          // top-to-bottom rows; cells match left-to-right.
+          const rows = recipeInfo.inShape;
+          const gridCols = craftSlots.length === 9 ? 3 : (craftSlots.length === 4 ? 2 : Math.max(...rows.map((r) => r.length)));
+          for (let r = 0; r < rows.length; r += 1) {
+            for (let c = 0; c < rows[r].length; c += 1) {
+              const ing = rows[r][c];
+              if (!ing) continue;
+              const slotIdxInGrid = r * gridCols + c;
+              const cell = craftSlots[slotIdxInGrid];
+              if (!cell) continue;
+              const src = sources.find((s) => s.ingredient === ing) as { slot: number; name?: string } | undefined;
+              if (!src) continue;
+              placements.push({ ingredient: ing, from: src.slot, fromName: src.name, to: cell.index, toName: cell.name });
+            }
           }
-          ci += 1;
+        } else {
+          // Shapeless: round-robin interleave through ingredients.
+          const queues: Array<{ ingredient: string; slot: number; name?: string; remaining: number }> = sources.map((s) => ({
+            ingredient: s.ingredient, slot: (s as { slot: number }).slot, name: (s as { name?: string }).name, remaining: s.count,
+          }));
+          let ci = 0;
+          while (queues.some((q) => q.remaining > 0)) {
+            const q = queues[ci % queues.length];
+            if (q.remaining > 0) {
+              const cell = craftSlots[placements.length];
+              placements.push({ ingredient: q.ingredient, from: q.slot, fromName: q.name, to: cell.index, toName: cell.name });
+              q.remaining -= 1;
+            }
+            ci += 1;
+          }
         }
-        lines.push("Suggested placement plan (execute one step per probe iteration; emit move{from,to,count:'one'}):");
-        for (let i = 0; i < placements.length; i += 1) {
-          const p = placements[i];
-          lines.push(`  Step ${i + 1}: move from=${p.from}${p.fromName ? `(${p.fromName})` : ""} to=${p.to}${p.toName ? `(${p.toName})` : ""}  // place ${p.ingredient}`);
+        if (placements.length > 0) {
+          lines.push(`Suggested placement plan (${recipeInfo.inShape ? "SHAPED" : "shapeless"}; execute one step per probe iteration; emit move{from,to,count:'one'}):`);
+          for (let i = 0; i < placements.length; i += 1) {
+            const p = placements[i];
+            lines.push(`  Step ${i + 1}: move from=${p.from}${p.fromName ? `(${p.fromName})` : ""} to=${p.to}${p.toName ? `(${p.toName})` : ""}  // place ${p.ingredient}`);
+          }
+          lines.push(`After all ${placements.length} placements, take the crafted result from the result slot.`);
+          lines.push(`Use Recent actions to count how many steps you have already executed; do NOT repeat a step that has already verified OK in Recent.`);
         }
-        lines.push(`After all ${placements.length} placements, take the crafted result from the result slot.`);
-        lines.push(`Use Recent actions to count how many steps you have already executed; do NOT repeat a step that has already verified OK in Recent.`);
       }
     }
     return lines.join("\n");
