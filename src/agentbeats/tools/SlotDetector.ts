@@ -738,15 +738,29 @@ export function discoverSlots(jpegBase64: string): DiscoveredLayout | null {
   }
   if (candidates.length === 0) return null;
 
-  // Raster-order by row band, then x. Row band = quantize cy to slot stride.
-  const stride = Math.max(8, Math.round(expectedSide * 1.1));
-  candidates.sort((a, b) => {
-    const ra = Math.round(a.cy / stride);
-    const rb = Math.round(b.cy / stride);
-    if (ra !== rb) return ra - rb;
-    return a.cx - b.cx;
-  });
-  candidates.forEach((s, i) => { s.index = i; });
+  // Raster-order by clustering slots into row groups using a tight cy
+  // tolerance, then sorting each row by cx. The previous version
+  // quantized cy by stride which mis-grouped neighboring slots that
+  // straddled a stride boundary -- so the SoM badges came out in
+  // jumbled order (e.g. hotbar reading 42, 40, 41, 43, ...) and the
+  // agent could not reason about "the next slot to the right".
+  // Wide tolerance: bbox cy can shift upward by several pixels when
+  // an item icon occupies the slot, so a strict tolerance jumbles
+  // neighboring slots in the same physical row.
+  const ROW_TOL = Math.max(6, Math.round(expectedSide * 0.6));
+  const sortedByY = [...candidates].sort((a, b) => a.cy - b.cy);
+  const rows: Array<typeof sortedByY> = [];
+  for (const s of sortedByY) {
+    const last = rows[rows.length - 1];
+    if (last && Math.abs(last[0].cy - s.cy) <= ROW_TOL) last.push(s);
+    else rows.push([s]);
+  }
+  for (const row of rows) row.sort((a, b) => a.cx - b.cx);
+  const flattened = rows.flat();
+  flattened.forEach((s, i) => { s.index = i; });
+  // Mutate the original candidates array order to match for downstream consumers.
+  candidates.length = 0;
+  for (const s of flattened) candidates.push(s);
 
   return {
     windowX: bbox.x,
@@ -859,14 +873,23 @@ function annotateWithLayout(
     out.push({ index: 0, cx: u.cx, cy: u.cy, w: u.w, h: u.h });
   }
 
-  // 3. Re-sort raster order and re-index.
-  const stride = Math.max(8, Math.round(disc.slotPx * 1.1));
-  out.sort((a, b) => {
-    const ra = Math.round(a.cy / stride);
-    const rb = Math.round(b.cy / stride);
-    if (ra !== rb) return ra - rb;
-    return a.cx - b.cx;
-  });
+  // 3. Re-sort raster order and re-index. Cluster by cy with a wider
+  // tolerance because bbox cy can shift upward when an item icon
+  // occupies the slot (the icon's bounding box pulls the centroid up
+  // by ~3-5 px relative to an empty slot); a stride-based row
+  // assignment then jumbles neighbors. ROW_TOL ~ 0.6 * slot side
+  // tolerates that shift while still separating distinct physical rows.
+  const ROW_TOL = Math.max(6, Math.round(disc.slotPx * 0.6));
+  const sortedByY = [...out].sort((a, b) => a.cy - b.cy);
+  const rows: Array<typeof sortedByY> = [];
+  for (const s of sortedByY) {
+    const last = rows[rows.length - 1];
+    if (last && Math.abs(last[0].cy - s.cy) <= ROW_TOL) last.push(s);
+    else rows.push([s]);
+  }
+  for (const row of rows) row.sort((a, b) => a.cx - b.cx);
+  out.length = 0;
+  for (const s of rows.flat()) out.push(s);
   out.forEach((s, i) => { s.index = i; });
 
   return out;
