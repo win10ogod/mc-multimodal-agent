@@ -16,6 +16,15 @@ import {
   type McuEnvAction,
   type McuPolicyDecision,
 } from "./McuPrompt";
+import {
+  buildCraftOpenInventoryFrames,
+  planClosedLoopCraft,
+  servoCursorStep,
+  type ClosedLoopCraftPlan,
+  type UiFastControlFrame,
+} from "./UiFastControl";
+import { probeNextCraftAction } from "./InventoryProbe";
+import { detectCursorWithExpectation, detectGuiLayout, samplePatchFingerprint } from "./SlotDetector";
 
 type McuInitPayload = {
   type: "init";
@@ -36,6 +45,16 @@ type McuContextState = {
   holdUntilStep: number;
   recentActions: McuEnvAction[];
   recentObservationImages: string[];
+  pendingMacroFrames: UiFastControlFrame[];
+  closedLoopCraft: ClosedLoopCraftPlan | null;
+  /** Short labels of the most recent closed-loop probe actions (newest first),
+   *  passed back to the VLM each iteration so it doesn't repeat itself. */
+  closedLoopHistory: string[];
+  /** When true, the policy emits no-op actions without calling the
+   *  VLM for the rest of the episode. Set by the closed-loop probe
+   *  saying "done". The benchmark can't be told to early-end, but
+   *  this saves API budget for the remaining steps. */
+  earlyStop: boolean;
 };
 
 const ACTION_PAYLOAD_PREFIX = {
@@ -212,7 +231,7 @@ export function normalizeMcuAction(value: unknown): McuEnvAction {
   return action;
 }
 
-export function parseMcuActionText(text: string): McuPolicyDecision | undefined {
+export function parseMcuActionText(text: string): (McuPolicyDecision & { task_done?: boolean }) | undefined {
   for (const candidate of jsonCandidates(text)) {
     try {
       const parsed = JSON.parse(candidate) as unknown;
@@ -221,10 +240,12 @@ export function parseMcuActionText(text: string): McuPolicyDecision | undefined 
       }
       const actionSource = isRecord(parsed.action) ? parsed.action : parsed;
       const hold = Number.parseInt(String(parsed.hold_steps ?? parsed.holdSteps ?? ""), 10);
+      const taskDone = parsed.task_done === true || parsed.taskDone === true;
       return {
         ...ACTION_PAYLOAD_PREFIX,
         hold_steps: Number.isFinite(hold) ? hold : undefined,
         action: normalizeMcuAction(actionSource),
+        task_done: taskDone,
       };
     } catch {
       // Try the next candidate.
@@ -352,8 +373,13 @@ export function taskSpecificGuidance(taskText: string): string {
       return "Task strategy: center reachable stone block faces and hold attack repeatedly until stone breaks.";
     case "crafting":
       return [
-        "Task strategy: ingredients are already in your starting inventory.",
-        "First press inventory (E) to open the GUI. Inside the inventory, place ingredients in the 2x2 craft grid for simple recipes, or right-click (use) the crafting table for 3x3 recipes. Always start by setting inventory to 1 on step 0 unless you are clearly already inside the GUI.",
+        "Task strategy: ingredients (and a crafting_table item if needed) are pre-given in inventory.",
+        "DONE CONDITION (CRITICAL): set task_done=true ONLY when the requested crafted item is VISIBLE in your MAIN INVENTORY GRID or HOTBAR row. The result slot inside the crafting GUI does NOT count -- the item is not yours until you take it out AND store it in an inventory slot. A common mistake: seeing oak_planks appear in the small result slot to the right of the 2x2 grid and immediately declaring done. That is wrong -- the planks must be moved into a real inventory slot first. If you only see the item in the result slot, keep working: take it out and place it in the inventory.",
+        "Open inventory ONCE with inventory=1 (single frame); after it is open, do NOT press inventory again until you are done — repeated inventory presses just toggle the GUI off and waste steps.",
+        "IMPORTANT: a CV-driven UI helper takes over cursor control automatically when the inventory is open for handled 2x2 recipes (oak_planks, crafting_table). Manual VLM cursor control runs at ~3% success rate. If the inventory is open and the helper is operating, emit a NO-OP action (no buttons pressed, camera=[0,0]) so the helper can run uninterrupted; do NOT issue camera deltas yourself.",
+        "For 3x3 recipes (furnace, cake, enchanting_table, ladder, bell, diorite, clock, bee_nest, stonecut): you must FIRST place the crafting_table block in the world. Select the hotbar slot holding the crafting_table, tilt camera down so a clear ground tile is centered, use=1 to place it, then use=1 again on the placed block to open the 3x3 GUI before placing ingredients.",
+        "Manual cursor control fallback (only for unhandled recipes): camera=[0,5] moves cursor right ~5, [0,-5] left, [5,0] down, [-5,0] up. use=1 places ONE item; attack=1 grabs/drops whole stack.",
+        "Loop avoidance: if you have issued the same single button (inventory, use, or attack) for more than ~10 consecutive frames with camera=[0,0] and nothing has changed visibly, switch strategy — emit camera deltas, walk forward, or close the GUI and re-approach.",
       ].join(" ");
     case "smelting":
       return [
@@ -542,6 +568,10 @@ export class McuVisualPolicy {
   private handleInit(contextId: string, payload: McuInitPayload): string {
     const taskText = payload.text?.trim() || "";
     const promptText = payload.prompt?.trim() || "";
+    const closedLoopCraft = planClosedLoopCraft(taskText);
+    const pendingMacroFrames: UiFastControlFrame[] = closedLoopCraft
+      ? buildCraftOpenInventoryFrames(closedLoopCraft.target)
+      : [];
     this.contexts.set(contextId, {
       taskText,
       promptText,
@@ -549,8 +579,14 @@ export class McuVisualPolicy {
       holdUntilStep: -1,
       recentActions: [],
       recentObservationImages: [],
+      pendingMacroFrames,
+      closedLoopCraft,
+      closedLoopHistory: [],
+      earlyStop: false,
     });
-    console.log(`[agentbeats] init context=${contextId} task=${JSON.stringify(taskText)}`);
+    console.log(
+      `[agentbeats] init context=${contextId} task=${JSON.stringify(taskText)} closedLoop=${closedLoopCraft ? `${closedLoopCraft.target} ingredient=${closedLoopCraft.ingredient}` : "none"}`,
+    );
     return JSON.stringify({
       type: "ack",
       success: true,
@@ -600,20 +636,501 @@ export class McuVisualPolicy {
   }
 
   private async handleObservation(contextId: string, payload: McuObservationPayload): Promise<McuPolicyDecision> {
-    const state = this.contexts.get(contextId) ?? {
+    const state: McuContextState = this.contexts.get(contextId) ?? {
       taskText: "",
       promptText: "",
       lastAction: defaultMcuAction(),
       holdUntilStep: -1,
       recentActions: [],
       recentObservationImages: [],
+      pendingMacroFrames: [],
+      closedLoopCraft: null,
+      closedLoopHistory: [],
+      earlyStop: false,
     };
     this.contexts.set(contextId, state);
 
     const step = Math.max(0, Number.isFinite(payload.step) ? Number(payload.step) : 0);
+
+    // VLM-driven early stop: when the model previously set task_done=true,
+    // do not call it again for the rest of the episode. Emit a dummy
+    // no-op action each step. The benchmark cannot be early-ended by
+    // the agent, but skipping API calls saves significant cost while
+    // the env burns through its remaining max_steps.
+    if (state.earlyStop) {
+      return { ...ACTION_PAYLOAD_PREFIX, action: defaultMcuAction(), hold_steps: this.config.agentbeats.maxHoldSteps };
+    }
+
     if (payload.obs) {
       state.recentObservationImages.push(payload.obs);
       state.recentObservationImages = state.recentObservationImages.slice(-3);
+    }
+
+    const emitMacroFrame = (frame: UiFastControlFrame): McuPolicyDecision => {
+      const holdSteps = Math.max(
+        1,
+        Math.min(this.config.agentbeats.maxHoldSteps, frame.holdSteps),
+      );
+      state.lastAction = frame.action;
+      state.holdUntilStep = step + holdSteps - 1;
+      state.recentActions.push(frame.action);
+      state.recentActions = state.recentActions.slice(-16);
+      console.log(
+        `[agentbeats] macro step=${step} hold=${holdSteps} ${frame.label} action=${JSON.stringify({
+          pressed: MCU_BUTTON_KEYS.filter((key) => frame.action[key] === 1),
+          camera: frame.action.camera,
+        })}`,
+      );
+      return { ...ACTION_PAYLOAD_PREFIX, action: frame.action, hold_steps: holdSteps };
+    };
+
+    // Drain any queued macro frames first.
+    if (state.pendingMacroFrames.length > 0) {
+      const frame = state.pendingMacroFrames.shift()!;
+      return emitMacroFrame(frame);
+    }
+
+    // Closed-loop crafting (Image-Based Visual Servoing):
+    //   - Each obs: detect layout + cursor.
+    //   - If no pendingClick: probe VLM for next action, set the click target.
+    //   - With a pendingClick: emit ONE camera correction toward the slot,
+    //     OR a click frame when the cursor is within tolerance of the target.
+    //   - Repeats until VLM says "done" or iteration cap is hit.
+    const plan = state.closedLoopCraft;
+    if (plan && !plan.done && plan.iteration < plan.maxIterations && payload.obs) {
+      // Each obs: detect the inventory window FRESH (CV-cheap) -- this is
+      // how we know if the GUI is still open. If yes and we have a session
+      // layout already, REUSE it so slot indices stay stable. If yes and
+      // no session yet, capture one. If no window detected, RESET the
+      // session (UI closed) and end the closed-loop.
+      const liveLayout = detectGuiLayout(payload.obs, plan.layoutHint ?? undefined);
+      if (!liveLayout) {
+        console.log(`[agentbeats] closed-loop: inventory window no longer visible at step=${step}; resetting session`);
+        plan.sessionLayout = null;
+        plan.layoutHint = null;
+        plan.pendingClick = null;
+        plan.awaitingVerify = null;
+        plan.done = true;
+      } else if (plan.sessionLayout === null) {
+        // First detection in this session -- lock it.
+        plan.sessionLayout = liveLayout;
+        plan.layoutHint = liveLayout.matchedLayoutId;
+        console.log(`[agentbeats] closed-loop session locked: layout=${liveLayout.matchedLayoutId ?? "unknown"} slots=${liveLayout.slots.length}`);
+      }
+      const layout = (plan.sessionLayout as ReturnType<typeof detectGuiLayout> | null) ?? liveLayout;
+      if (!layout) {
+        // Already handled above (plan.done=true path)
+      } else {
+        const cursor = detectCursorWithExpectation(payload.obs, layout, null);
+        plan.cursor = cursor ?? plan.cursor;
+
+        // No park step. After moveAway from the previous click the
+        // cursor is already at a window-corner safeSpot which is clear
+        // of slot grids, so re-SOM and VLM probe both work fine from
+        // there. Parking added a long detour (cursor: corner -> left
+        // -> next slot) that often got stuck mid-way and shaved no
+        // benefit on detection.
+        if (plan.pendingClick === null) {
+          // Re-SOM only NOW, just before calling the VLM. Within an
+          // in-flight click sequence the layout stays stable (we keep
+          // using the locked session); fresh detection only matters at
+          // the moment the VLM is about to make a new decision.
+          let layoutForProbe = layout;
+          {
+            const fresh = detectGuiLayout(payload.obs, plan.layoutHint ?? undefined);
+            if (fresh) {
+              plan.sessionLayout = fresh;
+              plan.layoutHint = fresh.matchedLayoutId;
+              layoutForProbe = fresh;
+              console.log(`[agentbeats] re-detected SoM for fresh probe: ${fresh.matchedLayoutId ?? "unknown"} slots=${fresh.slots.length}`);
+            }
+          }
+          // CV cursor-holding detection is unreliable: the offset patch
+          // (cx+8, cy+8) routinely lands on a real inventory slot's
+          // item icon and reports false "holding". Pass null and let
+          // the VLM read held-item state visually from the SoM image.
+          const cursorHolding = null;
+          try {
+            const result = await probeNextCraftAction({
+              client: this.client,
+              model: this.config.openai.model,
+              obsBase64: payload.obs,
+              taskTarget: plan.target,
+              ingredient: plan.ingredient,
+              iteration: plan.iteration,
+              sessionLayout: layoutForProbe, // freshly redetected for each probe
+              recentActions: state.closedLoopHistory,
+              cursorHolding,
+              pickupSourceSlot: plan.pickupSourceSlot ?? null,
+            });
+            plan.iteration += 1;
+            const probed = result.action;
+            if (!probed) {
+              // Probe failed to return an action — invalidate the SoM
+              // session so the next frame redetects (some slots may have
+              // been occluded the first time) and re-probes. Don't set
+              // done: manual LLM cursor control runs at ~3% success.
+              console.log(`[agentbeats] closed-loop probe returned no action; invalidating SoM session and reprobing next frame`);
+              plan.sessionLayout = null;
+              plan.layoutHint = null;
+            } else if (probed.action === "done") {
+              // The closed-loop probe is too imprecise to judge task
+              // completion (it routinely hallucinates that the result
+              // is already in the hotbar). Ignore "done" entirely;
+              // only the regular VLM (with task_done in its action
+              // schema) is allowed to declare completion. Closed-loop
+              // keeps iterating until the iteration cap is hit, after
+              // which control falls through to the regular VLM.
+              console.log(`[agentbeats] closed-loop probe said done -- IGNORED (only the regular VLM decides task completion via task_done)`);
+              state.closedLoopHistory.unshift(`probe done ignored; keep planning the next move`);
+              state.closedLoopHistory = state.closedLoopHistory.slice(0, 5);
+            } else if (probed.action === "fallback_manual") {
+              console.log(`[agentbeats] closed-loop probe says fallback_manual reason=${probed.reason ?? ""} -- handing control to manual LLM cursor`);
+              plan.done = true;
+            } else if (probed.action === "move") {
+              // High-level atomic move: pickup `from` -> place at `to`
+              // -> auto-return remainder to `from` (when count=one).
+              // Build the click chain; first click goes to pendingClick,
+              // rest queue in plan.pendingChain and promote on verify.
+              const fromSlot = layoutForProbe.slots[probed.from];
+              const toSlot = layoutForProbe.slots[probed.to];
+              if (!fromSlot || !toSlot) {
+                console.warn(`[agentbeats] move from=${probed.from} to=${probed.to}: slot(s) not in layout (have ${layoutForProbe.slots.length}); skipping`);
+              } else {
+                const mkClick = (s: { index: number; name?: string; role?: string; cx: number; cy: number }, button: "attack" | "use", expectAfter: "should_empty" | "should_fill", actionKind: "pickup" | "place_one" | "place_all" | "take", kind: "click" | "auto_return"): import("./UiFastControl").PendingClick => ({
+                  rasterIndex: s.index, slotName: s.name, slotRole: s.role,
+                  frozenTarget: { x: s.cx, y: s.cy },
+                  button, shift: false, expectAfter,
+                  phase: "servo", retries: 0, kind, actionKind,
+                });
+                const chain: import("./UiFastControl").PendingClick[] = [];
+                chain.push(mkClick(fromSlot, "attack", "should_empty", "pickup", "click"));
+                if (probed.count === "all") {
+                  chain.push(mkClick(toSlot, "attack", "should_fill", "place_all", "click"));
+                } else {
+                  chain.push(mkClick(toSlot, "use", "should_fill", "place_one", "click"));
+                  chain.push(mkClick(fromSlot, "attack", "should_fill", "place_all", "auto_return"));
+                }
+                plan.pickupSourceSlot = { index: fromSlot.index, name: fromSlot.name };
+                plan.pendingClick = chain.shift()!;
+                plan.pendingChain = chain;
+                plan.servoSteps = 0;
+                state.closedLoopHistory.unshift(`move ${fromSlot.name ?? probed.from} -> ${toSlot.name ?? probed.to} (count=${probed.count ?? "one"})`);
+                state.closedLoopHistory = state.closedLoopHistory.slice(0, 5);
+                console.log(`[agentbeats] closed-loop probe iter=${plan.iteration}: move from=${probed.from}(${fromSlot.name ?? "?"}) to=${probed.to}(${toSlot.name ?? "?"}) count=${probed.count ?? "one"} reason=${probed.reason ?? ""}; chain=${chain.length + 1} clicks`);
+              }
+            } else if (probed.action === "put") {
+              const dest = layoutForProbe.slots[probed.slot];
+              if (!dest) {
+                console.warn(`[agentbeats] put slot=${probed.slot}: not in layout; skipping`);
+              } else {
+                plan.pendingClick = {
+                  rasterIndex: dest.index, slotName: dest.name, slotRole: dest.role,
+                  frozenTarget: { x: dest.cx, y: dest.cy },
+                  button: "attack", shift: false, expectAfter: "should_fill",
+                  phase: "servo", retries: 0, kind: "click", actionKind: "place_all",
+                };
+                plan.pendingChain = [];
+                plan.servoSteps = 0;
+                state.closedLoopHistory.unshift(`put -> ${dest.name ?? probed.slot}`);
+                state.closedLoopHistory = state.closedLoopHistory.slice(0, 5);
+                console.log(`[agentbeats] closed-loop probe iter=${plan.iteration}: put slot=${probed.slot}(${dest.name ?? "?"}) reason=${probed.reason ?? ""}`);
+              }
+            } else {
+              // Legacy low-level actions: pickup / place_one / place_all / take.
+              const button: "attack" | "use" = probed.action === "place_one" ? "use" : "attack";
+              const shift = false;
+              const probedSlot = layoutForProbe.slots[probed.slot];
+              if (!probedSlot) {
+                console.warn(`[agentbeats] probe returned slot ${probed.slot} but layout only has ${layout.slots.length}; skipping`);
+              } else if (probed.action === "pickup" && cursorHolding === true) {
+                // Hard guard: cursor is already carrying an item, so a
+                // "pickup" would actually swap stacks and corrupt state.
+                // Skip this probe; next iteration the VLM will see the
+                // updated cursor_holding=yes hint and choose place_all.
+                console.warn(`[agentbeats] probe asked for pickup at slot ${probed.slot} but CV says cursor is HOLDING; refusing -- will reprobe`);
+                state.closedLoopHistory.unshift(`refused pickup slot=${probed.slot} (cursor not empty)`);
+                state.closedLoopHistory = state.closedLoopHistory.slice(0, 5);
+              } else if (probed.action === "take" && cursorHolding === true) {
+                console.warn(`[agentbeats] probe asked for take at slot ${probed.slot} but CV says cursor is HOLDING; refusing -- will reprobe`);
+                state.closedLoopHistory.unshift(`refused take slot=${probed.slot} (cursor not empty)`);
+                state.closedLoopHistory = state.closedLoopHistory.slice(0, 5);
+              } else {
+                if (probed.action === "pickup") {
+                  plan.pickupSourceSlot = { index: probed.slot, name: probedSlot.name };
+                  console.log(`[agentbeats] recorded pickupSourceSlot=${probed.slot} (${probedSlot.name ?? "?"})`);
+                }
+                // Pre-take auto-return: "take" requires an empty cursor
+                // (otherwise it does nothing in MC). If we have a
+                // recorded pickup source, schedule a place_all back to
+                // it FIRST. Next probe will re-issue take when result
+                // slot is still filled and cursor is now empty.
+                // Putting auto-return here (just in front of crafting)
+                // instead of after every place_one keeps multi-slot
+                // recipes working: leftover stays in the cursor across
+                // multiple place_one calls until the recipe is ready.
+                if (probed.action === "take"
+                    && plan.pickupSourceSlot
+                    && plan.pickupSourceSlot.name
+                    && cursorHolding !== false) {
+                  const ret = layoutForProbe.slots.find((s) => s.name === plan.pickupSourceSlot!.name);
+                  if (ret) {
+                    console.log(`[agentbeats] PRE-TAKE AUTO_RETURN: scheduling place_all back to ${ret.name} (raster=${ret.index}) before take`);
+                    plan.pendingClick = {
+                      rasterIndex: ret.index,
+                      slotName: ret.name,
+                      slotRole: ret.role,
+                      frozenTarget: { x: ret.cx, y: ret.cy },
+                      button: "attack",
+                      shift: false,
+                      expectAfter: "should_fill",
+                      phase: "servo",
+                      retries: 0,
+                      kind: "auto_return",
+                      actionKind: "place_all",
+                    };
+                    plan.servoSteps = 0;
+                    state.closedLoopHistory.unshift(`auto_return -> ${ret.name} (before take)`);
+                    state.closedLoopHistory = state.closedLoopHistory.slice(0, 5);
+                    return { ...ACTION_PAYLOAD_PREFIX, action: defaultMcuAction(), hold_steps: 1 };
+                  }
+                  // Original pickup slot is no longer in the layout
+                  // (e.g. layout reset, slot rearranged). Skip the take
+                  // and surface to the LLM so it picks a fallback dump
+                  // slot for the leftover via the next probe.
+                  console.warn(`[agentbeats] PRE-TAKE AUTO_RETURN: original source slot "${plan.pickupSourceSlot.name}" not in current layout; skipping take so next probe can choose a fallback dump slot`);
+                  state.closedLoopHistory.unshift(`auto_return blocked: source ${plan.pickupSourceSlot.name} not in layout; please place_all leftover into any empty main_inv slot before take`);
+                  state.closedLoopHistory = state.closedLoopHistory.slice(0, 5);
+                  return { ...ACTION_PAYLOAD_PREFIX, action: defaultMcuAction(), hold_steps: 1 };
+                }
+                const expectAfter: "should_empty" | "should_fill" =
+                  (probed.action === "place_one" || probed.action === "place_all") ? "should_fill" : "should_empty";
+                plan.pendingClick = {
+                  rasterIndex: probed.slot,
+                  slotName: probedSlot.name,
+                  slotRole: probedSlot.role,
+                  frozenTarget: { x: probedSlot.cx, y: probedSlot.cy },
+                  button,
+                  shift,
+                  expectAfter,
+                  phase: "servo",
+                  retries: 0,
+                  kind: "click",
+                  actionKind: probed.action as "pickup" | "place_one" | "place_all" | "take",
+                };
+                plan.servoSteps = 0;
+                state.closedLoopHistory.unshift(`${probed.action} slot=${probed.slot}${probedSlot.name ? `(${probedSlot.name})` : ""}`);
+                state.closedLoopHistory = state.closedLoopHistory.slice(0, 5);
+                console.log(
+                  `[agentbeats] closed-loop probe iter=${plan.iteration}: ${probed.action} slot=${probed.slot} name=${probedSlot.name ?? "?"} reason=${probed.reason ?? ""}`,
+                );
+              }
+            }
+          } catch (error) {
+            // Don't surrender to manual LLM control on a transient probe
+            // failure -- closed-loop is enforced. Reset the session and
+            // try again on the next obs frame.
+            console.warn(`[agentbeats] closed-loop probe failed: ${formatModelProviderError(error)} -- resetting SoM session and reprobing next frame (closed-loop enforced)`);
+            plan.sessionLayout = null;
+            plan.layoutHint = null;
+            plan.pendingClick = null;
+          }
+        }
+
+        // Click state machine: servo -> fired -> moveAway -> verify ->
+        // (success: clear & next probe | fail: retry up to MAX_RETRIES).
+        if (plan.pendingClick !== null && !plan.done) {
+          const pc = plan.pendingClick;
+          // Resolve current target slot pixel by semantic name (stable
+          // across frames even when raster indices shift).
+          const resolveSlot = (): { cx: number; cy: number } => {
+            if (pc.slotName) {
+              const f = layout.slots.find((s) => s.name === pc.slotName);
+              if (f) return { cx: f.cx, cy: f.cy };
+            }
+            if (pc.slotRole) {
+              const f = layout.slots.find((s) => s.role === pc.slotRole);
+              if (f) return { cx: f.cx, cy: f.cy };
+            }
+            const f = layout.slots[pc.rasterIndex];
+            if (f) return { cx: f.cx, cy: f.cy };
+            return { cx: pc.frozenTarget.x, cy: pc.frozenTarget.y };
+          };
+          const slotCenter = resolveSlot();
+
+          // Safe spot to move cursor to for verification: somewhere
+          // inside the inventory window away from the just-clicked slot.
+          // Use a corner of the window opposite to the slot.
+          const safeSpot = {
+            x: slotCenter.cx > layout.windowX + layout.windowW / 2
+              ? layout.windowX + 8
+              : layout.windowX + layout.windowW - 8,
+            y: layout.windowY + layout.windowH - 8,
+          };
+
+          // Strict thresholds: looser values caused clicks to land 13-17
+          // px off slot center (servo cap firing during overshoot
+          // approach), missing MC's effective hit region. Strict 5 px
+          // threshold + 10-frame stuck cap matches the run that
+          // achieved sim_score=1.0.
+          const SERVO_STEP_CAP = 10;
+          const MAX_RETRIES = 4;
+          const HIT_THRESHOLD_PX = 5;
+
+          // Helper: emit a closed-loop action and remember the cam delta
+          // so the next frame's stale-cursor check has ground truth.
+          const emit = (action: McuEnvAction): McuPolicyDecision => {
+            plan.lastEmittedCam = [action.camera[0], action.camera[1]];
+            return { ...ACTION_PAYLOAD_PREFIX, action, hold_steps: 1 };
+          };
+
+          // === Phase: servo === move cursor to slot, then click
+          if (pc.phase === "servo") {
+            const stepResult = servoCursorStep({
+              cursor,
+              target: { x: slotCenter.cx, y: slotCenter.cy },
+              button: pc.button,
+              shift: pc.shift,
+              hitThresholdPx: HIT_THRESHOLD_PX,
+            });
+            plan.servoSteps += 1;
+            const shouldClickNow = plan.servoSteps > SERVO_STEP_CAP || (stepResult && stepResult.click);
+            if (shouldClickNow) {
+              // Safety: clicking outside the inventory window drops the
+              // held stack to the world ("throw"). Refuse to fire if the
+              // detected cursor is outside the window bbox.
+              const cursorInsideWindow = !!cursor
+                && cursor.x >= layout.windowX
+                && cursor.x <= layout.windowX + layout.windowW
+                && cursor.y >= layout.windowY
+                && cursor.y <= layout.windowY + layout.windowH;
+              if (!cursorInsideWindow) {
+                console.warn(`[agentbeats] click suppressed: cursor (${cursor?.x},${cursor?.y}) outside inventory window [${layout.windowX},${layout.windowY},${layout.windowW}x${layout.windowH}]; aborting to avoid throwing held item`);
+                state.closedLoopHistory.unshift(`abort ${pc.slotName ?? pc.rasterIndex} (cursor outside window; would throw item)`);
+                state.closedLoopHistory = state.closedLoopHistory.slice(0, 5);
+                plan.pendingClick = null;
+                plan.sessionLayout = null;
+                plan.layoutHint = null;
+                return emit(defaultMcuAction());
+              }
+              pc.prePatch = samplePatchFingerprint(payload.obs, slotCenter.cx, slotCenter.cy) ?? undefined;
+              // Pre-condition for "should_empty" actions (pickup/take):
+              // source slot MUST currently have an item (pre.stddev
+              // high). If it looks already empty, the click would do
+              // nothing -- abort and reprobe so the VLM picks a slot
+              // that actually has the ingredient.
+              if (pc.expectAfter === "should_empty"
+                  && pc.prePatch
+                  && pc.prePatch.stddev < 25) {
+                console.warn(`[agentbeats] pickup/take aborted: slot=${pc.rasterIndex}(${pc.slotName ?? "?"}) looks already empty (pre.stddev=${pc.prePatch.stddev.toFixed(1)})`);
+                state.closedLoopHistory.unshift(`abort ${pc.kind ?? "click"} slot=${pc.rasterIndex} (source slot empty; nothing to grab)`);
+                state.closedLoopHistory = state.closedLoopHistory.slice(0, 5);
+                plan.pendingClick = null;
+                return emit(defaultMcuAction());
+              }
+              const action = defaultMcuAction();
+              action[pc.button] = 1;
+              if (pc.shift) action.sneak = 1;
+              pc.phase = "fired";
+              plan.servoSteps = 0;
+              console.log(`[agentbeats] click ${pc.slotName ?? pc.rasterIndex} (${pc.button}${pc.shift ? "+sneak" : ""}) prePatch.stddev=${pc.prePatch?.stddev.toFixed(1) ?? "?"}`);
+              return emit(action);
+            }
+            if (stepResult) {
+              console.log(
+                `[agentbeats] servo step=${step} cursor=(${cursor?.x},${cursor?.y}) target=(${slotCenter.cx},${slotCenter.cy}) name=${pc.slotName ?? "?"} ${stepResult.reason}`,
+              );
+              return emit(stepResult.action);
+            }
+            console.log(`[agentbeats] servo step=${step}: no cursor detected; noop`);
+            return emit(defaultMcuAction());
+          }
+
+          // === Phase: fired === one settle frame to let the click apply
+          if (pc.phase === "fired") {
+            pc.phase = "moveAway";
+            plan.servoSteps = 0;
+            console.log(`[agentbeats] click settled; moving cursor away from ${pc.slotName ?? pc.rasterIndex} for verify`);
+            return emit(defaultMcuAction());
+          }
+
+          // === Phase: moveAway === servo cursor to safe spot
+          if (pc.phase === "moveAway") {
+            const stepResult = servoCursorStep({
+              cursor,
+              target: safeSpot,
+              button: "attack",
+              hitThresholdPx: HIT_THRESHOLD_PX,
+            });
+            plan.servoSteps += 1;
+            const distFromSafe = cursor ? Math.hypot(cursor.x - safeSpot.x, cursor.y - safeSpot.y) : 999;
+            const arrived = distFromSafe < 12 || plan.servoSteps > SERVO_STEP_CAP;
+            if (arrived) {
+              pc.phase = "verify";
+              console.log(`[agentbeats] cursor at safe spot (${cursor?.x},${cursor?.y}); next frame will verify`);
+              return emit(defaultMcuAction());
+            }
+            if (stepResult && !stepResult.click) {
+              return emit(stepResult.action);
+            }
+            return emit(defaultMcuAction());
+          }
+
+          // === Phase: verify === sample target slot patch, decide
+          if (pc.phase === "verify") {
+            const post = samplePatchFingerprint(payload.obs, slotCenter.cx, slotCenter.cy);
+            if (!post) {
+              console.warn(`[agentbeats] verify: could not sample patch; assuming success`);
+              plan.pendingClick = null;
+              return { ...ACTION_PAYLOAD_PREFIX, action: defaultMcuAction(), hold_steps: 1 };
+            }
+            const isEmpty = post.stddev < 25;
+            const isFilled = post.stddev > 35;
+            const matched = pc.expectAfter === "should_empty" ? isEmpty : isFilled;
+            console.log(
+              `[agentbeats] verify ${pc.slotName ?? pc.rasterIndex}: post.stddev=${post.stddev.toFixed(1)} expect=${pc.expectAfter} -> ${matched ? "OK" : "MISMATCH"} (retry ${pc.retries}/${MAX_RETRIES})`,
+            );
+            if (matched) {
+              state.closedLoopHistory.unshift(`${pc.actionKind ?? pc.kind ?? "click"} slot=${pc.rasterIndex}${pc.slotName ? `(${pc.slotName})` : ""} OK`);
+              state.closedLoopHistory = state.closedLoopHistory.slice(0, 5);
+              // Advance the chain: if there's a queued follow-up click
+              // (e.g. the place_one or auto_return inside a "move" op),
+              // promote it into pendingClick. Otherwise return to VLM.
+              const next = plan.pendingChain.shift();
+              if (next) {
+                next.phase = "servo";
+                next.retries = 0;
+                next.prePatch = undefined;
+                plan.pendingClick = next;
+                plan.servoSteps = 0;
+                console.log(`[agentbeats] chain advance -> ${next.actionKind ?? next.kind} slot=${next.rasterIndex}(${next.slotName ?? "?"}) (${plan.pendingChain.length} more queued)`);
+              } else {
+                plan.pendingClick = null;
+              }
+              return { ...ACTION_PAYLOAD_PREFIX, action: defaultMcuAction(), hold_steps: 1 };
+            }
+            // Mismatch path
+            if (pc.retries < MAX_RETRIES) {
+              pc.retries += 1;
+              pc.phase = "servo";
+              plan.servoSteps = 0;
+              console.log(`[agentbeats] RETRY click on ${pc.slotName ?? pc.rasterIndex} (attempt ${pc.retries + 1}/${MAX_RETRIES + 1})`);
+              return { ...ACTION_PAYLOAD_PREFIX, action: defaultMcuAction(), hold_steps: 1 };
+            }
+            // Retries exhausted (5 attempts total). Surface back to VLM
+            // reasoning -- drop the rest of the chain too so the LLM
+            // can replan from current observed state.
+            const failureLabel = `${pc.actionKind ?? pc.kind ?? "click"} slot=${pc.rasterIndex}${pc.slotName ? `(${pc.slotName})` : ""} FAILED post.stddev=${post.stddev.toFixed(0)}`;
+            state.closedLoopHistory.unshift(`${failureLabel} (chain aborted; ${plan.pendingChain.length} dropped)`);
+            state.closedLoopHistory = state.closedLoopHistory.slice(0, 5);
+            console.warn(`[agentbeats] ${failureLabel}; retries exhausted; clearing chain (${plan.pendingChain.length} dropped) and returning to VLM`);
+            plan.pendingClick = null;
+            plan.pendingChain = [];
+            return { ...ACTION_PAYLOAD_PREFIX, action: defaultMcuAction(), hold_steps: 1 };
+          }
+
+        }
+      }
     }
 
     if (!this.config.openai.apiKey) {
@@ -628,6 +1145,11 @@ export class McuVisualPolicy {
     }
 
     let decision = await this.modelDecision(state, step);
+    if ((decision as McuPolicyDecision & { task_done?: boolean }).task_done) {
+      console.log(`[agentbeats] VLM declared task_done=true at step=${step}; entering early-stop noop loop for the rest of the episode`);
+      state.earlyStop = true;
+      return { ...ACTION_PAYLOAD_PREFIX, action: defaultMcuAction(), hold_steps: this.config.agentbeats.maxHoldSteps };
+    }
     decision = repairDecisionForTask(decision, state.taskText, step);
 
     const holdSteps = Math.max(

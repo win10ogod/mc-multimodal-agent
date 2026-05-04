@@ -17,6 +17,7 @@
   "dependencies": {
     "agent-browser": "^0.26.0",
     "dotenv": "^17.2.3",
+    "jpeg-js": "^0.4.4",
     "level": "^10.0.0",
     "minecraft-data": "^3.108.0",
     "mineflayer": "^4.37.0",
