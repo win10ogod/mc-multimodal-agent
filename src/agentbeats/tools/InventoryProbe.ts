@@ -418,9 +418,29 @@ export async function probeNextCraftAction(opts: {
         recentActions: opts.recentActions ?? [],
         layoutId: detectedLayout.matchedLayoutId,
         slots: detectedLayout.slots.map((s) => ({ index: s.index, name: s.name, role: s.role, cx: s.cx, cy: s.cy })),
+        // Structured copies of the new context blocks so they're greppable
+        // without unescaping the giant prompt string.
+        knownSlots: opts.knownSlots ?? [],
+        recipeHint: recipeHint ?? null,
         prompt: promptText,
       },
     }, imgBase64, imgMime === "image/png" ? "png" : "jpg");
+    // Also dump the full prompt as plain text so it's easy to read:
+    // events.jsonl gets a giant escaped string per probe; the .txt
+    // companion is line-broken and viewable at a glance.
+    try {
+      const debugDir = process.env.AGENTBEATS_DEBUG_DIR;
+      if (debugDir) {
+        // eslint-disable-next-line @typescript-eslint/no-require-imports
+        const fs = require("node:fs") as typeof import("node:fs");
+        // eslint-disable-next-line @typescript-eslint/no-require-imports
+        const pathMod = require("node:path") as typeof import("node:path");
+        const stamp = String(opts.iteration).padStart(4, "0");
+        fs.writeFileSync(pathMod.join(debugDir, `probe_${stamp}_prompt.txt`), promptText);
+      }
+    } catch (e) {
+      console.warn(`[probe-debug] prompt dump failed: ${e instanceof Error ? e.message : String(e)}`);
+    }
   }
   type Create = typeof opts.client.chat.completions.create;
   type CreateParams = Parameters<Create>[0];
