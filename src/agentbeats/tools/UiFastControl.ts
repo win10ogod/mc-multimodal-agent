@@ -501,18 +501,6 @@ export type ClosedLoopCraftPlan = {
    *  "hover" action so the cursor stays on the slot the VLM asked to
    *  inspect (so MC renders the tooltip in the next probe image). */
   skipNextPark: boolean;
-  /** When non-null, a hover-action just settled and the next obs frame
-   *  is expected to show the MC tooltip. The runtime will run TooltipOCR
-   *  on that frame and write the result into slotMemory keyed by the
-   *  given absolute pixel position. */
-  pendingTooltipRead: { slotIndex: number; x: number; y: number } | null;
-  /** Batch tooltip inspection queue from a verify_slots probe action.
-   *  The runtime servos cursor to each slot in turn, captures the
-   *  tooltip frame on settle, runs TooltipOCR, writes slotMemory, and
-   *  advances. The main probe is NOT called between hovers — one probe
-   *  LLM call requested the whole batch and the next probe runs only
-   *  after every queued slot has been read. */
-  pendingTooltipBatch: { slots: Array<{ slot: number; x: number; y: number }>; idx: number } | null;
   /** Per-UI-session memory of "what is at absolute pixel position X,Y"
    *  populated by TooltipOCR after each hover. Surfaced to the probe in
    *  the next prompt so the VLM doesn't re-hover the same slot. */
@@ -619,8 +607,6 @@ export function planClosedLoopCraft(taskText: string): ClosedLoopCraftPlan {
     staleCursorFrames: 0,
     parkSteps: 0,
     skipNextPark: false,
-    pendingTooltipRead: null,
-    pendingTooltipBatch: null,
     slotMemory: new SlotMemory(),
   };
 }

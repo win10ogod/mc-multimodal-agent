@@ -345,7 +345,7 @@ export async function probeNextCraftAction(opts: {
     "Respond with strict JSON only (no markdown fences, no commentary):",
     `  {"action": "move", "from": A, "to": B, "count": "one"|"all", "reason": "...", "subTask": "..."} -- ATOMIC. Tool picks the stack from A, places into B (one item if count=one, whole stack if count=all), and automatically returns any remainder to A.`,
     `  {"action": "put",  "slot": N, "reason": "...", "subTask": "..."} -- dump whatever the cursor is currently holding into slot N as a whole stack. Use only when the cursor already holds something.`,
-    `  {"action": "verify_slots", "slots": [N1, N2, ...], "reason": "..."} -- BATCH inventory inspection. Runtime hovers each listed slot in sequence, runs OCR on each tooltip frame via a sub-agent, and PERSISTS every result into the "Known slot contents" block above. One probe LLM call (this one) drives all N reads — the actual OCR sub-calls are separate small calls that do not return to you until the whole batch is done. Memory survives across iterations until each slot is clicked. Use this when MULTIPLE slots are unknown (e.g. at the start of a multi-ingredient recipe to identify which hotbar/inventory slots hold which ingredient). Cap N <= 8.`,
+    `  {"action": "verify_slots", "slots": [N1, N2, ...], "reason": "..."} -- BATCH slot identification. The runtime crops each listed slot from the current frame (no cursor movement) and asks an identifier sub-agent to name the item icon. Results are written to "Known slot contents" and persist across iterations. KEEP THE LIST SHORT -- only include slots that genuinely look ambiguous from the SoM image (e.g. similar-looking blocks). Do NOT inspect slots that visually look empty. Do NOT inspect slots already in Known. Cap N <= 4.`,
     `  {"action": "fallback_manual", "reason": "..."} -- SoM marks do NOT cover the slot you need; hand control back to the manual LLM controller.`,
     `  {"action": "done", "reason": "...", "subTask": "..."} -- ONLY when (a) any recipe result slot in view is empty AND (b) the requested target is visibly stored in a regular inventory slot. Tool may CV-verify before accepting.`,
     "",
@@ -484,8 +484,8 @@ export async function probeNextCraftAction(opts: {
       console.warn(`[agentbeats] probe parse: verify_slots had no valid indices`);
       return { action: null, layout: detectedLayout };
     }
-    // Cap to keep token + servo cost bounded.
-    const capped = slots.slice(0, 8);
+    // Cap to keep parallel-OCR cost bounded.
+    const capped = slots.slice(0, 4);
     return { action: { action: "verify_slots", slots: capped, reason }, layout: detectedLayout };
   }
   if (!Number.isFinite(slot) || slot < 0 || slot > maxSlot) {

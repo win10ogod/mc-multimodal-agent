@@ -1,73 +1,73 @@
 /**
- * Sub-agent that reads the Minecraft tooltip text from a frame captured
- * while the cursor was hovering over a specific slot.
+ * Slot-content identifier sub-agent.
  *
- * To avoid the LLM being fooled by always-on GUI text (window titles
- * like "Crafting", "Inventory"), the obs frame is CROPPED to a small
- * region around the cursor before being passed to the model. MC renders
- * tooltips to the right and slightly below the cursor; we crop a band
- * centered on the cursor position so the only readable text in the
- * cropped image is the actual tooltip (or nothing, if the slot is empty).
+ * Earlier this was a tooltip-OCR design that required hovering the
+ * cursor over each slot so MC would render a tooltip. That had two
+ * unfixable failure modes: (1) cursor servo precision could not reliably
+ * land on the right slot when slots are 18 px apart, so MC would render
+ * the *neighbor's* tooltip and we'd record memory for the wrong slot;
+ * (2) every slot inspected was a full hover round-trip (N policy ticks)
+ * which dominated long-horizon cost.
  *
- * Result is cached in SlotMemory keyed by absolute pixel position, so
- * the agent never has to re-hover the same slot.
+ * The new design: crop a zoomed-in patch around each requested slot's
+ * pixel center and ask the VLM "what item is in this slot?" directly.
+ * No cursor movement, no tooltip dependency, no timing race. We can
+ * batch all crops from a single obs frame and run the OCR calls in
+ * parallel for the whole verify_slots batch.
  */
 import type OpenAI from "openai";
-import { getDebugRecorder } from "./DebugRecorder";
+import * as fs from "node:fs";
+import * as path from "node:path";
 
-export type TooltipOCROpts = {
+export type SlotIdOpts = {
   client: OpenAI;
   model: string;
   obsBase64: string;
-  /** Pixel pos of the slot the cursor was hovering. Used as the anchor
-   *  for cropping the tooltip region out of the full obs frame. */
+  /** Pixel center of the slot to inspect. */
   slotPos: { x: number; y: number };
+  /** Optional slot label for prompt context (e.g. "hotbar_3"). */
+  slotName?: string;
 };
 
-const SYSTEM_PROMPT = `You are an OCR-only sub-agent for Minecraft tooltips.
+export type SlotIdResult = { item: string };
 
-You are shown a SMALL CROPPED REGION around the player's cursor. The crop also contains CYAN NUMBERED BADGES drawn at the corner of each slot (e.g. "40", "41"). If a Minecraft tooltip box (a dark rectangle with white item name text floating near the cursor) is visible IN THIS CROP, the tooltip belongs to whichever slot the cursor is currently OVER -- read the slot's cyan badge number AND the item name from the tooltip.
+const SYSTEM_PROMPT = `You are a Minecraft slot-content identifier sub-agent.
+
+You are shown a small ZOOMED-IN crop of one inventory slot from a Minecraft GUI. Identify the item icon visible in the slot.
 
 STRICT RULES:
-- If you can read both the slot's cyan badge AND a clear tooltip item name, return JSON: {"slot": <integer>, "item": "<snake_case_item>"} (e.g. {"slot": 42, "item": "cobblestone"}).
-- If the crop shows only a slot icon with NO floating tooltip text box visible: {"slot": <integer or null>, "item": "empty"}.
-- If you cannot identify the slot badge OR the tooltip text is unreadable: {"slot": null, "item": "unknown"}.
-- NEVER guess the item from the slot icon alone. NEVER infer from window labels. Only return an item name if you can READ the tooltip text letter by letter.
-- Item names: "Cobblestone" -> cobblestone, "Nether Quartz" -> nether_quartz, "Oak Planks" -> oak_planks, "Crafting Table" -> crafting_table.
+- Return JSON: {"item": "<snake_case_identifier>"}.
+- Use snake_case names: "Cobblestone" -> cobblestone, "Nether Quartz" -> nether_quartz, "Oak Planks" -> oak_planks, "Crafting Table" -> crafting_table, "Iron Pickaxe" -> iron_pickaxe.
+- If the slot is visually EMPTY (no item icon, just the dark slot background): {"item": "empty"}.
+- If the icon is too small / blurry / ambiguous to identify: {"item": "unknown"}.
+- Do NOT add markdown fences, do NOT add commentary. Output ONLY the JSON object.`;
 
-Output exactly one JSON object. No commentary, no markdown fences.`;
+const ZOOM = 4; // 4x upscale so the LLM sees a ~64x64 slot icon clearly
+const SRC_W = 18;
+const SRC_H = 18;
 
-const CROP_W = 140;
-const CROP_H = 70;
-
-export type TooltipOCRResult = { slot: number | null; item: string };
-
-export async function readTooltip(opts: TooltipOCROpts): Promise<TooltipOCRResult> {
-  // Crop the obs frame to a band centered on the cursor pos. MC tooltips
-  // render to the right + below cursor, so anchor the crop's top-left at
-  // (cursor.x - 20, cursor.y - 20) -- gives us 20px to the left of the
-  // cursor (icon visibility) and ~120px to the right (tooltip body).
-  let croppedB64 = opts.obsBase64;
+export async function readTooltip(opts: SlotIdOpts): Promise<SlotIdResult> {
+  let cropB64 = opts.obsBase64;
   try {
-    croppedB64 = await cropToCursor(opts.obsBase64, opts.slotPos.x, opts.slotPos.y);
+    cropB64 = cropAndZoomSlot(opts.obsBase64, opts.slotPos.x, opts.slotPos.y);
   } catch (e) {
-    console.warn(`[tooltip-ocr] crop failed (${e instanceof Error ? e.message : String(e)}); falling back to full frame`);
+    console.warn(`[slot-id] crop failed (${e instanceof Error ? e.message : String(e)}); falling back to full frame`);
   }
-  const cleaned = croppedB64.startsWith("data:image/")
-    ? croppedB64
-    : `data:image/png;base64,${croppedB64.replace(/^data:image\/[a-z]+;base64,/, "")}`;
-  const userText = `Cropped region around the cursor at slot pixel (${Math.round(opts.slotPos.x)}, ${Math.round(opts.slotPos.y)}). Read any tooltip text or return empty.`;
+  const url = cropB64.startsWith("data:image/")
+    ? cropB64
+    : `data:image/png;base64,${cropB64.replace(/^data:image\/[a-z]+;base64,/, "")}`;
+  const userText = `Identify the item in this Minecraft inventory slot${opts.slotName ? ` (${opts.slotName})` : ""}.`;
   const body: Record<string, unknown> = {
     model: opts.model,
     temperature: 0,
-    max_completion_tokens: 12,
+    max_completion_tokens: 64,
     messages: [
       { role: "system", content: SYSTEM_PROMPT },
       {
         role: "user",
         content: [
           { type: "text", text: userText },
-          { type: "image_url", image_url: { url: cleaned, detail: "high" } },
+          { type: "image_url", image_url: { url, detail: "high" } },
         ],
       },
     ],
@@ -78,41 +78,51 @@ export async function readTooltip(opts: TooltipOCROpts): Promise<TooltipOCRResul
     raw = (resp as unknown as { choices?: Array<{ message?: { content?: string } }> })
       .choices?.[0]?.message?.content ?? "";
   } catch (e) {
-    console.warn(`[tooltip-ocr] LLM call failed: ${e instanceof Error ? e.message : String(e)}`);
-    return { slot: null, item: "unknown" };
+    console.warn(`[slot-id] LLM call failed: ${e instanceof Error ? e.message : String(e)}`);
+    return { item: "unknown" };
   }
-  // Parse the JSON {slot, item} response. Tolerate stray whitespace and
-  // accidental markdown fences.
-  const parsed: TooltipOCRResult = (() => {
+  const parsed: SlotIdResult = (() => {
     const cleanedRaw = raw.trim().replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "");
     try {
       const obj = JSON.parse(cleanedRaw) as Record<string, unknown>;
-      const slotRaw = obj.slot;
       const itemRaw = obj.item;
-      const slot = typeof slotRaw === "number" && Number.isFinite(slotRaw) ? Math.round(slotRaw) : null;
       const item = typeof itemRaw === "string"
         ? itemRaw.trim().toLowerCase().replace(/[^a-z0-9_]/g, "") || "unknown"
         : "unknown";
-      return { slot, item };
+      return { item };
     } catch {
-      // Tolerate the legacy "just an item word" output if the model slips.
-      const fallback = cleanedRaw.toLowerCase().replace(/[^a-z0-9_]/g, "");
-      return { slot: null, item: fallback || "unknown" };
+      // Loose match if model didn't follow JSON.
+      const m = cleanedRaw.toLowerCase().match(/[a-z][a-z0-9_]+/);
+      return { item: m ? m[0] : "unknown" };
     }
   })();
-  // Debug: persist the crop + the raw response so we can audit OCR errors.
-  const dbg = getDebugRecorder();
-  if (dbg.isEnabled()) {
-    dbg.record({
-      type: "tooltip_ocr",
-      data: { slotPos: opts.slotPos, raw, parsed },
-    }, croppedB64, "png");
+  // Persist debug crops directly (no DebugRecorder, which would re-swap
+  // the R/B channels of our already-correct PNG and produce BGR output).
+  const debugDir = process.env.AGENTBEATS_DEBUG_DIR;
+  if (debugDir) {
+    try {
+      const seq = String(++DEBUG_SEQ).padStart(5, "0");
+      const fname = `${seq}_slot_id.png`;
+      const pngBytes = Buffer.from(cropB64, "base64");
+      fs.writeFileSync(path.join(debugDir, fname), pngBytes);
+      const line = JSON.stringify({
+        seq: DEBUG_SEQ,
+        ts: new Date().toISOString(),
+        type: "slot_id",
+        imageFile: fname,
+        data: { slotPos: opts.slotPos, slotName: opts.slotName, raw, parsed },
+      });
+      fs.appendFileSync(path.join(debugDir, "events.jsonl"), line + "\n");
+    } catch (e) {
+      console.warn(`[slot-id] debug write failed: ${e instanceof Error ? e.message : String(e)}`);
+    }
   }
   return parsed;
 }
 
-async function cropToCursor(obsBase64: string, cursorX: number, cursorY: number): Promise<string> {
-  // Lazy require so the cost is only paid when OCR actually runs.
+let DEBUG_SEQ = 100000;
+
+function cropAndZoomSlot(obsBase64: string, slotX: number, slotY: number): string {
   // eslint-disable-next-line @typescript-eslint/no-require-imports
   const jpegLib = require("jpeg-js");
   // eslint-disable-next-line @typescript-eslint/no-require-imports
@@ -124,24 +134,26 @@ async function cropToCursor(obsBase64: string, cursorX: number, cursorY: number)
   const decoded = jpegLib.decode(inBuf, { useTArray: true, formatAsRGBA: true });
   const w = decoded.width as number;
   const h = decoded.height as number;
-  // Anchor crop so the cursor sits 20px from the left edge -- the rest
-  // of the crop captures the tooltip body to the cursor's right/below.
-  const x0 = Math.max(0, Math.min(w - CROP_W, Math.round(cursorX) - 20));
-  const y0 = Math.max(0, Math.min(h - CROP_H, Math.round(cursorY) - 20));
-  const out = new PNG({ width: CROP_W, height: CROP_H });
-  for (let y = 0; y < CROP_H; y += 1) {
-    for (let x = 0; x < CROP_W; x += 1) {
-      const srcIdx = ((y0 + y) * w + (x0 + x)) * 4;
-      const dstIdx = (y * CROP_W + x) * 4;
-      // jpeg-js with formatAsRGBA produces BGR-encoded data on this sim
-      // (same swap that DebugRecorder applies). Re-swap so the OCR
-      // model sees true colors.
+  // Source crop window centered on the slot.
+  const sx0 = Math.max(0, Math.min(w - SRC_W, Math.round(slotX) - Math.floor(SRC_W / 2)));
+  const sy0 = Math.max(0, Math.min(h - SRC_H, Math.round(slotY) - Math.floor(SRC_H / 2)));
+  const outW = SRC_W * ZOOM;
+  const outH = SRC_H * ZOOM;
+  const out = new PNG({ width: outW, height: outH });
+  // Nearest-neighbor upscale + R/B swap (MC sim outputs BGR-encoded
+  // JPEG; jpeg-js with formatAsRGBA returns the bytes in BGR order, so
+  // we swap channels here once so the LLM sees true colors).
+  for (let oy = 0; oy < outH; oy += 1) {
+    const sy = sy0 + Math.floor(oy / ZOOM);
+    for (let ox = 0; ox < outW; ox += 1) {
+      const sx = sx0 + Math.floor(ox / ZOOM);
+      const srcIdx = (sy * w + sx) * 4;
+      const dstIdx = (oy * outW + ox) * 4;
       out.data[dstIdx] = decoded.data[srcIdx + 2];
       out.data[dstIdx + 1] = decoded.data[srcIdx + 1];
       out.data[dstIdx + 2] = decoded.data[srcIdx];
       out.data[dstIdx + 3] = 255;
     }
   }
-  const png = PNG.sync.write(out);
-  return png.toString("base64");
+  return PNG.sync.write(out).toString("base64");
 }

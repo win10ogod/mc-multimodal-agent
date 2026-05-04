@@ -820,79 +820,9 @@ export class McuVisualPolicy {
           if (plan.skipNextPark) {
             plan.skipNextPark = false;
             plan.parkSteps = 0;
-            console.log(`[agentbeats] skipNextPark consumed; cursor stays at current spot for tooltip-friendly probe`);
-            // Tooltip OCR: if a hover-action was just settled, the obs
-            // frame is currently showing the MC tooltip text. Read it
-            // with a sub-LLM call and write to slotMemory keyed by the
-            // hovered slot's absolute pixel pos. The next probe sees
-            // this in its prompt instead of having to re-hover.
-            if (plan.pendingTooltipRead) {
-              const { TooltipOCR } = { TooltipOCR: (await import("./tools/TooltipOCR")) };
-              const target = plan.pendingTooltipRead;
-              try {
-                const ocr = await TooltipOCR.readTooltip({
-                  client: this.client,
-                  model: this.config.openai.model,
-                  obsBase64: payload.obs ?? "",
-                  slotPos: { x: target.x, y: target.y },
-                });
-                // OCR can also report which SoM-badge slot the cursor is
-                // actually over, since tooltip belongs to whichever slot
-                // the cursor lands on -- not necessarily the slot we
-                // ASKED for (cursor may have settled on a neighbor edge).
-                // Trust the OCR-reported slot when valid; that is the
-                // physical slot whose item we just read. Fall back to
-                // the original target only if OCR didn't report a slot.
-                let recordX = target.x;
-                let recordY = target.y;
-                let resolvedSlot: number = target.slotIndex;
-                if (ocr.slot != null) {
-                  const corrected = layout.slots[ocr.slot];
-                  if (corrected) {
-                    recordX = corrected.cx;
-                    recordY = corrected.cy;
-                    resolvedSlot = ocr.slot;
-                  }
-                }
-                plan.slotMemory.record(recordX, recordY, ocr.item, plan.iteration);
-                state.closedLoopHistory.unshift(`tooltip slot=${resolvedSlot}(${ocr.item})${ocr.slot != null && ocr.slot !== target.slotIndex ? ` [cursor on neighbor; intended ${target.slotIndex}]` : ""}`);
-                state.closedLoopHistory = state.closedLoopHistory.slice(0, 5);
-                console.log(`[agentbeats] tooltip OCR intended_slot=${target.slotIndex} ocr_slot=${ocr.slot ?? "?"} pos=(${recordX},${recordY}) -> ${ocr.item}`);
-              } catch (e) {
-                console.warn(`[agentbeats] tooltip OCR failed: ${e instanceof Error ? e.message : String(e)}`);
-              }
-              plan.pendingTooltipRead = null;
-            }
-            // verify_slots batch advance: if a queue is active and has
-            // more slots to inspect, arm the next hover and SKIP the
-            // probe call this frame. Otherwise clear the batch and let
-            // the probe run with the populated slotMemory snapshot.
-            if (plan.pendingTooltipBatch) {
-              plan.pendingTooltipBatch.idx += 1;
-              if (plan.pendingTooltipBatch.idx < plan.pendingTooltipBatch.slots.length) {
-                const next = plan.pendingTooltipBatch.slots[plan.pendingTooltipBatch.idx];
-                const dest = layout.slots[next.slot];
-                if (dest) {
-                  plan.pendingClick = {
-                    rasterIndex: dest.index, slotName: dest.name, slotRole: dest.role,
-                    frozenTarget: { x: next.x, y: next.y },
-                    button: "attack", shift: false, expectAfter: "should_fill",
-                    phase: "servo", retries: 0, kind: "hover" as "click",
-                    actionKind: "pickup" as "pickup",
-                  };
-                  plan.skipNextPark = true;
-                  plan.pendingTooltipRead = { slotIndex: next.slot, x: next.x, y: next.y };
-                  console.log(`[agentbeats] verify_slots batch advance idx=${plan.pendingTooltipBatch.idx}/${plan.pendingTooltipBatch.slots.length} slot=${next.slot}`);
-                  return { ...ACTION_PAYLOAD_PREFIX, action: defaultMcuAction(), hold_steps: 1 };
-                }
-                console.warn(`[agentbeats] verify_slots advance: slot=${next.slot} no longer in layout; aborting batch`);
-                plan.pendingTooltipBatch = null;
-              } else {
-                console.log(`[agentbeats] verify_slots batch complete (${plan.pendingTooltipBatch.idx} slots read)`);
-                plan.pendingTooltipBatch = null;
-              }
-            }
-            // Fall through directly to the probe without parking.
+            console.log(`[agentbeats] skipNextPark consumed; cursor stays at current spot for probe`);
+            // verify_slots no longer needs cursor movement; OCR happens
+            // inline in the probed-action handler. Just fall through.
           } else {
           const PARK_STEP_CAP = 6;
           // Park at the TOP-LEFT corner of the window. Cursor sprite
@@ -1129,43 +1059,42 @@ export class McuVisualPolicy {
                 console.log(`[agentbeats] closed-loop probe iter=${plan.iteration}: put slot=${probed.slot}(${dest.name ?? "?"}) reason=${probed.reason ?? ""}`);
               }
             } else if (probed.action === "verify_slots") {
-              // Batch tooltip inspection. Build a queue of {slot, x, y} from
-              // the requested raster indices, then arm the FIRST hover. The
-              // skipNextPark consumed branch (above) handles each settle:
-              // it runs TooltipOCR, writes slotMemory, and either dequeues
-              // the next slot (skipping the main probe) or — once the queue
-              // is empty — falls through to the next probe call. This is
-              // strictly cheaper than emitting per-slot hover actions
-              // because the main probe LLM call is NOT made between
-              // sequential captures inside one batch.
+              // Inline parallel slot identification. Crop each requested
+              // slot from the CURRENT obs frame, send each crop to the
+              // identifier sub-agent in parallel, write every result into
+              // SlotMemory, then return a no-op so the next obs triggers
+              // a fresh probe with the populated knownSlots block. No
+              // cursor movement, no tooltip dependency, no per-slot
+              // policy ticks -- one frame, N parallel small calls.
               const queue = probed.slots
                 .map((s) => {
                   const d = layoutForProbe.slots[s];
-                  return d ? { slot: s, x: d.cx, y: d.cy, name: d.name, role: d.role, index: d.index } : null;
+                  return d ? { slot: s, x: d.cx, y: d.cy, name: d.name } : null;
                 })
                 .filter((e): e is NonNullable<typeof e> => e !== null);
               if (queue.length === 0) {
                 console.warn(`[agentbeats] verify_slots: no resolvable slots in [${probed.slots.join(",")}]; skipping`);
               } else {
-                plan.pendingTooltipBatch = {
-                  slots: queue.map((q) => ({ slot: q.slot, x: q.x, y: q.y })),
-                  idx: 0,
-                };
-                const first = queue[0];
-                plan.pendingClick = {
-                  rasterIndex: first.index, slotName: first.name, slotRole: first.role,
-                  frozenTarget: { x: first.x, y: first.y },
-                  button: "attack", shift: false, expectAfter: "should_fill",
-                  phase: "servo", retries: 0, kind: "hover" as "click",
-                  actionKind: "pickup" as "pickup",
-                };
-                plan.pendingChain = [];
-                plan.servoSteps = 0;
-                plan.skipNextPark = true;
-                plan.pendingTooltipRead = { slotIndex: first.slot, x: first.x, y: first.y };
-                state.closedLoopHistory.unshift(`verify_slots[${queue.length}] -> ${queue.map((q) => q.name ?? q.slot).join(",")}`);
+                const { TooltipOCR } = { TooltipOCR: (await import("./tools/TooltipOCR")) };
+                console.log(`[agentbeats] verify_slots batch=${queue.length} slots=${queue.map((q) => `${q.slot}(${q.name ?? "?"})`).join(",")}`);
+                const results = await Promise.all(queue.map((q) =>
+                  TooltipOCR.readTooltip({
+                    client: this.client,
+                    model: this.config.openai.model,
+                    obsBase64: payload.obs ?? "",
+                    slotPos: { x: q.x, y: q.y },
+                    slotName: q.name,
+                  }).then((r) => ({ q, r }))
+                ));
+                for (const { q, r } of results) {
+                  plan.slotMemory.record(q.x, q.y, r.item, plan.iteration);
+                  console.log(`[agentbeats] slot_id slot=${q.slot}(${q.name ?? "?"}) -> ${r.item}`);
+                }
+                state.closedLoopHistory.unshift(
+                  `verify_slots[${queue.length}]: ${results.map(({ q, r }) => `${q.slot}=${r.item}`).join(", ")}`,
+                );
                 state.closedLoopHistory = state.closedLoopHistory.slice(0, 5);
-                console.log(`[agentbeats] verify_slots batch=${queue.length}: first slot=${first.slot}(${first.name ?? "?"})`);
+                return { ...ACTION_PAYLOAD_PREFIX, action: defaultMcuAction(), hold_steps: 1 };
               }
             } else {
               // Legacy low-level actions: pickup / place_one / place_all / take.
