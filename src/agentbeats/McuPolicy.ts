@@ -821,6 +821,30 @@ export class McuVisualPolicy {
             plan.skipNextPark = false;
             plan.parkSteps = 0;
             console.log(`[agentbeats] skipNextPark consumed; cursor stays at current spot for tooltip-friendly probe`);
+            // Tooltip OCR: if a hover-action was just settled, the obs
+            // frame is currently showing the MC tooltip text. Read it
+            // with a sub-LLM call and write to slotMemory keyed by the
+            // hovered slot's absolute pixel pos. The next probe sees
+            // this in its prompt instead of having to re-hover.
+            if (plan.pendingTooltipRead) {
+              const { TooltipOCR } = { TooltipOCR: (await import("./tools/TooltipOCR")) };
+              const target = plan.pendingTooltipRead;
+              try {
+                const item = await TooltipOCR.readTooltip({
+                  client: this.client,
+                  model: this.config.openai.model,
+                  obsBase64: payload.obs ?? "",
+                  slotPos: { x: target.x, y: target.y },
+                });
+                plan.slotMemory.record(target.x, target.y, item, plan.iteration);
+                state.closedLoopHistory.unshift(`tooltip slot=${target.slotIndex}(${item})`);
+                state.closedLoopHistory = state.closedLoopHistory.slice(0, 5);
+                console.log(`[agentbeats] tooltip OCR slot=${target.slotIndex} pos=(${target.x},${target.y}) -> ${item}`);
+              } catch (e) {
+                console.warn(`[agentbeats] tooltip OCR failed: ${e instanceof Error ? e.message : String(e)}`);
+              }
+              plan.pendingTooltipRead = null;
+            }
             // Fall through directly to the probe without parking.
           } else {
           const PARK_STEP_CAP = 6;
@@ -874,6 +898,19 @@ export class McuVisualPolicy {
           // the VLM read held-item state visually from the SoM image.
           const cursorHolding = null;
           try {
+            // Build slot-memory snapshot keyed to current raster indices so
+            // the probe sees "slot 1 = cobblestone (read 4 iters ago)" etc.
+            // Each detected slot's absolute pixel pos is looked up in
+            // slotMemory; matched entries become the probe's known-contents
+            // hint, freeing the agent from re-hovering identified slots.
+            plan.slotMemory.pruneStale(plan.iteration);
+            const knownSlots: Array<{ index: number; name?: string; item: string; ageIters: number }> = [];
+            for (const s of layoutForProbe.slots) {
+              const mem = plan.slotMemory.lookup(s.cx, s.cy);
+              if (mem && mem.item !== "empty" && mem.item !== "unknown") {
+                knownSlots.push({ index: s.index, name: s.name, item: mem.item, ageIters: plan.iteration - mem.step });
+              }
+            }
             const result = await probeNextCraftAction({
               client: this.client,
               model: this.config.openai.model,
@@ -884,6 +921,7 @@ export class McuVisualPolicy {
               recentActions: state.closedLoopHistory,
               cursorHolding,
               pickupSourceSlot: plan.pickupSourceSlot ?? null,
+              knownSlots,
             });
             plan.iteration += 1;
             const probed = result.action;
@@ -1062,6 +1100,7 @@ export class McuVisualPolicy {
                 plan.pendingChain = [];
                 plan.servoSteps = 0;
                 plan.skipNextPark = true;
+                plan.pendingTooltipRead = { slotIndex: probed.slot, x: dest.cx, y: dest.cy };
                 state.closedLoopHistory.unshift(`hover -> ${dest.name ?? probed.slot}`);
                 state.closedLoopHistory = state.closedLoopHistory.slice(0, 5);
                 console.log(`[agentbeats] closed-loop probe iter=${plan.iteration}: hover slot=${probed.slot}(${dest.name ?? "?"}) reason=${probed.reason ?? ""}`);
@@ -1362,6 +1401,12 @@ export class McuVisualPolicy {
             const isEmpty = post.stddev < 25;
             const isFilled = post.stddev > 35;
             const matched = pc.expectAfter === "should_empty" ? isEmpty : isFilled;
+            // A successful click mutated the slot's contents — the slot
+            // memory entry (if any) for this absolute pos is now stale.
+            // Forget it; the agent will re-discover via hover if needed.
+            if (matched && pc.kind !== ("hover" as never)) {
+              plan.slotMemory.invalidate(slotCenter.cx, slotCenter.cy);
+            }
             console.log(
               `[agentbeats] verify ${pc.slotName ?? pc.rasterIndex}: post.stddev=${post.stddev.toFixed(1)} expect=${pc.expectAfter} -> ${matched ? "OK" : "MISMATCH"} (retry ${pc.retries}/${MAX_RETRIES})`,
             );

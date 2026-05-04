@@ -16,6 +16,7 @@
  * benchmark's 640x360 obs resolution. No task-name-based hardcoding.
  */
 import minecraftData from "minecraft-data";
+import { SlotMemory } from "./SlotMemory";
 import { defaultMcuAction, type McuEnvAction } from "../McuPrompt";
 import type { GuiLayout } from "./SlotDetector";
 
@@ -500,6 +501,15 @@ export type ClosedLoopCraftPlan = {
    *  "hover" action so the cursor stays on the slot the VLM asked to
    *  inspect (so MC renders the tooltip in the next probe image). */
   skipNextPark: boolean;
+  /** When non-null, a hover-action just settled and the next obs frame
+   *  is expected to show the MC tooltip. The runtime will run TooltipOCR
+   *  on that frame and write the result into slotMemory keyed by the
+   *  given absolute pixel position. */
+  pendingTooltipRead: { slotIndex: number; x: number; y: number } | null;
+  /** Per-UI-session memory of "what is at absolute pixel position X,Y"
+   *  populated by TooltipOCR after each hover. Surfaced to the probe in
+   *  the next prompt so the VLM doesn't re-hover the same slot. */
+  slotMemory: SlotMemory;
 };
 
 /** Servo control law: given current cursor + target slot pixel center,
@@ -602,6 +612,8 @@ export function planClosedLoopCraft(taskText: string): ClosedLoopCraftPlan {
     staleCursorFrames: 0,
     parkSteps: 0,
     skipNextPark: false,
+    pendingTooltipRead: null,
+    slotMemory: new SlotMemory(),
   };
 }
 

@@ -255,6 +255,10 @@ export async function probeNextCraftAction(opts: {
    *  Attached as additional images so the VLM can read tooltip text for
    *  every requested slot in a single call. */
   tooltipFrames?: Array<{ slot: number; obsBase64: string }>;
+  /** Known slot contents from the slot-memory store, mapped to current
+   *  raster indices. Surfaced as a text line in the prompt so the agent
+   *  doesn't re-hover slots whose contents have already been read. */
+  knownSlots?: Array<{ index: number; name?: string; item: string; ageIters: number }>;
 }): Promise<CraftProbeResult> {
   // Set-of-Mark: render the obs frame with numbered badges drawn at every
   // slot's pixel center so the VLM grounds slot indices visually instead of
@@ -309,10 +313,20 @@ export async function probeNextCraftAction(opts: {
     return null;
   })();
 
+  // Known slot contents from the slot-memory store. Each entry is the
+  // result of a prior hover + tooltip OCR, expressed in the current
+  // raster index space. Surfaced as a text block so the agent doesn't
+  // burn iterations re-hovering identified slots.
+  const knownSlotsText = (opts.knownSlots && opts.knownSlots.length > 0)
+    ? "Known slot contents (from prior tooltip reads — TRUST these instead of guessing from image):\n" +
+      opts.knownSlots.map((k) => `  slot ${k.index}${k.name ? `(${k.name})` : ""} = ${k.item} (read ${k.ageIters} iters ago)`).join("\n")
+    : null;
+
   const promptText = [
     `You are operating a Minecraft GUI (640x360 image) to advance the user's task.`,
     `Task: ${opts.taskText}`,
     ...(recipeHint ? ["", recipeHint] : []),
+    ...(knownSlotsText ? ["", knownSlotsText] : []),
     "",
     `The image has YELLOW NUMBERED BADGES drawn at the corner of each slot.`,
     `Use the visible numbers to choose a slot. Pick the index of the slot you mean.`,
@@ -330,7 +344,7 @@ export async function probeNextCraftAction(opts: {
     "Respond with strict JSON only (no markdown fences, no commentary):",
     `  {"action": "move", "from": A, "to": B, "count": "one"|"all", "reason": "...", "subTask": "..."} -- ATOMIC. Tool picks the stack from A, places into B (one item if count=one, whole stack if count=all), and automatically returns any remainder to A.`,
     `  {"action": "put",  "slot": N, "reason": "...", "subTask": "..."} -- dump whatever the cursor is currently holding into slot N as a whole stack. Use only when the cursor already holds something.`,
-    `  {"action": "hover","slot": N, "reason": "...", "subTask": "..."} -- move the cursor over slot N WITHOUT clicking. MC will render the item tooltip on the next probe image so you can read what is in that slot. Use when uncertain about a slot's contents (e.g. before placing the second ingredient of a multi-ingredient recipe, hover one ambiguous grid cell at a time).`,
+    `  {"action": "hover","slot": N, "reason": "...", "subTask": "..."} -- move the cursor over slot N WITHOUT clicking. The runtime then runs OCR on the tooltip and PERSISTS the result into the "Known slot contents" block above so you don't have to re-hover this slot again (memory survives across iterations until that slot is clicked). Use when uncertain about a slot whose contents are NOT already in the Known list.`,
     `  {"action": "fallback_manual", "reason": "..."} -- SoM marks do NOT cover the slot you need; hand control back to the manual LLM controller.`,
     `  {"action": "done", "reason": "...", "subTask": "..."} -- ONLY when (a) any recipe result slot in view is empty AND (b) the requested target is visibly stored in a regular inventory slot. Tool may CV-verify before accepting.`,
     "",
