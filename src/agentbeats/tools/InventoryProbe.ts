@@ -224,10 +224,6 @@ export async function probeNextCraftAction(opts: {
   /** Slot the agent originally picked the ingredient up from, so the VLM
    *  can return leftover items to the same place after place_one. */
   pickupSourceSlot?: { index: number; name?: string } | null;
-  /** Logical "item currently held on the cursor", tracked by the click
-   *  state machine. When non-null, the agent should treat this as the
-   *  cursor's contents without re-verifying. Cleared after a place. */
-  cursorItem?: string | null;
   /** Captured tooltip frames from a prior verify_slots request. Each entry
    *  is one slot the runtime hovered + the resulting frame (base64 jpeg).
    *  Attached as additional images so the VLM can read tooltip text for
@@ -266,32 +262,13 @@ export async function probeNextCraftAction(opts: {
     ? "(none yet)"
     : historyLines.map((a, i) => `  ${i === 0 ? "most recent" : `${i + 1} ago`}: ${a}`).join("\n");
 
-  // CV cursorHolding is the state-change ground truth. Logical
-  // cursorItem is the best guess at identity. CONFLICT (logical says
-  // holding but CV says empty, or vice-versa) -> report UNKNOWN
-  // explicitly rather than trusting either source. Agreement adds the
-  // identity annotation.
-  const cursorState = (() => {
-    if (opts.cursorHolding === true && opts.cursorItem) {
-      return `CURSOR IS HOLDING (CV-confirmed). Item identity (last pickup): ${opts.cursorItem}.`;
-    }
-    if (opts.cursorHolding === true && !opts.cursorItem) {
-      return "CURSOR IS HOLDING (CV-confirmed); item identity unknown -- check Recent actions.";
-    }
-    if (opts.cursorHolding === false && !opts.cursorItem) {
-      return "CURSOR IS EMPTY (CV-confirmed).";
-    }
-    if (opts.cursorHolding === false && opts.cursorItem) {
-      return `CURSOR STATE UNKNOWN: CV says empty but logical pickup recorded '${opts.cursorItem}'. Conflict -- do NOT assume what cursor holds; verify before placing.`;
-    }
-    if (opts.cursorHolding == null && opts.cursorItem) {
-      return `CURSOR STATE UNKNOWN: logical pickup tracked '${opts.cursorItem}' but CV undetermined. Treat with caution.`;
-    }
-    return "CURSOR STATE UNKNOWN.";
-  })();
-  const sourceLine = opts.pickupSourceSlot
-    ? `Original ingredient source slot: index ${opts.pickupSourceSlot.index}${opts.pickupSourceSlot.name ? ` (${opts.pickupSourceSlot.name})` : ""}. The tool already returns leftover ingredient back to this slot automatically -- do NOT use it as a destination for the crafted result; pick a DIFFERENT empty slot (look for a "." mark in the slot listing) for the result.`
-    : "No pickup source recorded yet.";
+  // CV-only cursor state. No rule-based logical tracking -- if CV
+  // hasn't observed it, we don't claim it.
+  const cursorState = opts.cursorHolding === true
+    ? "CURSOR IS HOLDING an item (CV-detected). Identity unknown unless visible in the image."
+    : opts.cursorHolding === false
+      ? "CURSOR IS EMPTY (CV-detected)."
+      : "CURSOR STATE UNKNOWN.";
 
   // Recipe-info hint (read-only, derived from minecraft-data). Helps the VLM
   // disambiguate multi-ingredient placement without surfacing live state.
@@ -416,7 +393,6 @@ export async function probeNextCraftAction(opts: {
     "",
     `State:`,
     `  ${cursorState}`,
-    `  ${sourceLine}`,
     "",
     `Recent actions you've already executed (do NOT repeat the same one if state hasn't changed):`,
     historyText,

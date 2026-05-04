@@ -975,7 +975,6 @@ export class McuVisualPolicy {
               recentActions: state.closedLoopHistory,
               cursorHolding,
               pickupSourceSlot: plan.pickupSourceSlot ?? null,
-              cursorItem: plan.cursorItem,
               knownSlots,
             });
             plan.iteration += 1;
@@ -1493,32 +1492,14 @@ export class McuVisualPolicy {
             // A successful click mutated the slot's contents — the slot
             // memory entry (if any) for this absolute pos is now stale.
             // Forget it; the agent will re-discover via hover if needed.
+            // A successful click mutated the slot. Invalidate the slot's
+            // memory entry; subsequent perception will re-OCR if the
+            // agent decides to verify_slots that slot. We do NOT
+            // speculatively write the cursor's item into the
+            // destination -- per the user's "perception only" rule,
+            // memory only contains entries confirmed by OCR.
             if (matched && pc.kind !== ("hover" as never)) {
-              const memBefore = plan.slotMemory.lookup(slotCenter.cx, slotCenter.cy);
-              if (pc.actionKind === "pickup" || pc.actionKind === "take") {
-                // Pickup: cursor gains the slot's item; slot empties.
-                plan.cursorItem = memBefore?.item ?? plan.cursorItem;
-                plan.slotMemory.invalidate(slotCenter.cx, slotCenter.cy);
-                console.log(`[agentbeats] cursorItem set to '${plan.cursorItem}' after pickup of ${pc.slotName ?? pc.rasterIndex}`);
-              } else if (pc.actionKind === "place_one") {
-                // Place ONE from cursor: slot now contains cursor's
-                // item; cursor still holds the rest. Record memory at
-                // dest with the cursor's known item so the agent sees
-                // "ingredient is now in cell N" without re-OCR.
-                if (plan.cursorItem) {
-                  plan.slotMemory.record(slotCenter.cx, slotCenter.cy, plan.cursorItem, plan.iteration);
-                  console.log(`[agentbeats] slotMemory placed '${plan.cursorItem}' at ${pc.slotName ?? pc.rasterIndex}`);
-                }
-                // cursor still holds remaining items.
-              } else if (pc.actionKind === "place_all") {
-                // Place ALL from cursor: slot now has cursor's item;
-                // cursor empties.
-                if (plan.cursorItem) {
-                  plan.slotMemory.record(slotCenter.cx, slotCenter.cy, plan.cursorItem, plan.iteration);
-                  console.log(`[agentbeats] slotMemory placed '${plan.cursorItem}' at ${pc.slotName ?? pc.rasterIndex}; cursor cleared`);
-                }
-                plan.cursorItem = null;
-              }
+              plan.slotMemory.invalidate(slotCenter.cx, slotCenter.cy);
             }
             console.log(
               `[agentbeats] verify ${pc.slotName ?? pc.rasterIndex}: post.stddev=${post.stddev.toFixed(1)} expect=${pc.expectAfter} -> ${matched ? "OK" : "MISMATCH"} (retry ${pc.retries}/${MAX_RETRIES})`,
