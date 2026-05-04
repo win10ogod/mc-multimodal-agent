@@ -991,22 +991,30 @@ export class McuVisualPolicy {
             plan.slotMemory.pruneStale(plan.iteration);
             const knownSlots: Array<{ index: number; name?: string; item: string; ageIters: number }> = [];
             // CV item-disappearance scan: for each slot we know holds
-            // an item from prior OCR, sample its current pixel patch.
-            // If the patch stddev is now low (slot looks empty), the
-            // item disappeared since OCR. Combined with park cursor
-            // diff, that tells us the cursor likely picked up that
-            // item.
+            // an item from prior OCR, sample its current pixel patch
+            // and compare to the stored fingerprint from OCR-time. A
+            // significant drift (RGB-mean distance) AND a stddev drop
+            // toward empty indicate the item left. Both conditions
+            // required to avoid false positives from minor variation.
             const disappearedItems: string[] = [];
             for (const s of layoutForProbe.slots) {
               const mem = plan.slotMemory.lookup(s.cx, s.cy);
               if (mem && mem.item !== "empty" && mem.item !== "unknown") {
                 const live = samplePatchFingerprint(payload.obs, s.cx, s.cy, 6);
-                if (live && live.stddev < 25) {
-                  // Slot was known filled, now visually empty.
-                  disappearedItems.push(mem.item);
-                  plan.slotMemory.invalidate(s.cx, s.cy);
-                  console.log(`[agentbeats] item disappeared: '${mem.item}' was at slot ${s.index}(${s.name ?? "?"}) -- cursor likely holds it`);
-                  continue;  // don't include in knownSlots
+                if (live && mem.fingerprint) {
+                  const dr = live.meanR - mem.fingerprint.meanR;
+                  const dg = live.meanG - mem.fingerprint.meanG;
+                  const db = live.meanB - mem.fingerprint.meanB;
+                  const distFromOcr = Math.sqrt(dr * dr + dg * dg + db * db);
+                  const stddevDrop = mem.fingerprint.stddev - live.stddev;
+                  // Drifted far from the OCR-time appearance AND much
+                  // less textured than then -> item really left.
+                  if (distFromOcr > 40 && stddevDrop > 30 && live.stddev < 30) {
+                    disappearedItems.push(mem.item);
+                    plan.slotMemory.invalidate(s.cx, s.cy);
+                    console.log(`[agentbeats] item disappeared: '${mem.item}' was at slot ${s.index}(${s.name ?? "?"}) -- distFromOcr=${distFromOcr.toFixed(1)} stddevDrop=${stddevDrop.toFixed(1)}`);
+                    continue;
+                  }
                 }
                 knownSlots.push({ index: s.index, name: s.name, item: mem.item, ageIters: plan.iteration - mem.step });
               }
