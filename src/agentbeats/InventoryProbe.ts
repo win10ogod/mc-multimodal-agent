@@ -299,7 +299,7 @@ export async function probeNextCraftAction(opts: {
     "",
     "Do NOT return a 'done' action -- task completion is decided by a different controller, not by you. Always emit the next move or put step that advances the task; if everything is already placed and the result is sitting in role=result, your next step is to move it out into a role=hotbar or role=main_inv slot.",
     "",
-    `Rule: when the cursor is carrying an item, "to" must be a visually empty slot. Placing onto a filled slot triggers a swap. If you must deposit into an occupied slot S, use this 3-step sequence (cursor empty between pickups): (1) "put" current held item into an empty side slot to park it; (2) next probe: "move" the item from S to another empty slot; (3) next probe: "move" the parked item from the side slot to S.`,
+    `Rule: when the cursor is carrying an item, "to" must be either (a) a visually empty slot, OR (b) a slot containing the SAME item as what the cursor holds (will stack into one pile). Placing onto a slot with a DIFFERENT item triggers a destructive swap and corrupts state. If you must deposit into a slot occupied by a different item, use this 3-step sequence: (1) "put" current held item into an empty side slot, (2) next probe: "move" the blocking item to another empty slot, (3) next probe: "move" the parked item to the now-empty target.`,
     "",
     `Flow for ${opts.taskTarget}:`,
     `  1. move one ${opts.ingredient} from a hotbar/main_inv slot into a craft slot (count=one).`,
