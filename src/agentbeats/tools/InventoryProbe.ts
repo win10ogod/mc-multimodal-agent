@@ -307,6 +307,8 @@ export async function probeNextCraftAction(opts: {
     "",
     `Rule: when the cursor is carrying an item, "to" must be either (a) a visually empty slot, OR (b) a slot containing the SAME item as what the cursor holds (will stack). Placing onto a slot with a DIFFERENT item triggers a swap. If you must deposit into a slot occupied by a different item: (1) "put" current held item into an empty side slot, (2) next probe: "move" the blocking item to another empty slot, (3) next probe: "move" the parked item to the now-empty target.`,
     "",
+    `Anti-hallucination rule for crafting with MULTIPLE distinct ingredients (e.g. diorite = cobblestone + nether quartz, granite, andesite, any non-uniform 2x2/3x3 recipe): you cannot reliably tell which ingredient occupies a non-empty grid cell from the raster image alone. Before placing the SECOND ingredient type, you MUST emit one or more "hover" actions over EACH non-empty grid cell to read its tooltip. Only after every occupied grid cell's identity is confirmed via tooltip in a subsequent probe image may you place a different ingredient. Do NOT assume "the other ingredient is already there" -- if you only ever picked up one item type so far, only that type is in the grid.`,
+    "",
     `This is iteration ${opts.iteration}. Return ONLY the JSON action.`,
   ].join("\n");
   const dataUrl = `data:${imgMime};base64,${imgBase64}`;
