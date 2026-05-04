@@ -30,6 +30,10 @@ import { getDebugRecorder } from "./tools/DebugRecorder";
 import { dispatchObservation } from "./agents/Dispatcher";
 import type { EpisodeState, SubAgent, SubAgentKind, SubAgentStep } from "./agents/SubAgent";
 import { makeEpisodeState } from "./agents/SubAgent";
+import { createWorldExplorer } from "./agents/subagents/WorldExplorer";
+import { createMining } from "./agents/subagents/Mining";
+import { createCombat } from "./agents/subagents/Combat";
+import { createPlacing } from "./agents/subagents/Placing";
 
 type McuInitPayload = {
   type: "init";
@@ -702,17 +706,13 @@ export class McuVisualPolicy {
       // Single-task ui_inventory bypass: fall through to existing closed-loop body unchanged.
       // Multi-subgoal first-step that is NOT ui_inventory: route through dispatcher with stub world sub-agents.
       if (!episode.singleTask && currentSubgoal && currentSubgoal.kind !== "ui_inventory") {
-        const stubAct = (kind: SubAgentKind): SubAgent => ({
-          kind,
-          systemPrompt: "",
-          step: async (): Promise<SubAgentStep> => ({ kind: "subgoal_failed", reason: `world sub-agent ${kind} not yet implemented` }),
-        });
+        const worldDeps = { client: this.client, model: this.config.openai.model };
         const subagents: Record<SubAgentKind, SubAgent> = {
-          ui_inventory: stubAct("ui_inventory"),
-          world_explore: stubAct("world_explore"),
-          mining: stubAct("mining"),
-          combat: stubAct("combat"),
-          placing: stubAct("placing"),
+          ui_inventory: { kind: "ui_inventory", systemPrompt: "", step: async () => ({ kind: "subgoal_failed", reason: "ui_inventory bridge not yet wired" }) },
+          world_explore: createWorldExplorer(worldDeps),
+          mining: createMining(worldDeps),
+          combat: createCombat(worldDeps),
+          placing: createPlacing(worldDeps),
         };
         const result = await dispatchObservation(
           {
