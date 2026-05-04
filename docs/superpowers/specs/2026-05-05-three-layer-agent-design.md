@@ -158,7 +158,9 @@ src/agentbeats/
    ├─ SlotDetector.ts
    ├─ InventoryProbe.ts
    ├─ UiFastControl.ts
-   └─ DebugRecorder.ts
+   ├─ DebugRecorder.ts
+   ├─ SlotMarker.ts
+   └─ InventoryLayouts.ts
 ```
 
 ## 5. Dispatch Flow

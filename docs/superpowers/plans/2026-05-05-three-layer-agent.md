@@ -1,4 +1,4 @@
-# Three-Layer Agent Architecture Implementation Plan
+1# Three-Layer Agent Architecture Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
@@ -22,8 +22,6 @@ src/agentbeats/
 ├─ McuToolDriver.ts                 # unchanged
 ├─ McuVisionStub.ts                 # unchanged
 ├─ A2AServer.ts                     # unchanged
-├─ SlotMarker.ts                    # unchanged (used by tools)
-├─ InventoryLayouts.ts              # unchanged (used by tools)
 ├─ agents/
 │  ├─ SubAgent.ts                   # NEW: interface + types + EpisodeState
 │  ├─ Dispatcher.ts                 # NEW: routing + GUI gate
@@ -46,7 +44,9 @@ src/agentbeats/
    ├─ SlotDetector.ts               # MOVED from ../SlotDetector.ts
    ├─ InventoryProbe.ts             # MOVED
    ├─ UiFastControl.ts              # MOVED
-   └─ DebugRecorder.ts              # MOVED
+   ├─ DebugRecorder.ts              # MOVED
+   ├─ SlotMarker.ts                 # MOVED
+   └─ InventoryLayouts.ts           # MOVED
 ```
 
 Tests live alongside existing tests under `test/`.
