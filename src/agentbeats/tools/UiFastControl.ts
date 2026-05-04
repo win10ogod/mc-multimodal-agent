@@ -502,9 +502,23 @@ export type ClosedLoopCraftPlan = {
    *  inspect (so MC renders the tooltip in the next probe image). */
   skipNextPark: boolean;
   /** Per-UI-session memory of "what is at absolute pixel position X,Y"
-   *  populated by TooltipOCR after each hover. Surfaced to the probe in
+   *  populated by tooltip OCR after each hover. Surfaced to the probe in
    *  the next prompt so the VLM doesn't re-hover the same slot. */
   slotMemory: SlotMemory;
+  /** When non-null, an OCR-on-settle is expected for the next obs frame
+   *  (cursor was just hovered onto a slot; tooltip should be rendered). */
+  pendingTooltipRead: { slotIndex: number; x: number; y: number; slotName?: string } | null;
+  /** Active verify_slots batch: queue of non-empty slots to hover + OCR
+   *  in sequence. After the last slot, the runtime servos cursor back to
+   *  a park position before falling through to the next probe call so
+   *  the cursor never lingers on a real item across iterations. */
+  pendingOcrBatch: {
+    slots: Array<{ slot: number; x: number; y: number; name?: string }>;
+    idx: number;
+    /** Set when we've finished all slots and are now servoing back to
+     *  the park position; OCR is suppressed in this phase. */
+    parking: boolean;
+  } | null;
 };
 
 /** Servo control law: given current cursor + target slot pixel center,
@@ -608,6 +622,8 @@ export function planClosedLoopCraft(taskText: string): ClosedLoopCraftPlan {
     parkSteps: 0,
     skipNextPark: false,
     slotMemory: new SlotMemory(),
+    pendingTooltipRead: null,
+    pendingOcrBatch: null,
   };
 }
 

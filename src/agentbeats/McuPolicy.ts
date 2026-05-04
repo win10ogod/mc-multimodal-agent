@@ -821,8 +821,68 @@ export class McuVisualPolicy {
             plan.skipNextPark = false;
             plan.parkSteps = 0;
             console.log(`[agentbeats] skipNextPark consumed; cursor stays at current spot for probe`);
-            // verify_slots no longer needs cursor movement; OCR happens
-            // inline in the probed-action handler. Just fall through.
+            // OCR-on-settle: a verify_slots batch has cursor parked on
+            // a slot; tooltip should be rendered. Read it, record memory,
+            // advance the queue. After the last slot, servo back to the
+            // park position before returning control to the main probe.
+            if (plan.pendingTooltipRead) {
+              const { readTooltip } = await import("./tools/SlotOcr");
+              const target = plan.pendingTooltipRead;
+              try {
+                const r = await readTooltip({
+                  client: this.client,
+                  model: this.config.openai.model,
+                  obsBase64: payload.obs ?? "",
+                  slotPos: { x: target.x, y: target.y },
+                  slotName: target.slotName,
+                });
+                plan.slotMemory.record(target.x, target.y, r.item, plan.iteration);
+                console.log(`[agentbeats] slot_ocr slot=${target.slotIndex}(${target.slotName ?? "?"}) -> ${r.item}`);
+              } catch (e) {
+                console.warn(`[agentbeats] slot OCR failed: ${e instanceof Error ? e.message : String(e)}`);
+              }
+              plan.pendingTooltipRead = null;
+            }
+            // Advance the OCR batch.
+            if (plan.pendingOcrBatch) {
+              if (plan.pendingOcrBatch.parking) {
+                // Cursor just finished parking; batch complete.
+                console.log(`[agentbeats] verify_slots batch complete (parked)`);
+                plan.pendingOcrBatch = null;
+                // Fall through to probe.
+              } else {
+                plan.pendingOcrBatch.idx += 1;
+                if (plan.pendingOcrBatch.idx < plan.pendingOcrBatch.slots.length) {
+                  const next = plan.pendingOcrBatch.slots[plan.pendingOcrBatch.idx];
+                  plan.pendingClick = {
+                    rasterIndex: next.slot, slotName: next.name, slotRole: undefined,
+                    frozenTarget: { x: next.x, y: next.y },
+                    button: "attack", shift: false, expectAfter: "should_fill",
+                    phase: "servo", retries: 0, kind: "hover" as "click",
+                    actionKind: "pickup" as "pickup",
+                  };
+                  plan.skipNextPark = true;
+                  plan.pendingTooltipRead = { slotIndex: next.slot, x: next.x, y: next.y, slotName: next.name };
+                  console.log(`[agentbeats] verify_slots OCR advance idx=${plan.pendingOcrBatch.idx}/${plan.pendingOcrBatch.slots.length} slot=${next.slot}`);
+                  return { ...ACTION_PAYLOAD_PREFIX, action: defaultMcuAction(), hold_steps: 1 };
+                }
+                // All slots OCR'd. Move cursor back to park position so
+                // the next probe sees a clean cursor (not lingering on a
+                // real slot which would change tooltip / risk a click).
+                const parkSpot = { x: layout.windowX + 4, y: layout.windowY + 4 };
+                plan.pendingClick = {
+                  rasterIndex: -1, slotName: "park", slotRole: undefined,
+                  frozenTarget: parkSpot,
+                  button: "attack", shift: false, expectAfter: "should_fill",
+                  phase: "servo", retries: 0, kind: "hover" as "click",
+                  actionKind: "pickup" as "pickup",
+                };
+                plan.skipNextPark = true;
+                plan.pendingOcrBatch.parking = true;
+                console.log(`[agentbeats] verify_slots OCR done; servoing cursor to park (${parkSpot.x},${parkSpot.y})`);
+                return { ...ACTION_PAYLOAD_PREFIX, action: defaultMcuAction(), hold_steps: 1 };
+              }
+            }
           } else {
           const PARK_STEP_CAP = 6;
           // Park at the TOP-LEFT corner of the window. Cursor sprite
@@ -1059,13 +1119,11 @@ export class McuVisualPolicy {
                 console.log(`[agentbeats] closed-loop probe iter=${plan.iteration}: put slot=${probed.slot}(${dest.name ?? "?"}) reason=${probed.reason ?? ""}`);
               }
             } else if (probed.action === "verify_slots") {
-              // Inline parallel slot identification. Crop each requested
-              // slot from the CURRENT obs frame, send each crop to the
-              // identifier sub-agent in parallel, write every result into
-              // SlotMemory, then return a no-op so the next obs triggers
-              // a fresh probe with the populated knownSlots block. No
-              // cursor movement, no tooltip dependency, no per-slot
-              // policy ticks -- one frame, N parallel small calls.
+              // verify_slots: hover cursor on each requested slot in
+              // sequence, OCR the rendered tooltip, write SlotMemory,
+              // then park the cursor before returning to the probe.
+              // CV stddev fast-path lets visually-empty slots short-
+              // circuit with zero cursor movement and zero LLM cost.
               const queue = probed.slots
                 .map((s) => {
                   const d = layoutForProbe.slots[s];
@@ -1075,41 +1133,43 @@ export class McuVisualPolicy {
               if (queue.length === 0) {
                 console.warn(`[agentbeats] verify_slots: no resolvable slots in [${probed.slots.join(",")}]; skipping`);
               } else {
-                const SlotPerception = await import("./tools/SlotPerception");
-                // CV fast-path: if a slot's patch looks visually empty
-                // (uniform low-stddev background), skip the perception
-                // LLM call. ~half the verify_slots batches are wasted
-                // on slots the agent over-eagerly listed.
-                const decided: Array<{ q: typeof queue[0]; r: { item: string } }> = [];
-                const needLlm: typeof queue = [];
+                const cvEmpty: typeof queue = [];
+                const needOcr: typeof queue = [];
                 for (const q of queue) {
                   const patch = samplePatchFingerprint(payload.obs, q.x, q.y, 6);
-                  if (patch && patch.stddev < 25) {
-                    decided.push({ q, r: { item: "empty" } });
-                  } else {
-                    needLlm.push(q);
-                  }
+                  if (patch && patch.stddev < 25) cvEmpty.push(q);
+                  else needOcr.push(q);
                 }
-                console.log(`[agentbeats] verify_slots batch=${queue.length} cv_empty=${decided.length} llm=${needLlm.length} slots=${queue.map((q) => `${q.slot}(${q.name ?? "?"})`).join(",")}`);
-                const llmResults = await Promise.all(needLlm.map((q) =>
-                  SlotPerception.perceiveSlot({
-                    client: this.client,
-                    model: this.config.openai.model,
-                    obsBase64: payload.obs ?? "",
-                    slotPos: { x: q.x, y: q.y },
-                    slotName: q.name,
-                  }).then((r) => ({ q, r }))
-                ));
-                const results = [...decided, ...llmResults];
-                for (const { q, r } of results) {
-                  plan.slotMemory.record(q.x, q.y, r.item, plan.iteration);
-                  console.log(`[agentbeats] slot_id slot=${q.slot}(${q.name ?? "?"}) -> ${r.item}`);
+                // Record CV-empty results immediately; no servo needed.
+                for (const q of cvEmpty) {
+                  plan.slotMemory.record(q.x, q.y, "empty", plan.iteration);
                 }
-                state.closedLoopHistory.unshift(
-                  `verify_slots[${queue.length}]: ${results.map(({ q, r }) => `${q.slot}=${r.item}`).join(", ")}`,
-                );
+                console.log(`[agentbeats] verify_slots batch=${queue.length} cv_empty=${cvEmpty.length} ocr=${needOcr.length} slots=${queue.map((q) => `${q.slot}(${q.name ?? "?"})`).join(",")}`);
+                if (needOcr.length === 0) {
+                  // Everything was CV-empty; nothing to OCR. Just return
+                  // and let the probe see the updated slotMemory.
+                  state.closedLoopHistory.unshift(`verify_slots[${queue.length}] cv_empty=${cvEmpty.length}`);
+                  state.closedLoopHistory = state.closedLoopHistory.slice(0, 5);
+                  return { ...ACTION_PAYLOAD_PREFIX, action: defaultMcuAction(), hold_steps: 1 };
+                }
+                // Arm the OCR batch state machine: queue the non-empty
+                // slots and start servoing cursor toward the first one.
+                plan.pendingOcrBatch = { slots: needOcr, idx: 0, parking: false };
+                const first = needOcr[0];
+                plan.pendingClick = {
+                  rasterIndex: first.slot, slotName: first.name, slotRole: undefined,
+                  frozenTarget: { x: first.x, y: first.y },
+                  button: "attack", shift: false, expectAfter: "should_fill",
+                  phase: "servo", retries: 0, kind: "hover" as "click",
+                  actionKind: "pickup" as "pickup",
+                };
+                plan.pendingChain = [];
+                plan.servoSteps = 0;
+                plan.skipNextPark = true;
+                plan.pendingTooltipRead = { slotIndex: first.slot, x: first.x, y: first.y, slotName: first.name };
+                state.closedLoopHistory.unshift(`verify_slots[${queue.length}] cv_empty=${cvEmpty.length} ocr=${needOcr.length}`);
                 state.closedLoopHistory = state.closedLoopHistory.slice(0, 5);
-                return { ...ACTION_PAYLOAD_PREFIX, action: defaultMcuAction(), hold_steps: 1 };
+                console.log(`[agentbeats] verify_slots OCR batch start: first slot=${first.slot}(${first.name ?? "?"})`);
               }
             } else {
               // Legacy low-level actions: pickup / place_one / place_all / take.
