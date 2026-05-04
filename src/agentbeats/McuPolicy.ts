@@ -877,7 +877,7 @@ export class McuVisualPolicy {
                 // All slots OCR'd. Move cursor back to park position so
                 // the next probe sees a clean cursor (not lingering on a
                 // real slot which would change tooltip / risk a click).
-                const parkSpot = { x: layout.windowX + 4, y: layout.windowY + 4 };
+                const parkSpot = { x: Math.min(632, layout.windowX + layout.windowW + 16), y: layout.windowY + 8 };
                 plan.pendingClick = {
                   rasterIndex: -1, slotName: "park", slotRole: undefined,
                   frozenTarget: parkSpot,
@@ -901,13 +901,13 @@ export class McuVisualPolicy {
           // ON main_inv_0 in the player_inventory layout, which then
           // contaminated every pre-check sample of that slot
           // (cursor + held-item pixels read as "filled" stddev~137).
-          // Park OUTSIDE the inventory window in the dimmed world-view
-          // region. The previous park (windowX+4, windowY+4) actually
-          // lands on the helmet armor slot in player_inventory, which
-          // contaminates samples and clicks. Right-of-window stays
-          // inside the 640px obs and away from any inventory slot.
+          // Park OUTSIDE the inventory window. MC does allow the cursor
+          // to leave the GUI window region while a GUI is open. Right
+          // of the window puts the cursor in the dimmed world-view
+          // region with no slot icons, so the patch sample there is
+          // a stable baseline.
           const parkSpot = {
-            x: Math.min(630, layout.windowX + layout.windowW + 12),
+            x: Math.min(632, layout.windowX + layout.windowW + 16),
             y: layout.windowY + 8,
           };
           const distFromPark = cursor ? Math.hypot(cursor.x - parkSpot.x, cursor.y - parkSpot.y) : Infinity;
@@ -948,8 +948,9 @@ export class McuVisualPolicy {
           // cursor arrow itself, so cursor-sprite pixels aren't part
           // of the signal. Compare to a baseline captured the first
           // time we know the cursor is empty (initial park).
-          const PARK_X = layout.windowX + 4;
-          const PARK_Y = layout.windowY + 4;
+          // Must match the parkSpot computed in the park-step block below.
+          const PARK_X = Math.min(632, layout.windowX + layout.windowW + 16);
+          const PARK_Y = layout.windowY + 8;
           // Tolerance must match the park-step's own 12-px arrival
           // gate -- park rarely lands within 6 px because cam moves
           // are quantized.
