@@ -738,6 +738,42 @@ export function discoverSlots(jpegBase64: string): DiscoveredLayout | null {
   }
   if (candidates.length === 0) return null;
 
+  // Overlap dedup: when two bboxes overlap significantly (e.g. armor
+  // shield and chestplate icons being detected as separate components
+  // inside the same slot, or item-icon contours nested inside the
+  // slot frame), drop the SMALLER one and keep the OUTER. We score
+  // overlap by intersection-over-union of the bboxes; anything >0.5
+  // is a duplicate of the larger.
+  {
+    const bboxOf = (s: typeof candidates[0]) => ({ x0: s.x, y0: s.y, x1: s.x + s.w - 1, y1: s.y + s.h - 1, area: s.w * s.h });
+    const drop = new Set<number>();
+    for (let i = 0; i < candidates.length; i += 1) {
+      if (drop.has(i)) continue;
+      const a = bboxOf(candidates[i]);
+      for (let j = i + 1; j < candidates.length; j += 1) {
+        if (drop.has(j)) continue;
+        const b = bboxOf(candidates[j]);
+        const ix0 = Math.max(a.x0, b.x0), iy0 = Math.max(a.y0, b.y0);
+        const ix1 = Math.min(a.x1, b.x1), iy1 = Math.min(a.y1, b.y1);
+        if (ix1 < ix0 || iy1 < iy0) continue;
+        const inter = (ix1 - ix0 + 1) * (iy1 - iy0 + 1);
+        const union = a.area + b.area - inter;
+        const iou = inter / union;
+        if (iou > 0.5) {
+          // Drop the smaller area; keep the larger (outer) bbox.
+          if (a.area >= b.area) drop.add(j);
+          else { drop.add(i); break; }
+        }
+      }
+    }
+    if (drop.size > 0) {
+      const kept: typeof candidates = [];
+      for (let i = 0; i < candidates.length; i += 1) if (!drop.has(i)) kept.push(candidates[i]);
+      candidates.length = 0;
+      for (const k of kept) candidates.push(k);
+    }
+  }
+
   // Raster-order by clustering slots into row groups using a tight cy
   // tolerance, then sorting each row by cx. The previous version
   // quantized cy by stride which mis-grouped neighboring slots that
