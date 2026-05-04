@@ -258,6 +258,30 @@ function resultImages(result: ToolResult): Array<{ dataUrl: string; detail?: "lo
     .filter((entry) => entry.dataUrl.trim().length > 0);
 }
 
+function isChatImagePart(part: unknown): boolean {
+  return Boolean(part && typeof part === "object" && (part as { type?: unknown }).type === "image_url");
+}
+
+function pruneChatMessageImages(messages: any[], maxImages: number): void {
+  const limit = Math.max(0, Math.floor(Number.isFinite(maxImages) ? maxImages : 8));
+  let retained = 0;
+  for (let messageIndex = messages.length - 1; messageIndex >= 0; messageIndex -= 1) {
+    const content = messages[messageIndex]?.content;
+    if (!Array.isArray(content)) {
+      continue;
+    }
+    for (let partIndex = content.length - 1; partIndex >= 0; partIndex -= 1) {
+      if (!isChatImagePart(content[partIndex])) {
+        continue;
+      }
+      retained += 1;
+      if (retained > limit) {
+        content.splice(partIndex, 1);
+      }
+    }
+  }
+}
+
 const AGENT_TURN_SCHEMA: JsonObject = {
   type: "object",
   additionalProperties: false,
@@ -1246,6 +1270,7 @@ export class ChatCompletionsModelProvider implements ModelProvider {
   }
 
   private async createChatCompletion(tools: JsonObject[]): Promise<ProviderTurn> {
+    pruneChatMessageImages(this.messages, this.config.openai.maxImagesPerPrompt);
     const body: Record<string, unknown> = {
       model: this.config.openai.model,
       messages: this.messages,

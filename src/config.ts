@@ -47,6 +47,7 @@ export type AgentConfig = {
     maxRetries: number;
     retryInitialDelayMs: number;
     parallelToolCalls: boolean;
+    maxImagesPerPrompt: number;
     reasoningEffort?: "none" | "low" | "medium" | "high" | "xhigh";
     structuredOutputs: boolean;
     extraBody?: Record<string, unknown>;
@@ -318,6 +319,7 @@ export function loadConfig(projectRoot = process.cwd()): AgentConfig {
       maxRetries: envInt("OPENAI_MAX_RETRIES", 5),
       retryInitialDelayMs: envInt("OPENAI_RETRY_INITIAL_DELAY_MS", 1_000),
       parallelToolCalls: envBool("OPENAI_PARALLEL_TOOL_CALLS", true),
+      maxImagesPerPrompt: Math.max(0, envInt("OPENAI_MAX_IMAGES_PER_PROMPT", 8)),
       reasoningEffort:
         (process.env.OPENAI_REASONING_EFFORT?.trim() as AgentConfig["openai"]["reasoningEffort"]) ||
         "medium",
