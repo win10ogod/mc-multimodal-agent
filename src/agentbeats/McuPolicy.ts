@@ -701,22 +701,7 @@ export class McuVisualPolicy {
       if (!layout) {
         // Already handled above (plan.done=true path)
       } else {
-        // Cursor detection with motion-expectation disambiguation.
-        // The plain largest-white-blob detector latches onto static GUI
-        // features (slot highlights, item icon edges) and reports a
-        // phantom pixel for many frames. Track an EXPECTED position
-        // open-loop from the cam deltas we emitted, and prefer the
-        // candidate closest to that expectation.
-        const PX_PER_CAM_PITCH_OL = 5.0;
-        const PX_PER_CAM_YAW_OL = 8.5;
-        let expected: { x: number; y: number } | null = plan.cursor;
-        if (expected && (plan.lastEmittedCam[0] !== 0 || plan.lastEmittedCam[1] !== 0)) {
-          expected = {
-            x: expected.x + plan.lastEmittedCam[1] * PX_PER_CAM_YAW_OL,
-            y: expected.y + plan.lastEmittedCam[0] * PX_PER_CAM_PITCH_OL,
-          };
-        }
-        const cursor = detectCursorWithExpectation(payload.obs, layout, expected);
+        const cursor = detectCursorWithExpectation(payload.obs, layout, null);
         plan.cursor = cursor ?? plan.cursor;
 
         // Before each new probe, park the cursor in a clear left-side

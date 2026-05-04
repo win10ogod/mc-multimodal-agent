@@ -316,7 +316,7 @@ export function guiSlotsByRole(layout: GuiLayout, role: string): GuiSlot[] {
  *  ~10x16 footprint and is not at a slot's typical position (helps avoid
  *  matching white items in slots). Returns null if no plausible cursor
  *  is found. */
-export function detectCursor(jpegBase64: string, layout: GuiLayout): { x: number; y: number } | null {
+export function detectCursor(jpegBase64: string, _layout: GuiLayout): { x: number; y: number } | null {
   const cleaned = jpegBase64.startsWith("data:image/")
     ? jpegBase64.replace(/^data:image\/[a-z]+;base64,/, "")
     : jpegBase64;
@@ -327,13 +327,16 @@ export function detectCursor(jpegBase64: string, layout: GuiLayout): { x: number
   } catch {
     return null;
   }
-  const { width: w, data } = decoded;
+  const { width: w, height: h, data } = decoded;
 
-  // Search inside the inventory window only.
-  const x0 = layout.windowX;
-  const y0 = layout.windowY;
-  const ww = layout.windowW;
-  const hh = layout.windowH;
+  // Search the whole frame: the GUI cursor can be anywhere on screen,
+  // not just inside the inventory window's grey area (e.g. on the
+  // sidebar, hotbar, or transparent overlay regions). With shape
+  // filtering below the false-positive rate is acceptable.
+  const x0 = 0;
+  const y0 = 0;
+  const ww = w;
+  const hh = h;
 
   // Build mask of near-white pixels.
   const mask = new Uint8Array(ww * hh);
@@ -357,7 +360,7 @@ export function detectCursor(jpegBase64: string, layout: GuiLayout): { x: number
 
   // Flood-fill, score components.
   const labels = new Int32Array(ww * hh);
-  let best: { cx: number; cy: number; area: number; cw: number; ch: number } | null = null;
+  let best: { cx: number; cy: number; area: number; cw: number; ch: number; score: number } | null = null;
   let nextLabel = 1;
   for (let yy = 0; yy < hh; yy += 1) {
     for (let xx = 0; xx < ww; xx += 1) {
@@ -386,18 +389,42 @@ export function detectCursor(jpegBase64: string, layout: GuiLayout): { x: number
       if (area < 6 || area > 90) continue;
       if (cw < 4 || cw > 16) continue;
       if (ch < 6 || ch > 22) continue;
-      // Cursor is taller than wide.
       if (ch < cw * 0.7) continue;
-      // The Minecraft GUI cursor's hotspot (the pixel that registers the
-      // click) is at the arrow TIP, which is the top-LEFT corner of the
-      // sprite. Return that point, not the bbox centroid -- the servo
-      // needs to align the hotspot with the slot center.
+      // SHAPE MATCHING: the MC GUI cursor is an arrow pointing UP-LEFT
+      // -- its tip is at the bbox top-left corner, density is heavy in
+      // the upper-left, light toward the bottom-right. Static slot
+      // highlights / item icon edges have rectangular or hollow density
+      // distributions, so they fail this test even when their size is
+      // in the cursor range. Reject blobs that don't look like cursors.
+      let topLeftFill = 0;
+      let bottomRightFill = 0;
+      const midX = minX + Math.floor(cw / 2);
+      const midY = minY + Math.floor(ch / 2);
+      for (let py = minY; py <= maxY; py += 1) {
+        for (let px = minX; px <= maxX; px += 1) {
+          if (labels[py * ww + px] !== nextLabel - 1) continue;
+          if (px <= midX && py <= midY) topLeftFill += 1;
+          else if (px > midX && py > midY) bottomRightFill += 1;
+        }
+      }
+      // Cursor: tip pixel must lie in the bbox top-left corner (within
+      // 1 px). For a hollow rectangle the top-left bbox corner is empty.
+      const tipPresent =
+        labels[minY * ww + minX] === nextLabel - 1
+        || (minX + 1 < ww && labels[minY * ww + (minX + 1)] === nextLabel - 1)
+        || (minY + 1 < hh && labels[(minY + 1) * ww + minX] === nextLabel - 1);
+      if (!tipPresent) continue;
+      // Cursor: top-left half should have noticeably more pixels than
+      // bottom-right half (mass concentrated at tip, tail thinning).
+      if (topLeftFill < bottomRightFill * 1.5 + 2) continue;
+      // Score by cursor-likeness, not size. Larger asymmetry wins.
+      const score = topLeftFill - bottomRightFill;
       const candidate = {
         cx: x0 + minX,
         cy: y0 + minY,
-        area, cw, ch,
+        area, cw, ch, score,
       };
-      if (!best || candidate.area > best.area) best = candidate;
+      if (!best || candidate.score > best.score) best = candidate;
     }
   }
   return best ? { x: Math.round(best.cx), y: Math.round(best.cy) } : null;
