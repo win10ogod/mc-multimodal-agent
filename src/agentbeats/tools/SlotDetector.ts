@@ -945,6 +945,17 @@ function fillGridGaps(disc: DiscoveredLayout): DiscoveredSlot[] {
   return filled;
 }
 
+/** Adapter for the Dispatcher GUI gate. Returns slots[] or empty on any error.
+ *  Uses discoverSlots internally -- pure CV, no layout assumption. */
+export function detectGuiSlots(imageBase64: string): { slots: Array<{ index: number; cx?: number; cy?: number }> } {
+  try {
+    const result = discoverSlots(imageBase64);
+    return { slots: result?.slots ?? [] };
+  } catch {
+    return { slots: [] };
+  }
+}
+
 /** GENERAL DETECTION POLICY entry point.
  *  - Always runs CV slot discovery (works for any GUI).
  *  - Tries to promote raster indices to semantic names by matching

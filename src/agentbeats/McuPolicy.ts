@@ -27,6 +27,9 @@ import {
 import { probeNextCraftAction, vlmVerifySlotState } from "./tools/InventoryProbe";
 import { detectCursorWithExpectation, detectGuiLayout, samplePatchFingerprint } from "./tools/SlotDetector";
 import { getDebugRecorder } from "./tools/DebugRecorder";
+import { dispatchObservation } from "./agents/Dispatcher";
+import type { EpisodeState, SubAgent, SubAgentKind, SubAgentStep } from "./agents/SubAgent";
+import { makeEpisodeState } from "./agents/SubAgent";
 
 type McuInitPayload = {
   type: "init";
@@ -509,6 +512,7 @@ export class McuVisualPolicy {
   private readonly client: OpenAI;
   private readonly contexts = new Map<string, McuContextState>();
   private readonly toolDrivers = new Map<string, import("./McuToolDriver").McuToolDriver>();
+  private readonly episodes = new Map<string, EpisodeState>();
 
   constructor(private readonly config: AgentConfig) {
     this.client = new OpenAI({
@@ -662,6 +666,73 @@ export class McuVisualPolicy {
       earlyStop: false,
     };
     this.contexts.set(contextId, state);
+
+    // ── MCU_USE_PLANNER gated branch ──────────────────────────────────────
+    // When MCU_USE_PLANNER=1: run the planner/dispatcher BEFORE the existing
+    // closed-loop body. When the gate is off (default), this block is skipped
+    // entirely and behavior is byte-identical to the previous implementation.
+    const usePlanner = process.env.MCU_USE_PLANNER === "1";
+    if (usePlanner) {
+      // Lazy-init episode for this contextId
+      let episode = this.episodes.get(contextId);
+      if (!episode) {
+        const taskText = state.taskText || ((payload as any)?.task ?? "");
+        episode = makeEpisodeState(taskText);
+        this.episodes.set(contextId, episode);
+      }
+
+      // First-time plan
+      if (episode.subgoals.length === 0) {
+        const { planGoals } = await import("./agents/GoalPlanner");
+        const out = await planGoals(
+          { client: this.client, model: this.config.openai.model },
+          episode.taskText,
+          [],
+        );
+        if (out.overall_done) {
+          episode.earlyStop = true;
+          state.earlyStop = true;
+          return { ...ACTION_PAYLOAD_PREFIX, action: defaultMcuAction(), hold_steps: this.config.agentbeats.maxHoldSteps };
+        }
+        episode.subgoals = out.subgoals;
+        episode.singleTask = out.subgoals.length === 1;
+      }
+
+      const currentSubgoal = episode.subgoals[episode.idx];
+      // Single-task ui_inventory bypass: fall through to existing closed-loop body unchanged.
+      // Multi-subgoal first-step that is NOT ui_inventory: route through dispatcher with stub world sub-agents.
+      if (!episode.singleTask && currentSubgoal && currentSubgoal.kind !== "ui_inventory") {
+        const stubAct = (kind: SubAgentKind): SubAgent => ({
+          kind,
+          systemPrompt: "",
+          step: async (): Promise<SubAgentStep> => ({ kind: "subgoal_failed", reason: `world sub-agent ${kind} not yet implemented` }),
+        });
+        const subagents: Record<SubAgentKind, SubAgent> = {
+          ui_inventory: stubAct("ui_inventory"),
+          world_explore: stubAct("world_explore"),
+          mining: stubAct("mining"),
+          combat: stubAct("combat"),
+          placing: stubAct("placing"),
+        };
+        const result = await dispatchObservation(
+          {
+            client: this.client,
+            plannerModel: this.config.openai.model,
+            subagents,
+            runClosedLoopStep: async () => ({ kind: "subgoal_failed", reason: "closed-loop bridge not yet wired" }),
+          },
+          episode,
+          { imageBase64: payload.obs ?? "", contextId },
+        );
+        if (episode.earlyStop) {
+          state.earlyStop = true;
+        }
+        return { ...ACTION_PAYLOAD_PREFIX, action: result.action, hold_steps: result.holdSteps };
+      }
+      // else: single-task ui_inventory (or multi-task with ui_inventory first) —
+      // fall through to the existing closed-loop body unchanged.
+    }
+    // ── end MCU_USE_PLANNER gated branch ──────────────────────────────────
 
     const step = Math.max(0, Number.isFinite(payload.step) ? Number(payload.step) : 0);
 
