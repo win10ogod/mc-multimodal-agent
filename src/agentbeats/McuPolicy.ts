@@ -708,6 +708,22 @@ export class McuVisualPolicy {
         const cursor = detectCursor(payload.obs, layout);
         plan.cursor = cursor ?? plan.cursor;
 
+        // Before each new probe, invalidate the locked SoM session and
+        // redetect on the current frame. The VLM should reason on the
+        // freshest perception, not a stale lock from an earlier obs.
+        // (Within an in-flight click sequence the layout still stays
+        // stable -- this only fires when pendingClick is null.)
+        if (plan.pendingClick === null && plan.sessionLayout !== null) {
+          const fresh = detectGuiLayout(payload.obs, plan.layoutHint ?? undefined);
+          if (fresh) {
+            plan.sessionLayout = fresh;
+            plan.layoutHint = fresh.matchedLayoutId;
+            console.log(`[agentbeats] re-detected SoM for fresh probe: ${fresh.matchedLayoutId ?? "unknown"} slots=${fresh.slots.length}`);
+          }
+        }
+        // Re-resolve layout in case we just re-detected.
+        const layoutForProbe = (plan.sessionLayout as ReturnType<typeof detectGuiLayout> | null) ?? layout;
+
         // Before each new probe, park the cursor in a clear left-side
         // spot inside the inventory window. Two reasons:
         //   1. SoM detection runs cleanly when the cursor isn't
@@ -720,8 +736,8 @@ export class McuVisualPolicy {
         // (no click here), just emit cam deltas via servoCursorStep.
         if (plan.pendingClick === null) {
           const parkSpot = {
-            x: layout.windowX + 8,
-            y: Math.round(layout.windowY + layout.windowH / 2),
+            x: layoutForProbe.windowX + 8,
+            y: Math.round(layoutForProbe.windowY + layoutForProbe.windowH / 2),
           };
           const distFromPark = cursor ? Math.hypot(cursor.x - parkSpot.x, cursor.y - parkSpot.y) : Infinity;
           if (distFromPark > 12) {
@@ -750,7 +766,7 @@ export class McuVisualPolicy {
               taskTarget: plan.target,
               ingredient: plan.ingredient,
               iteration: plan.iteration,
-              sessionLayout: layout, // session-locked; same marks all session
+              sessionLayout: layoutForProbe, // freshly redetected for each probe
               recentActions: state.closedLoopHistory,
               cursorHolding,
               pickupSourceSlot: plan.pickupSourceSlot ?? null,
@@ -782,7 +798,7 @@ export class McuVisualPolicy {
               //                before issuing "take" or "pickup".
               const button: "attack" | "use" = probed.action === "place_one" ? "use" : "attack";
               const shift = false;
-              const probedSlot = layout.slots[probed.slot];
+              const probedSlot = layoutForProbe.slots[probed.slot];
               if (!probedSlot) {
                 console.warn(`[agentbeats] probe returned slot ${probed.slot} but layout only has ${layout.slots.length}; skipping`);
               } else if (probed.action === "pickup" && cursorHolding === true) {
@@ -815,7 +831,7 @@ export class McuVisualPolicy {
                     && plan.pickupSourceSlot
                     && plan.pickupSourceSlot.name
                     && cursorHolding !== false) {
-                  const ret = layout.slots.find((s) => s.name === plan.pickupSourceSlot!.name);
+                  const ret = layoutForProbe.slots.find((s) => s.name === plan.pickupSourceSlot!.name);
                   if (ret) {
                     console.log(`[agentbeats] PRE-TAKE AUTO_RETURN: scheduling place_all back to ${ret.name} (raster=${ret.index}) before take`);
                     plan.pendingClick = {
