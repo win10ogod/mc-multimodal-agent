@@ -470,6 +470,12 @@ export type ClosedLoopCraftPlan = {
   /** Slot from which the agent first picked up the ingredient stack. Used
    *  to instruct the VLM to return leftover items here after place_one. */
   pickupSourceSlot: { index: number; name?: string } | null;
+  /** RGB signature of the item currently being carried by the cursor.
+   *  Captured from the prePatch of the most recent successful pickup
+   *  (when the source slot was filled, before the click emptied it).
+   *  Used by the swap guard so place_all onto a slot containing the
+   *  SAME item is allowed (will stack in MC) instead of refused. */
+  cursorItemSignature: { meanR: number; meanG: number; meanB: number } | null;
   /** Queued follow-up clicks that should fire after the current pendingClick
    *  verifies successfully. Used to expand a single high-level VLM action
    *  (move, put) into a sequence of low-level clicks the existing state
@@ -585,6 +591,7 @@ export function planClosedLoopCraft(taskText: string): ClosedLoopCraftPlan | nul
     layoutHint: null,
     sessionLayout: null,
     pickupSourceSlot: null,
+    cursorItemSignature: null,
     pendingChain: [],
     lastCursorRead: null,
     lastEmittedCam: [0, 0],

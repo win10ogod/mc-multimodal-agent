@@ -826,7 +826,35 @@ export class McuVisualPolicy {
               const destPatch = (toSlot && fromSlot && fromSlot.name !== toSlot.name && movingWholeStack)
                 ? samplePatchFingerprint(payload.obs, toSlot.cx, toSlot.cy, 12)
                 : null;
-              const destLooksFilled = !!destPatch && destPatch.stddev > 35;
+              // Same-item stacking allowance: if the destination is
+              // filled BUT its color signature matches what the cursor
+              // is currently carrying (cursorItemSignature recorded at
+              // last pickup), the click will STACK same-item piles in
+              // MC -- not swap. Allow it.
+              const sigDist = (destPatch && plan.cursorItemSignature)
+                ? Math.hypot(
+                    destPatch.meanR - plan.cursorItemSignature.meanR,
+                    destPatch.meanG - plan.cursorItemSignature.meanG,
+                    destPatch.meanB - plan.cursorItemSignature.meanB,
+                  )
+                : null;
+              const destSameItem = sigDist !== null && sigDist < 30;
+              const destLooksFilled = !!destPatch && destPatch.stddev > 35 && !destSameItem;
+              const dbgPre = getDebugRecorder();
+              if (dbgPre.isEnabled() && destPatch && toSlot) {
+                dbgPre.record({
+                  type: "pre_check_move",
+                  iteration: plan.iteration,
+                  step,
+                  data: {
+                    from: { index: probed.from, name: fromSlot?.name },
+                    to: { index: probed.to, name: toSlot.name, cx: toSlot.cx, cy: toSlot.cy },
+                    count: probed.count,
+                    destPatch: { meanR: destPatch.meanR, meanG: destPatch.meanG, meanB: destPatch.meanB, stddev: destPatch.stddev },
+                    decision: destLooksFilled ? "REFUSE_FILLED" : "PROCEED",
+                  },
+                }, payload.obs, "jpg");
+              }
               if (!fromSlot || !toSlot) {
                 console.warn(`[agentbeats] move from=${probed.from} to=${probed.to}: slot(s) not in layout (have ${layoutForProbe.slots.length}); skipping`);
               } else if (destLooksFilled) {
@@ -1184,6 +1212,24 @@ export class McuVisualPolicy {
             if (matched) {
               state.closedLoopHistory.unshift(`${pc.actionKind ?? pc.kind ?? "click"} slot=${pc.rasterIndex}${pc.slotName ? `(${pc.slotName})` : ""} OK`);
               state.closedLoopHistory = state.closedLoopHistory.slice(0, 5);
+              // Record / clear cursorItemSignature based on this click:
+              //   pickup OK  -> cursor now carries the item from the source slot.
+              //                Capture the source's prePatch RGB as the signature.
+              //   place_all OK (kind=click) -> cursor is now empty.
+              //                Clear the signature.
+              //   place_one OK -> cursor still carries (count-1) of same item.
+              //                Keep signature.
+              //   auto_return OK -> cursor empty. Clear.
+              if (pc.actionKind === "pickup" && pc.prePatch) {
+                plan.cursorItemSignature = {
+                  meanR: pc.prePatch.meanR,
+                  meanG: pc.prePatch.meanG,
+                  meanB: pc.prePatch.meanB,
+                };
+                console.log(`[agentbeats] cursorItemSignature set from pickup ${pc.slotName ?? pc.rasterIndex}: rgb=(${pc.prePatch.meanR.toFixed(0)},${pc.prePatch.meanG.toFixed(0)},${pc.prePatch.meanB.toFixed(0)})`);
+              } else if (pc.actionKind === "place_all" || pc.kind === "auto_return") {
+                plan.cursorItemSignature = null;
+              }
               // Advance the chain: if there's a queued follow-up click
               // (e.g. the place_one or auto_return inside a "move" op),
               // promote it into pendingClick. Otherwise return to VLM.
