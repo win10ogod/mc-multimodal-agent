@@ -968,17 +968,14 @@ export class McuVisualPolicy {
             y: layout.windowY + layout.windowH - 8,
           };
 
-          // Lower stuck-cap so click fires sooner when servo can't
-          // converge -- 2-deg cam quantization (~17 px / bin) means
-          // residuals of 4-8 px are physically unavoidable, so waiting
-          // 10 stuck frames just wastes time.
-          const SERVO_STEP_CAP = 3;
+          // Strict thresholds: looser values caused clicks to land 13-17
+          // px off slot center (servo cap firing during overshoot
+          // approach), missing MC's effective hit region. Strict 5 px
+          // threshold + 10-frame stuck cap matches the run that
+          // achieved sim_score=1.0.
+          const SERVO_STEP_CAP = 10;
           const MAX_RETRIES = 4;
-          // Accept clicks within 8 px of slot center: the slot bbox is
-          // 16 px wide, so any cursor inside slot.cx +/- 8 lands inside
-          // the slot. Earlier 5 px threshold caused stuck loops at the
-          // quantization noise floor.
-          const HIT_THRESHOLD_PX = 8;
+          const HIT_THRESHOLD_PX = 5;
 
           // Helper: emit a closed-loop action and remember the cam delta
           // so the next frame's stale-cursor check has ground truth.
