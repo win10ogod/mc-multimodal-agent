@@ -842,9 +842,16 @@ export class McuVisualPolicy {
                 // a transient miss, so retrying would hit the same
                 // result. The agent must clear the cursor and re-issue
                 // verify_slots if it really wants to inspect.
-                const slotPatch = samplePatchFingerprint(payload.obs ?? "", target.x, target.y, 6) ?? undefined;
-                plan.slotMemory.record(target.x, target.y, r.item, plan.iteration, slotPatch);
-                console.log(`[agentbeats] slot_ocr slot=${target.slotIndex}(${target.slotName ?? "?"}) -> ${r.item}${slotPatch ? ` fp=${slotPatch.stddev.toFixed(1)}` : ""}`);
+                // Do NOT capture fingerprint here. Cursor is on the
+                // slot for OCR, which causes MC to draw a white hover
+                // highlight on the item -- the fingerprint we'd
+                // capture is brighter than the slot's natural
+                // appearance and would not match later samples taken
+                // when cursor is parked. Memory gets just the item
+                // name now; the per-probe scan with cursor at park
+                // will lazily populate the natural fingerprint.
+                plan.slotMemory.record(target.x, target.y, r.item, plan.iteration);
+                console.log(`[agentbeats] slot_ocr slot=${target.slotIndex}(${target.slotName ?? "?"}) -> ${r.item}`);
               } catch (e) {
                 console.warn(`[agentbeats] slot OCR failed: ${e instanceof Error ? e.message : String(e)}`);
               }
@@ -990,34 +997,43 @@ export class McuVisualPolicy {
             // hint, freeing the agent from re-hovering identified slots.
             plan.slotMemory.pruneStale(plan.iteration);
             const knownSlots: Array<{ index: number; name?: string; item: string; ageIters: number }> = [];
-            // CV item-disappearance scan: for each slot we know holds
-            // an item from prior OCR, sample its current pixel patch
-            // and compare to the stored fingerprint from OCR-time. A
-            // significant drift (RGB-mean distance) AND a stddev drop
-            // toward empty indicate the item left. Both conditions
-            // required to avoid false positives from minor variation.
+            // CV item tracking from the CURRENT PROBE FRAME (cursor is
+            // parked here, no hover highlight on slot icons). For each
+            // slot in memory:
+            //   1. Sample its current natural fingerprint.
+            //   2. If memory has no fingerprint yet, this is the
+            //      baseline -- store it.
+            //   3. If memory already has a fingerprint, compare. A
+            //      significant drift toward empty (low stddev,
+            //      different mean) means the item left.
             const disappearedItems: string[] = [];
             for (const s of layoutForProbe.slots) {
               const mem = plan.slotMemory.lookup(s.cx, s.cy);
-              if (mem && mem.item !== "empty" && mem.item !== "unknown") {
-                const live = samplePatchFingerprint(payload.obs, s.cx, s.cy, 6);
-                if (live && mem.fingerprint) {
-                  const dr = live.meanR - mem.fingerprint.meanR;
-                  const dg = live.meanG - mem.fingerprint.meanG;
-                  const db = live.meanB - mem.fingerprint.meanB;
-                  const distFromOcr = Math.sqrt(dr * dr + dg * dg + db * db);
-                  const stddevDrop = mem.fingerprint.stddev - live.stddev;
-                  // Drifted far from the OCR-time appearance AND much
-                  // less textured than then -> item really left.
-                  if (distFromOcr > 40 && stddevDrop > 30 && live.stddev < 30) {
-                    disappearedItems.push(mem.item);
-                    plan.slotMemory.invalidate(s.cx, s.cy);
-                    console.log(`[agentbeats] item disappeared: '${mem.item}' was at slot ${s.index}(${s.name ?? "?"}) -- distFromOcr=${distFromOcr.toFixed(1)} stddevDrop=${stddevDrop.toFixed(1)}`);
-                    continue;
-                  }
-                }
+              if (!mem || mem.item === "empty" || mem.item === "unknown") continue;
+              const live = samplePatchFingerprint(payload.obs, s.cx, s.cy, 6);
+              if (!live) {
                 knownSlots.push({ index: s.index, name: s.name, item: mem.item, ageIters: plan.iteration - mem.step });
+                continue;
               }
+              if (!mem.fingerprint) {
+                // Lazy baseline capture from the probe frame (no hover).
+                plan.slotMemory.record(s.cx, s.cy, mem.item, mem.step, live);
+                console.log(`[agentbeats] fp baseline captured for slot ${s.index}(${s.name ?? "?"}) item='${mem.item}' meanRGB=(${live.meanR.toFixed(0)},${live.meanG.toFixed(0)},${live.meanB.toFixed(0)}) stddev=${live.stddev.toFixed(1)}`);
+                knownSlots.push({ index: s.index, name: s.name, item: mem.item, ageIters: plan.iteration - mem.step });
+                continue;
+              }
+              const dr = live.meanR - mem.fingerprint.meanR;
+              const dg = live.meanG - mem.fingerprint.meanG;
+              const db = live.meanB - mem.fingerprint.meanB;
+              const distFromBaseline = Math.sqrt(dr * dr + dg * dg + db * db);
+              const stddevDrop = mem.fingerprint.stddev - live.stddev;
+              if (distFromBaseline > 40 && stddevDrop > 25 && live.stddev < 25) {
+                disappearedItems.push(mem.item);
+                plan.slotMemory.invalidate(s.cx, s.cy);
+                console.log(`[agentbeats] item disappeared: '${mem.item}' was at slot ${s.index}(${s.name ?? "?"}) -- dist=${distFromBaseline.toFixed(1)} stddevDrop=${stddevDrop.toFixed(1)} live.stddev=${live.stddev.toFixed(1)}`);
+                continue;
+              }
+              knownSlots.push({ index: s.index, name: s.name, item: mem.item, ageIters: plan.iteration - mem.step });
             }
             const result = await probeNextCraftAction({
               client: this.client,
