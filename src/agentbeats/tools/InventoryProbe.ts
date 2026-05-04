@@ -107,38 +107,6 @@ export async function probeHotbar(opts: {
 
 // --- Closed-loop GUI actions --------------------------------------------
 
-/** Build a per-frame slot description from the detected GuiLayout, listing
- *  each visible slot's raster index and (when known) its semantic role.
- *  This replaces the previous hard-coded "0..8 = hotbar" mapping which
- *  only worked for one specific GUI numbering scheme. */
-function buildSlotDescription(layout: GuiLayout): string {
-  const lines: string[] = [
-    `${layout.slots.length} slots are marked on the image with yellow numbered badges (raster order).`,
-  ];
-  if (layout.matchedLayoutId) {
-    lines.push(`Detected GUI: ${layout.matchedLayoutId}.`);
-  } else {
-    lines.push(`Detected GUI: unknown — slots numbered in raster order.`);
-  }
-  const byRole = new Map<string, number[]>();
-  const anonymous: number[] = [];
-  for (const s of layout.slots) {
-    if (s.role) {
-      const list = byRole.get(s.role) ?? [];
-      list.push(s.index);
-      byRole.set(s.role, list);
-    } else {
-      anonymous.push(s.index);
-    }
-  }
-  for (const [role, idxs] of byRole) {
-    lines.push(`  role=${role}: indices ${idxs.join(", ")}`);
-  }
-  if (anonymous.length > 0) {
-    lines.push(`  unrecognized slots: indices ${anonymous.join(", ")}`);
-  }
-  return lines.join("\n");
-}
 
 /** Cheap VLM sub-verify: given an obs frame, a target slot pixel, and
  *  the expected post-click state ("should_empty" or "should_fill"),
@@ -330,7 +298,27 @@ export async function probeNextCraftAction(opts: {
     const ing = recipeInfo.ingredients.map((it) => `${it.count}x ${it.name}`).join(" + ");
     const lines = [`RECIPE (from minecraft-data): produces ${recipeInfo.target}. Required ingredients: ${ing}. You MUST place EXACTLY this set into the craft grid -- placing extras of one ingredient and missing another yields nothing.`];
 
-    const craftSlots = detectedLayout.slots.filter((s) => s.role === "craft_2x2" || s.role === "craft_3x3");
+    // Sort the craft-grid slots by their actual pixel positions so the
+    // Row/Col mapping reflects what the agent visually sees, NOT the
+    // raster order of the SoM detector (which can renumber slots
+    // between perceptions and is not guaranteed to scan top-to-bottom
+    // left-to-right). Bin cy values into rows tolerant of small CV
+    // jitter, then sort within each row by cx.
+    const rawCraft = detectedLayout.slots.filter((s) => s.role === "craft_2x2" || s.role === "craft_3x3");
+    const ROW_TOL = 6;
+    const sortedCraft = (() => {
+      if (rawCraft.length === 0) return rawCraft;
+      const sortedY = [...rawCraft].sort((a, b) => a.cy - b.cy);
+      const rowGroups: Array<typeof sortedY> = [];
+      for (const s of sortedY) {
+        const last = rowGroups[rowGroups.length - 1];
+        if (last && Math.abs(last[0].cy - s.cy) <= ROW_TOL) last.push(s);
+        else rowGroups.push([s]);
+      }
+      for (const g of rowGroups) g.sort((a, b) => a.cx - b.cx);
+      return rowGroups.flat();
+    })();
+    const craftSlots = sortedCraft;
     const gridCols = craftSlots.length === 9 ? 3 : (craftSlots.length === 4 ? 2 : 0);
     const gridRows = craftSlots.length === 9 ? 3 : (craftSlots.length === 4 ? 2 : 0);
     if (gridCols > 0) {
@@ -396,9 +384,7 @@ export async function probeNextCraftAction(opts: {
     ...(recipeHint ? ["", recipeHint] : []),
     ...(knownSlotsText ? ["", knownSlotsText] : []),
     "",
-    `The image has YELLOW NUMBERED BADGES drawn at the corner of each slot.`,
-    `Use the visible numbers to choose a slot. Pick the index of the slot you mean.`,
-    buildSlotDescription(detectedLayout),
+    `The image has YELLOW NUMBERED BADGES drawn at the corner of each slot. Read the badge numbers directly from the image to choose a slot index.`,
     "",
     `State:`,
     `  ${cursorState}`,
