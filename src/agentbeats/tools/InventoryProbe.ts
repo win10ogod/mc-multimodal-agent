@@ -207,6 +207,14 @@ export type CraftAction =
   | { action: "move"; from: number; to: number; count?: "one" | "all"; reason?: string }
   | { action: "put"; slot: number; reason?: string }   // dump whole cursor stack into slot
   | { action: "hover"; slot: number; reason?: string } // move cursor over slot, no click; reveals MC tooltip
+  /** Batch tooltip inspection: runtime hovers each listed slot in sequence,
+   *  captures a tooltip frame per slot, then on the NEXT probe call attaches
+   *  every captured tooltip frame as additional images alongside the live
+   *  frame. One extra LLM call total regardless of N — much cheaper than N
+   *  sequential hover iterations. Use ONLY when you genuinely cannot tell
+   *  what is in a slot from the live image (e.g. mid-recipe with multiple
+   *  similar-looking ingredients). */
+  | { action: "verify_slots"; slots: number[]; reason?: string }
   | { action: "done"; reason?: string }
   | { action: "fallback_manual"; reason?: string }
   // Low-level operations kept for backwards compatibility / fine-grained
@@ -242,6 +250,11 @@ export async function probeNextCraftAction(opts: {
   /** Slot the agent originally picked the ingredient up from, so the VLM
    *  can return leftover items to the same place after place_one. */
   pickupSourceSlot?: { index: number; name?: string } | null;
+  /** Captured tooltip frames from a prior verify_slots request. Each entry
+   *  is one slot the runtime hovered + the resulting frame (base64 jpeg).
+   *  Attached as additional images so the VLM can read tooltip text for
+   *  every requested slot in a single call. */
+  tooltipFrames?: Array<{ slot: number; obsBase64: string }>;
 }): Promise<CraftProbeResult> {
   // Set-of-Mark: render the obs frame with numbered badges drawn at every
   // slot's pixel center so the VLM grounds slot indices visually instead of
@@ -317,7 +330,7 @@ export async function probeNextCraftAction(opts: {
     "Respond with strict JSON only (no markdown fences, no commentary):",
     `  {"action": "move", "from": A, "to": B, "count": "one"|"all", "reason": "...", "subTask": "..."} -- ATOMIC. Tool picks the stack from A, places into B (one item if count=one, whole stack if count=all), and automatically returns any remainder to A.`,
     `  {"action": "put",  "slot": N, "reason": "...", "subTask": "..."} -- dump whatever the cursor is currently holding into slot N as a whole stack. Use only when the cursor already holds something.`,
-    `  {"action": "hover","slot": N, "reason": "...", "subTask": "..."} -- move the cursor over slot N WITHOUT clicking. MC will render the item tooltip on the next probe image so you can read what is in that slot. Use when uncertain about a slot's contents.`,
+    `  {"action": "hover","slot": N, "reason": "...", "subTask": "..."} -- move the cursor over slot N WITHOUT clicking. MC will render the item tooltip on the next probe image so you can read what is in that slot. Use when uncertain about a slot's contents (e.g. before placing the second ingredient of a multi-ingredient recipe, hover one ambiguous grid cell at a time).`,
     `  {"action": "fallback_manual", "reason": "..."} -- SoM marks do NOT cover the slot you need; hand control back to the manual LLM controller.`,
     `  {"action": "done", "reason": "...", "subTask": "..."} -- ONLY when (a) any recipe result slot in view is empty AND (b) the requested target is visibly stored in a regular inventory slot. Tool may CV-verify before accepting.`,
     "",
@@ -325,7 +338,7 @@ export async function probeNextCraftAction(opts: {
     "",
     `Rule: when the cursor is carrying an item, "to" must be either (a) a visually empty slot, OR (b) a slot containing the SAME item as what the cursor holds (will stack). Placing onto a slot with a DIFFERENT item triggers a swap. If you must deposit into a slot occupied by a different item: (1) "put" current held item into an empty side slot, (2) next probe: "move" the blocking item to another empty slot, (3) next probe: "move" the parked item to the now-empty target.`,
     "",
-    `Anti-hallucination rule for MULTI-INGREDIENT recipes: do NOT assume an ingredient is in the grid unless YOU placed it there in your "Recent actions". The image alone cannot disambiguate similar-looking blocks (e.g. cobblestone vs nether quartz block). If the RECIPE line below lists multiple ingredients, count what you have actually placed so far from your "Recent actions" history; only then decide whether the next placement should be ingredient A or ingredient B. If unsure, pick up an unplaced ingredient from your hotbar/inventory rather than placing another of what you already moved.`,
+    `Anti-hallucination rule for MULTI-INGREDIENT recipes: do NOT assume an ingredient is already in the grid unless YOU placed it there (count from "Recent actions"). Similar-looking blocks (cobblestone vs nether quartz block, etc.) are NOT distinguishable from the raw image alone. When uncertain about a grid cell, hover it once to read the tooltip on the next probe -- don't guess.`,
     "",
     `This is iteration ${opts.iteration}. Return ONLY the JSON action.`,
   ].join("\n");
@@ -338,10 +351,20 @@ export async function probeNextCraftAction(opts: {
     messages: [
       {
         role: "user",
-        content: [
-          { type: "text", text: promptText },
-          { type: "image_url", image_url: { url: dataUrl, detail: "high" } },
-        ],
+        content: (() => {
+          const parts: Array<Record<string, unknown>> = [
+            { type: "text", text: promptText },
+            { type: "image_url", image_url: { url: dataUrl, detail: "high" } },
+          ];
+          for (const tf of opts.tooltipFrames ?? []) {
+            parts.push({ type: "text", text: `Tooltip capture for slot ${tf.slot} (cursor was hovering over it; read the tooltip text):` });
+            const cleaned = tf.obsBase64.startsWith("data:image/")
+              ? tf.obsBase64
+              : `data:image/jpeg;base64,${tf.obsBase64.replace(/^data:image\/[a-z]+;base64,/, "")}`;
+            parts.push({ type: "image_url", image_url: { url: cleaned, detail: "high" } });
+          }
+          return parts;
+        })(),
       },
     ],
   };
@@ -428,6 +451,25 @@ export async function probeNextCraftAction(opts: {
       return { action: null, layout: detectedLayout };
     }
     return { action: { action: "hover", slot, reason }, layout: detectedLayout };
+  }
+  if (action === "verify_slots") {
+    const rawSlots = (parsed as { slots?: unknown }).slots;
+    if (!Array.isArray(rawSlots) || rawSlots.length === 0) {
+      console.warn(`[agentbeats] probe parse: verify_slots requires a non-empty slots array`);
+      return { action: null, layout: detectedLayout };
+    }
+    const slots: number[] = [];
+    for (const raw of rawSlots) {
+      const n = Number(raw);
+      if (Number.isFinite(n) && n >= 0 && n <= maxSlot) slots.push(n);
+    }
+    if (slots.length === 0) {
+      console.warn(`[agentbeats] probe parse: verify_slots had no valid indices`);
+      return { action: null, layout: detectedLayout };
+    }
+    // Cap to keep token + servo cost bounded.
+    const capped = slots.slice(0, 8);
+    return { action: { action: "verify_slots", slots: capped, reason }, layout: detectedLayout };
   }
   if (!Number.isFinite(slot) || slot < 0 || slot > maxSlot) {
     console.warn(`[agentbeats] probe parse: ${action} slot=${slot} out of range 0..${maxSlot}`);

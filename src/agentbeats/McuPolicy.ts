@@ -1066,6 +1066,29 @@ export class McuVisualPolicy {
                 state.closedLoopHistory = state.closedLoopHistory.slice(0, 5);
                 console.log(`[agentbeats] closed-loop probe iter=${plan.iteration}: hover slot=${probed.slot}(${dest.name ?? "?"}) reason=${probed.reason ?? ""}`);
               }
+            } else if (probed.action === "verify_slots") {
+              // Batch tooltip inspection is parsed but not yet wired through
+              // the runtime. Degrade to hovering the FIRST slot so the agent
+              // still gets one tooltip on the next probe instead of stalling.
+              const firstSlot = probed.slots[0];
+              const dest = layoutForProbe.slots[firstSlot];
+              if (!dest) {
+                console.warn(`[agentbeats] verify_slots first slot=${firstSlot}: not in layout; skipping`);
+              } else {
+                plan.pendingClick = {
+                  rasterIndex: dest.index, slotName: dest.name, slotRole: dest.role,
+                  frozenTarget: { x: dest.cx, y: dest.cy },
+                  button: "attack", shift: false, expectAfter: "should_fill",
+                  phase: "servo", retries: 0, kind: "hover" as "click",
+                  actionKind: "pickup" as "pickup",
+                };
+                plan.pendingChain = [];
+                plan.servoSteps = 0;
+                plan.skipNextPark = true;
+                state.closedLoopHistory.unshift(`verify_slots[0] -> hover ${dest.name ?? firstSlot}`);
+                state.closedLoopHistory = state.closedLoopHistory.slice(0, 5);
+                console.log(`[agentbeats] verify_slots degraded to single hover slot=${firstSlot}; batch capture not yet wired`);
+              }
             } else {
               // Legacy low-level actions: pickup / place_one / place_all / take.
               const button: "attack" | "use" = probed.action === "place_one" ? "use" : "attack";
