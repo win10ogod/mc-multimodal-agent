@@ -286,6 +286,10 @@ export async function probeNextCraftAction(opts: {
   const action = String(parsed.action);
   const slot = typeof parsed.slot === "number" ? parsed.slot : Number(parsed.slot);
   const reason = typeof parsed.reason === "string" ? parsed.reason : undefined;
+  // Slot indices range 0..(layout.slots.length-1). Some inventories
+  // have 41+ slots (player_inventory has 49). Old hardcoded "<=40"
+  // bound was rejecting valid high-index picks.
+  const maxSlot = (detectedLayout?.slots.length ?? 41) - 1;
   if (action === "done") return { action: { action: "done", reason }, layout: detectedLayout };
   if (action === "fallback_manual") return { action: { action: "fallback_manual", reason }, layout: detectedLayout };
   if (action === "move") {
@@ -293,16 +297,26 @@ export async function probeNextCraftAction(opts: {
     const toRaw = parsed.to;
     const from = typeof fromRaw === "number" ? fromRaw : Number(fromRaw);
     const to = typeof toRaw === "number" ? toRaw : Number(toRaw);
-    if (!Number.isFinite(from) || from < 0 || from > 40) return { action: null, layout: detectedLayout };
-    if (!Number.isFinite(to)   || to   < 0 || to   > 40) return { action: null, layout: detectedLayout };
+    if (!Number.isFinite(from) || from < 0 || from > maxSlot) {
+      console.warn(`[agentbeats] probe parse: move from=${from} out of range 0..${maxSlot}`);
+      return { action: null, layout: detectedLayout };
+    }
+    if (!Number.isFinite(to) || to < 0 || to > maxSlot) {
+      console.warn(`[agentbeats] probe parse: move to=${to} out of range 0..${maxSlot}`);
+      return { action: null, layout: detectedLayout };
+    }
     const count: "one" | "all" = parsed.count === "all" ? "all" : "one";
     return { action: { action: "move", from, to, count, reason }, layout: detectedLayout };
   }
   if (action === "put") {
-    if (!Number.isFinite(slot) || slot < 0 || slot > 40) return { action: null, layout: detectedLayout };
+    if (!Number.isFinite(slot) || slot < 0 || slot > maxSlot) {
+      console.warn(`[agentbeats] probe parse: put slot=${slot} out of range 0..${maxSlot}`);
+      return { action: null, layout: detectedLayout };
+    }
     return { action: { action: "put", slot, reason }, layout: detectedLayout };
   }
-  if (!Number.isFinite(slot) || slot < 0 || slot > 40) {
+  if (!Number.isFinite(slot) || slot < 0 || slot > maxSlot) {
+    console.warn(`[agentbeats] probe parse: ${action} slot=${slot} out of range 0..${maxSlot}`);
     return { action: null, layout: detectedLayout };
   }
   if (action === "pickup" || action === "place_one" || action === "place_all" || action === "take") {

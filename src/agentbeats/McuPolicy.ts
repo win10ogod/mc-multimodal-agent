@@ -50,6 +50,11 @@ type McuContextState = {
   /** Short labels of the most recent closed-loop probe actions (newest first),
    *  passed back to the VLM each iteration so it doesn't repeat itself. */
   closedLoopHistory: string[];
+  /** When true, the policy emits no-op actions without calling the
+   *  VLM for the rest of the episode. Set by the closed-loop probe
+   *  saying "done". The benchmark can't be told to early-end, but
+   *  this saves API budget for the remaining steps. */
+  earlyStop: boolean;
 };
 
 const ACTION_PAYLOAD_PREFIX = {
@@ -226,7 +231,7 @@ export function normalizeMcuAction(value: unknown): McuEnvAction {
   return action;
 }
 
-export function parseMcuActionText(text: string): McuPolicyDecision | undefined {
+export function parseMcuActionText(text: string): (McuPolicyDecision & { task_done?: boolean }) | undefined {
   for (const candidate of jsonCandidates(text)) {
     try {
       const parsed = JSON.parse(candidate) as unknown;
@@ -235,10 +240,12 @@ export function parseMcuActionText(text: string): McuPolicyDecision | undefined 
       }
       const actionSource = isRecord(parsed.action) ? parsed.action : parsed;
       const hold = Number.parseInt(String(parsed.hold_steps ?? parsed.holdSteps ?? ""), 10);
+      const taskDone = parsed.task_done === true || parsed.taskDone === true;
       return {
         ...ACTION_PAYLOAD_PREFIX,
         hold_steps: Number.isFinite(hold) ? hold : undefined,
         action: normalizeMcuAction(actionSource),
+        task_done: taskDone,
       };
     } catch {
       // Try the next candidate.
@@ -574,6 +581,7 @@ export class McuVisualPolicy {
       pendingMacroFrames,
       closedLoopCraft,
       closedLoopHistory: [],
+      earlyStop: false,
     });
     console.log(
       `[agentbeats] init context=${contextId} task=${JSON.stringify(taskText)} closedLoop=${closedLoopCraft ? `${closedLoopCraft.target} ingredient=${closedLoopCraft.ingredient}` : "none"}`,
@@ -637,10 +645,21 @@ export class McuVisualPolicy {
       pendingMacroFrames: [],
       closedLoopCraft: null,
       closedLoopHistory: [],
+      earlyStop: false,
     };
     this.contexts.set(contextId, state);
 
     const step = Math.max(0, Number.isFinite(payload.step) ? Number(payload.step) : 0);
+
+    // VLM-driven early stop: when the model previously set task_done=true,
+    // do not call it again for the rest of the episode. Emit a dummy
+    // no-op action each step. The benchmark cannot be early-ended by
+    // the agent, but skipping API calls saves significant cost while
+    // the env burns through its remaining max_steps.
+    if (state.earlyStop) {
+      return { ...ACTION_PAYLOAD_PREFIX, action: defaultMcuAction(), hold_steps: this.config.agentbeats.maxHoldSteps };
+    }
+
     if (payload.obs) {
       state.recentObservationImages.push(payload.obs);
       state.recentObservationImages = state.recentObservationImages.slice(-3);
@@ -1117,6 +1136,11 @@ export class McuVisualPolicy {
     }
 
     let decision = await this.modelDecision(state, step);
+    if ((decision as McuPolicyDecision & { task_done?: boolean }).task_done) {
+      console.log(`[agentbeats] VLM declared task_done=true at step=${step}; entering early-stop noop loop for the rest of the episode`);
+      state.earlyStop = true;
+      return { ...ACTION_PAYLOAD_PREFIX, action: defaultMcuAction(), hold_steps: this.config.agentbeats.maxHoldSteps };
+    }
     decision = repairDecisionForTask(decision, state.taskText, step);
 
     const holdSteps = Math.max(
