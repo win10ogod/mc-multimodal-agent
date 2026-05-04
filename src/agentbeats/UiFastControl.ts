@@ -435,8 +435,10 @@ export type PendingClick = {
 };
 
 export type ClosedLoopCraftPlan = {
-  target: string;
-  ingredient: string;
+  /** Raw task text. Passed straight to the probe so it can reason over
+   *  any UI for any task without us teaching the tool what crafting /
+   *  smelting / chest / villager / etc. mean. */
+  taskText: string;
   cursor: { x: number; y: number };
   iteration: number;
   done: boolean;
@@ -570,24 +572,22 @@ export function servoCursorStep(opts: {
   };
 }
 
-/** Returns null if the task is not a single-ingredient 2x2 craft we handle. */
-export function planClosedLoopCraft(taskText: string): ClosedLoopCraftPlan | null {
-  const target = parseTargetItem(taskText);
-  if (!target) return null;
-  const recipe = lookupRecipe(target);
-  if (!recipe) return null;
-  if (recipe.requiresTable) return null;
-  if (recipe.ingredients.length !== 1) return null;
-  if (recipe.ingredients[0].count !== 1) return null;
+/** Always returns a plan. The closed-loop is gated purely at RUNTIME
+ *  by whether the SoM detector finds a multi-slot inventory layout in
+ *  the current obs frame -- no text-keyword filtering, no recipe-name
+ *  matching. If the agent never opens a UI, the closed-loop block
+ *  noops and the regular VLM handles world actions (mining, fighting,
+ *  exploring, killing the ender dragon, etc.). The moment any GUI
+ *  appears -- crafting grid, furnace, chest, anvil, villager, brewing
+ *  stand, enchanting table, modded container -- the probe + servo +
+ *  click + verify machinery takes over generically. The probe sees
+ *  the raw taskText so it can reason about whatever the goal is. */
+export function planClosedLoopCraft(taskText: string): ClosedLoopCraftPlan {
   return {
-    target: recipe.target,
-    ingredient: recipe.ingredients[0].name,
+    taskText,
     cursor: CURSOR_OPEN_CENTER,
     iteration: 0,
     done: false,
-    // Bumped from 8 -> 16: retry/cleanup/SoM-reset cycles can chew
-    // through several probes per "real" action, and falling back to
-    // manual LLM cursor control runs at ~3% success.
     maxIterations: 16,
     pendingClick: null,
     awaitingVerify: null,
@@ -607,9 +607,9 @@ export function planClosedLoopCraft(taskText: string): ClosedLoopCraftPlan | nul
 
 /** Legacy phase 1 for backwards-compat tests; now equivalent to open+settle. */
 export function buildUiFastControlPhase1(taskText: string): UiFastControlFrame[] | null {
-  const plan = planClosedLoopCraft(taskText);
-  if (!plan) return null;
-  return buildCraftOpenInventoryFrames(plan.target);
+  const target = parseTargetItem(taskText);
+  if (!target) return null;
+  return buildCraftOpenInventoryFrames(target);
 }
 
 /**

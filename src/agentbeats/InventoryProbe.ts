@@ -228,8 +228,10 @@ export async function probeNextCraftAction(opts: {
   client: OpenAI;
   model: string;
   obsBase64: string;
-  taskTarget: string;        // e.g. "oak_planks"
-  ingredient: string;        // e.g. "oak_log"
+  /** Raw task text. Probe is task-agnostic and just reasons over the
+   *  marked image + this string. No more crafting-specific
+   *  taskTarget/ingredient hints -- the VLM extracts those itself. */
+  taskText: string;
   iteration: number;         // for logging / nudging the model
   /** Session-locked layout so marks stay at fixed positions/indices. */
   sessionLayout?: GuiLayout | null;
@@ -278,7 +280,8 @@ export async function probeNextCraftAction(opts: {
     : "No pickup source recorded yet.";
 
   const promptText = [
-    `You are controlling a Minecraft inventory GUI (640x360 image) to craft ${opts.taskTarget} from ${opts.ingredient}.`,
+    `You are operating a Minecraft GUI (640x360 image) to advance the user's task.`,
+    `Task: ${opts.taskText}`,
     "",
     `The image has YELLOW NUMBERED BADGES drawn at the corner of each slot.`,
     `Use the visible numbers to choose a slot. Pick the index of the slot you mean.`,
@@ -291,20 +294,18 @@ export async function probeNextCraftAction(opts: {
     `Recent actions you've already executed (do NOT repeat the same one if state hasn't changed):`,
     historyText,
     "",
-    "Look at the image and decide the SINGLE NEXT action that best advances the task.",
+    "Look at the image and decide the SINGLE NEXT action that best advances the task. The available GUIs include the player inventory's 2x2 craft grid, furnace, brewing stand, chest, anvil, enchanting table, villager trade window, etc. -- the same actions below work in any of them; you just pick the slot indices that match the GUI you see.",
     "",
     "Respond with strict JSON only (no markdown fences, no commentary):",
-    `  {"action": "move", "from": A, "to": B, "count": "one"|"all", "reason": "..."} -- ATOMIC. Tool picks the stack from A, places into B (one item if count=one, whole stack if count=all), and automatically returns any remainder to A. Use this for the main craft step (count=one to drop one log into a craft slot) and for moving the result into your inventory (count=all).`,
-    `  {"action": "put",  "slot": N, "reason": "..."} -- dump whatever the cursor is currently holding into slot N as a whole stack. Use only when the cursor is already holding something and you want to put it down.`,
-    `  {"action": "hover","slot": N, "reason": "..."} -- move the cursor over slot N WITHOUT clicking. MC will then render the item tooltip (item name + count) over that slot, so on the NEXT probe you can read what is actually in it. Use this when the image resolution makes you uncertain what item is in a slot. The cursor is left on the slot for the next probe (no parking).`,
-    `  {"action": "fallback_manual", "reason": "..."} -- SoM marks do NOT cover the slot you need (UI too complex for our detector); hand control back to the manual LLM controller`,
-    `  {"action": "done", "reason": "..."} -- ONLY when (a) the result slot is EMPTY (no item icon visible inside it) AND (b) the requested ${opts.taskTarget} is visibly stored in a role=hotbar or role=main_inv slot. Tool will CV-verify both conditions before accepting. If you say done while the result slot still has the crafted item visible, you will be ignored.`,
+    `  {"action": "move", "from": A, "to": B, "count": "one"|"all", "reason": "...", "subTask": "..."} -- ATOMIC. Tool picks the stack from A, places into B (one item if count=one, whole stack if count=all), and automatically returns any remainder to A.`,
+    `  {"action": "put",  "slot": N, "reason": "...", "subTask": "..."} -- dump whatever the cursor is currently holding into slot N as a whole stack. Use only when the cursor already holds something.`,
+    `  {"action": "hover","slot": N, "reason": "...", "subTask": "..."} -- move the cursor over slot N WITHOUT clicking. MC will render the item tooltip on the next probe image so you can read what is in that slot. Use when uncertain about a slot's contents.`,
+    `  {"action": "fallback_manual", "reason": "..."} -- SoM marks do NOT cover the slot you need; hand control back to the manual LLM controller.`,
+    `  {"action": "done", "reason": "...", "subTask": "..."} -- ONLY when (a) any recipe result slot in view is empty AND (b) the requested target is visibly stored in a regular inventory slot. Tool may CV-verify before accepting.`,
     "",
-    `Rule: when the cursor is carrying an item, "to" must be either (a) a visually empty slot, OR (b) a slot containing the SAME item as what the cursor holds (will stack into one pile). Placing onto a slot with a DIFFERENT item triggers a destructive swap and corrupts state. If you must deposit into a slot occupied by a different item, use this 3-step sequence: (1) "put" current held item into an empty side slot, (2) next probe: "move" the blocking item to another empty slot, (3) next probe: "move" the parked item to the now-empty target.`,
+    `subTask field (optional but recommended for long-horizon tasks): a SHORT label of the current sub-goal you are advancing (e.g. "place_logs_in_grid", "take_planks_to_inv", "open_furnace", "deposit_diamond_in_chest"). This is echoed back to you on the NEXT probe so you can keep track of where you are across many steps. Keep stable across consecutive iterations of the same sub-goal.`,
     "",
-    `Flow for ${opts.taskTarget}:`,
-    `  1. move one ${opts.ingredient} from a hotbar/main_inv slot into a craft slot (count=one).`,
-    `  2. move the result (role=result) into an empty main_inv or hotbar slot (count=all).`,
+    `Rule: when the cursor is carrying an item, "to" must be either (a) a visually empty slot, OR (b) a slot containing the SAME item as what the cursor holds (will stack). Placing onto a slot with a DIFFERENT item triggers a swap. If you must deposit into a slot occupied by a different item: (1) "put" current held item into an empty side slot, (2) next probe: "move" the blocking item to another empty slot, (3) next probe: "move" the parked item to the now-empty target.`,
     "",
     `This is iteration ${opts.iteration}. Return ONLY the JSON action.`,
   ].join("\n");
@@ -331,8 +332,7 @@ export async function probeNextCraftAction(opts: {
       type: "probe_input",
       iteration: opts.iteration,
       data: {
-        taskTarget: opts.taskTarget,
-        ingredient: opts.ingredient,
+        taskText: opts.taskText,
         cursorHolding: opts.cursorHolding,
         pickupSourceSlot: opts.pickupSourceSlot ?? null,
         recentActions: opts.recentActions ?? [],

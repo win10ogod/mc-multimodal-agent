@@ -18,6 +18,7 @@ import {
 } from "./McuPrompt";
 import {
   buildCraftOpenInventoryFrames,
+  parseTargetItem,
   planClosedLoopCraft,
   servoCursorStep,
   type ClosedLoopCraftPlan,
@@ -570,8 +571,19 @@ export class McuVisualPolicy {
     const taskText = payload.text?.trim() || "";
     const promptText = payload.prompt?.trim() || "";
     const closedLoopCraft = planClosedLoopCraft(taskText);
-    const pendingMacroFrames: UiFastControlFrame[] = closedLoopCraft
-      ? buildCraftOpenInventoryFrames(closedLoopCraft.target)
+    // Try to derive a sensible "open inventory" macro target from the
+    // task. Crafting tasks get the recipe target as a hint; non-crafting
+    // tasks (which still benefit from closed-loop UI control once a GUI
+    // opens) just press inventory once and let the regular VLM path
+    // drive any out-of-inventory steps. parseTargetItem returns null
+    // for tasks that don't match the "craft X" pattern.
+    const inventoryHintTarget = (() => {
+      try {
+        return parseTargetItem(taskText) ?? "";
+      } catch { return ""; }
+    })();
+    const pendingMacroFrames: UiFastControlFrame[] = inventoryHintTarget
+      ? buildCraftOpenInventoryFrames(inventoryHintTarget)
       : [];
     this.contexts.set(contextId, {
       taskText,
@@ -586,7 +598,7 @@ export class McuVisualPolicy {
       earlyStop: false,
     });
     console.log(
-      `[agentbeats] init context=${contextId} task=${JSON.stringify(taskText)} closedLoop=${closedLoopCraft ? `${closedLoopCraft.target} ingredient=${closedLoopCraft.ingredient}` : "none"}`,
+      `[agentbeats] init context=${contextId} task=${JSON.stringify(taskText)} closedLoop=${closedLoopCraft ? "enabled" : "disabled"}`,
     );
     return JSON.stringify({
       type: "ack",
@@ -795,8 +807,7 @@ export class McuVisualPolicy {
               client: this.client,
               model: this.config.openai.model,
               obsBase64: payload.obs,
-              taskTarget: plan.target,
-              ingredient: plan.ingredient,
+              taskText: plan.taskText,
               iteration: plan.iteration,
               sessionLayout: layoutForProbe, // freshly redetected for each probe
               recentActions: state.closedLoopHistory,
@@ -1329,7 +1340,7 @@ export class McuVisualPolicy {
                   obsBase64: payload.obs,
                   slot: { cx: slotCenter.cx, cy: slotCenter.cy, name: pc.slotName },
                   expectAfter: pc.expectAfter,
-                  taskTarget: plan.target,
+                  taskTarget: plan.taskText,
                 });
                 if (vlmOk === true) {
                   console.log(`[agentbeats] VLM sub-verify says ${pc.expectAfter} HOLDS for ${pc.slotName ?? pc.rasterIndex} (CV was fooled, post.stddev=${post.stddev.toFixed(1)}); accepting as success`);
