@@ -300,16 +300,13 @@ export async function probeNextCraftAction(opts: {
 
   // Recipe-info hint (read-only, derived from minecraft-data). Helps the VLM
   // disambiguate multi-ingredient placement without surfacing live state.
-  const recipeHint = (() => {
+  const recipeInfo = (() => {
     const tokens = opts.taskText.toLowerCase().match(/[a-z_]+/g) ?? [];
     for (let i = tokens.length - 1; i >= 0; i -= 1) {
       const tok = tokens[i];
       if (tok === "craft" || tok === "make" || tok === "using" || tok === "and" || tok === "with" || tok === "the" || tok === "a") continue;
       const r = lookupRecipe(tok);
-      if (r) {
-        const ing = r.ingredients.map((it) => `${it.count}x ${it.name}`).join(" + ");
-        return `RECIPE (from minecraft-data): produces ${r.target}. Ingredients required: ${ing}. You must place EXACTLY this set into the craft grid; placing extras of one ingredient and missing the other yields nothing.`;
-      }
+      if (r) return r;
     }
     return null;
   })();
@@ -319,9 +316,34 @@ export async function probeNextCraftAction(opts: {
   // raster index space. Surfaced as a text block so the agent doesn't
   // burn iterations re-hovering identified slots.
   const knownSlotsText = (opts.knownSlots && opts.knownSlots.length > 0)
-    ? "Known slot contents (from prior tooltip reads — TRUST these instead of guessing from image):\n" +
+    ? "Known slot contents (from prior tooltip reads -- TRUST these instead of guessing from image):\n" +
       opts.knownSlots.map((k) => `  slot ${k.index}${k.name ? `(${k.name})` : ""} = ${k.item} (read ${k.ageIters} iters ago)`).join("\n")
     : null;
+
+  // Recipe hint: cross-reference required ingredients with the known
+  // slots so we can tell the agent EXACTLY which slot to draw each
+  // ingredient from. Without this, agents repeatedly place the first
+  // identified ingredient into all four cells of the 2x2 grid.
+  const recipeHint = (() => {
+    if (!recipeInfo) return null;
+    const ing = recipeInfo.ingredients.map((it) => `${it.count}x ${it.name}`).join(" + ");
+    const lines = [`RECIPE (from minecraft-data): produces ${recipeInfo.target}. Required ingredients: ${ing}. You MUST place EXACTLY this set into the craft grid -- placing extras of one ingredient and missing another yields nothing.`];
+    // For each ingredient, try to point at the source slot from Known.
+    if (opts.knownSlots && opts.knownSlots.length > 0) {
+      const sourceLines: string[] = [];
+      for (const it of recipeInfo.ingredients) {
+        const found = opts.knownSlots.find((k) => k.item === it.name);
+        if (found) sourceLines.push(`  - ${it.count}x ${it.name}: take from slot ${found.index}${found.name ? `(${found.name})` : ""}`);
+        else sourceLines.push(`  - ${it.count}x ${it.name}: NOT yet identified in Known -- you may need to verify_slots more inventory slots`);
+      }
+      if (sourceLines.length > 0) {
+        lines.push("Source slots for each required ingredient:");
+        lines.push(...sourceLines);
+        lines.push(`Do NOT place ${recipeInfo.ingredients[0]?.name} into all cells. Alternate ingredients per the recipe -- count what you have moved from Recent actions before each placement.`);
+      }
+    }
+    return lines.join("\n");
+  })();
 
   const promptText = [
     `You are operating a Minecraft GUI (640x360 image) to advance the user's task.`,
