@@ -828,8 +828,6 @@ export class McuVisualPolicy {
             if (plan.pendingTooltipRead) {
               const { readTooltip } = await import("./tools/SlotOcr");
               const target = plan.pendingTooltipRead;
-              const OCR_MAX_RETRIES = 3;
-              const tries = target.retries ?? 0;
               try {
                 const r = await readTooltip({
                   client: this.client,
@@ -838,21 +836,15 @@ export class McuVisualPolicy {
                   slotPos: { x: target.x, y: target.y },
                   slotName: target.slotName,
                 });
-                // Retry on LLM "empty" or "unknown" -- the tooltip box
-                // may simply not have rendered yet. CV stddev > 25 at
-                // the slot patch confirms the slot really has an icon,
-                // so an LLM "empty" reply is almost certainly the
-                // tooltip being late. Wait a few more frames and re-OCR.
-                const slotPatch = samplePatchFingerprint(payload.obs ?? "", target.x, target.y, 6);
-                const slotLooksFilled = !!slotPatch && slotPatch.stddev > 25;
-                if ((r.item === "empty" || r.item === "unknown") && slotLooksFilled && tries < OCR_MAX_RETRIES) {
-                  console.log(`[agentbeats] slot_ocr retry ${tries + 1}/${OCR_MAX_RETRIES} slot=${target.slotIndex}(${target.slotName ?? "?"}) -> '${r.item}' but CV says filled (stddev=${slotPatch?.stddev.toFixed(1)})`);
-                  plan.pendingTooltipRead = { ...target, retries: tries + 1 };
-                  // Stay parked; emit a settle frame, next tick will retry.
-                  return { ...ACTION_PAYLOAD_PREFIX, action: defaultMcuAction(), hold_steps: 4 };
-                }
-                plan.slotMemory.record(target.x, target.y, r.item, plan.iteration, slotPatch ?? undefined);
-                console.log(`[agentbeats] slot_ocr slot=${target.slotIndex}(${target.slotName ?? "?"}) -> ${r.item}${slotPatch ? ` fp=${slotPatch.stddev.toFixed(1)}` : ""}${tries > 0 ? ` (after ${tries} retries)` : ""}`);
+                // No retry: MC does not render a slot tooltip while
+                // the cursor is holding an item; an "empty" reply in
+                // that situation is the tooltip being suppressed, not
+                // a transient miss, so retrying would hit the same
+                // result. The agent must clear the cursor and re-issue
+                // verify_slots if it really wants to inspect.
+                const slotPatch = samplePatchFingerprint(payload.obs ?? "", target.x, target.y, 6) ?? undefined;
+                plan.slotMemory.record(target.x, target.y, r.item, plan.iteration, slotPatch);
+                console.log(`[agentbeats] slot_ocr slot=${target.slotIndex}(${target.slotName ?? "?"}) -> ${r.item}${slotPatch ? ` fp=${slotPatch.stddev.toFixed(1)}` : ""}`);
               } catch (e) {
                 console.warn(`[agentbeats] slot OCR failed: ${e instanceof Error ? e.message : String(e)}`);
               }
@@ -1136,6 +1128,16 @@ export class McuVisualPolicy {
                 console.log(`[agentbeats] closed-loop probe iter=${plan.iteration}: put slot=${probed.slot}(${dest.name ?? "?"}) reason=${probed.reason ?? ""}`);
               }
             } else if (probed.action === "verify_slots") {
+              // Guard: MC suppresses slot tooltips while the cursor
+              // holds an item (the held-item label is shown instead),
+              // so OCR would return "empty" for every slot. Refuse the
+              // batch and tell the agent to clear the cursor first.
+              if (cursorHolding === true) {
+                state.closedLoopHistory.unshift(`verify_slots refused: cursor is holding an item; clear cursor first`);
+                state.closedLoopHistory = state.closedLoopHistory.slice(0, 5);
+                console.warn(`[agentbeats] verify_slots refused: cursor is holding an item (CV); tooltips are suppressed`);
+                return { ...ACTION_PAYLOAD_PREFIX, action: defaultMcuAction(), hold_steps: 1 };
+              }
               // verify_slots: hover cursor on each requested slot in
               // sequence, OCR the rendered tooltip, write SlotMemory,
               // then park the cursor before returning to the probe.
