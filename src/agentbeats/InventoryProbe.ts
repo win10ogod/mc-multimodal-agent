@@ -13,6 +13,7 @@
 import type OpenAI from "openai";
 import { markInventoryFrame } from "./SlotMarker";
 import type { GuiLayout } from "./SlotDetector";
+import { getDebugRecorder } from "./DebugRecorder";
 
 // Hotbar slot pixel centers when the inventory GUI is open at 640x360 obs.
 // Mirrors the SLOT.hotbarX0/Dx/Y constants in UiFastControl.
@@ -322,6 +323,24 @@ export async function probeNextCraftAction(opts: {
       },
     ],
   };
+  // Debug: record the marked image + prompt the VLM is about to see.
+  const dbg = getDebugRecorder();
+  if (dbg.isEnabled()) {
+    dbg.record({
+      type: "probe_input",
+      iteration: opts.iteration,
+      data: {
+        taskTarget: opts.taskTarget,
+        ingredient: opts.ingredient,
+        cursorHolding: opts.cursorHolding,
+        pickupSourceSlot: opts.pickupSourceSlot ?? null,
+        recentActions: opts.recentActions ?? [],
+        layoutId: detectedLayout.matchedLayoutId,
+        slots: detectedLayout.slots.map((s) => ({ index: s.index, name: s.name, role: s.role, cx: s.cx, cy: s.cy })),
+        prompt: promptText,
+      },
+    }, imgBase64, imgMime === "image/png" ? "png" : "jpg");
+  }
   type Create = typeof opts.client.chat.completions.create;
   type CreateParams = Parameters<Create>[0];
   const completion = await opts.client.chat.completions.create(body as unknown as CreateParams) as Awaited<ReturnType<Create>> & {
@@ -338,6 +357,13 @@ export async function probeNextCraftAction(opts: {
     if (match) {
       try { parsed = JSON.parse(match[0]); } catch { /* give up */ }
     }
+  }
+  if (dbg.isEnabled()) {
+    dbg.record({
+      type: "probe_output",
+      iteration: opts.iteration,
+      data: { raw, parsed },
+    });
   }
   if (!parsed || typeof parsed.action !== "string") {
     return { action: null, layout: detectedLayout };

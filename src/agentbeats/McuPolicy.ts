@@ -25,6 +25,7 @@ import {
 } from "./UiFastControl";
 import { probeNextCraftAction, vlmVerifySlotState } from "./InventoryProbe";
 import { detectCursorWithExpectation, detectGuiLayout, samplePatchFingerprint } from "./SlotDetector";
+import { getDebugRecorder } from "./DebugRecorder";
 
 type McuInitPayload = {
   type: "init";
@@ -816,8 +817,22 @@ export class McuVisualPolicy {
               // rest queue in plan.pendingChain and promote on verify.
               const fromSlot = layoutForProbe.slots[probed.from];
               const toSlot = layoutForProbe.slots[probed.to];
+              const movingWholeStack = (probed.count ?? "one") === "all";
+              // Refuse swap: when count=all (whole-stack place into to=B)
+              // and B is CV-detected as already filled (stddev > 35),
+              // refuse the move. Placing on a filled slot triggers a
+              // destructive item swap. Skip this guard for from==to
+              // (legit auto-return to a slot we just emptied).
+              const destPatch = (toSlot && fromSlot && fromSlot.name !== toSlot.name && movingWholeStack)
+                ? samplePatchFingerprint(payload.obs, toSlot.cx, toSlot.cy, 12)
+                : null;
+              const destLooksFilled = !!destPatch && destPatch.stddev > 35;
               if (!fromSlot || !toSlot) {
                 console.warn(`[agentbeats] move from=${probed.from} to=${probed.to}: slot(s) not in layout (have ${layoutForProbe.slots.length}); skipping`);
+              } else if (destLooksFilled) {
+                console.warn(`[agentbeats] move to=${probed.to}(${toSlot.name ?? "?"}) refused: destination looks FILLED (stddev=${destPatch!.stddev.toFixed(1)} > 35); place_all here would trigger an item swap. Reprobe`);
+                state.closedLoopHistory.unshift(`refused move to=${probed.to}(${toSlot.name ?? "?"}) (destination already has an item; pick a visually empty slot)`);
+                state.closedLoopHistory = state.closedLoopHistory.slice(0, 5);
               } else if (
                 plan.pickupSourceSlot
                 && plan.pickupSourceSlot.name
@@ -868,6 +883,17 @@ export class McuVisualPolicy {
               }
             } else if (probed.action === "put") {
               const dest = layoutForProbe.slots[probed.slot];
+              // Same swap guard as for move count=all: refuse if dest looks filled.
+              if (dest) {
+                const putPatch = samplePatchFingerprint(payload.obs, dest.cx, dest.cy, 12);
+                if (putPatch && putPatch.stddev > 35) {
+                  console.warn(`[agentbeats] put slot=${probed.slot}(${dest.name ?? "?"}) refused: destination looks FILLED (stddev=${putPatch.stddev.toFixed(1)} > 35); would trigger an item swap. Reprobe`);
+                  state.closedLoopHistory.unshift(`refused put slot=${probed.slot}(${dest.name ?? "?"}) (destination already has an item; pick a visually empty slot)`);
+                  state.closedLoopHistory = state.closedLoopHistory.slice(0, 5);
+                  // Skip building the click; fall through to next obs which reprobes.
+                  return { ...ACTION_PAYLOAD_PREFIX, action: defaultMcuAction(), hold_steps: 1 };
+                }
+              }
               if (!dest) {
                 console.warn(`[agentbeats] put slot=${probed.slot}: not in layout; skipping`);
               } else {
@@ -1138,6 +1164,23 @@ export class McuVisualPolicy {
             console.log(
               `[agentbeats] verify ${pc.slotName ?? pc.rasterIndex}: post.stddev=${post.stddev.toFixed(1)} expect=${pc.expectAfter} -> ${matched ? "OK" : "MISMATCH"} (retry ${pc.retries}/${MAX_RETRIES})`,
             );
+            const dbgPolicy = getDebugRecorder();
+            if (dbgPolicy.isEnabled()) {
+              dbgPolicy.record({
+                type: "verify",
+                step,
+                data: {
+                  slotName: pc.slotName, slotIndex: pc.rasterIndex,
+                  slotCenter: { cx: slotCenter.cx, cy: slotCenter.cy },
+                  expectAfter: pc.expectAfter,
+                  prePatch: pc.prePatch ? { meanR: pc.prePatch.meanR, meanG: pc.prePatch.meanG, meanB: pc.prePatch.meanB, stddev: pc.prePatch.stddev } : null,
+                  postPatch: { meanR: post.meanR, meanG: post.meanG, meanB: post.meanB, stddev: post.stddev },
+                  matched, retries: pc.retries,
+                  cursor: plan.cursor,
+                  actionKind: pc.actionKind, kind: pc.kind,
+                },
+              }, payload.obs, "jpg");
+            }
             if (matched) {
               state.closedLoopHistory.unshift(`${pc.actionKind ?? pc.kind ?? "click"} slot=${pc.rasterIndex}${pc.slotName ? `(${pc.slotName})` : ""} OK`);
               state.closedLoopHistory = state.closedLoopHistory.slice(0, 5);
