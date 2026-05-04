@@ -322,24 +322,55 @@ export async function probeNextCraftAction(opts: {
 
   // Recipe hint: cross-reference required ingredients with the known
   // slots so we can tell the agent EXACTLY which slot to draw each
-  // ingredient from. Without this, agents repeatedly place the first
-  // identified ingredient into all four cells of the 2x2 grid.
+  // ingredient from. When all ingredient sources are identified, also
+  // emit an explicit per-placement plan -- the agent's job becomes
+  // executing one labeled step at a time rather than reasoning about
+  // alternation. This eliminates the "kept placing only cobblestone"
+  // failure mode for multi-ingredient recipes.
   const recipeHint = (() => {
     if (!recipeInfo) return null;
     const ing = recipeInfo.ingredients.map((it) => `${it.count}x ${it.name}`).join(" + ");
     const lines = [`RECIPE (from minecraft-data): produces ${recipeInfo.target}. Required ingredients: ${ing}. You MUST place EXACTLY this set into the craft grid -- placing extras of one ingredient and missing another yields nothing.`];
-    // For each ingredient, try to point at the source slot from Known.
     if (opts.knownSlots && opts.knownSlots.length > 0) {
-      const sourceLines: string[] = [];
+      const sources: Array<{ ingredient: string; count: number; slot: number; name?: string } | { ingredient: string; count: number; slot: null }> = [];
       for (const it of recipeInfo.ingredients) {
         const found = opts.knownSlots.find((k) => k.item === it.name);
-        if (found) sourceLines.push(`  - ${it.count}x ${it.name}: take from slot ${found.index}${found.name ? `(${found.name})` : ""}`);
-        else sourceLines.push(`  - ${it.count}x ${it.name}: NOT yet identified in Known -- you may need to verify_slots more inventory slots`);
+        if (found) sources.push({ ingredient: it.name, count: it.count, slot: found.index, name: found.name });
+        else sources.push({ ingredient: it.name, count: it.count, slot: null });
       }
-      if (sourceLines.length > 0) {
-        lines.push("Source slots for each required ingredient:");
-        lines.push(...sourceLines);
-        lines.push(`Do NOT place ${recipeInfo.ingredients[0]?.name} into all cells. Alternate ingredients per the recipe -- count what you have moved from Recent actions before each placement.`);
+      lines.push("Source slots for each required ingredient:");
+      for (const s of sources) {
+        if (s.slot != null) lines.push(`  - ${s.count}x ${s.ingredient}: take from slot ${s.slot}${s.name ? `(${s.name})` : ""}`);
+        else lines.push(`  - ${s.count}x ${s.ingredient}: NOT yet identified in Known -- emit verify_slots over candidate inventory slots first`);
+      }
+      // If all sources are identified AND we have at least sum(count)
+      // craft-grid slots available, emit an explicit interleaved plan.
+      const allKnown = sources.every((s) => s.slot != null);
+      const craftSlots = detectedLayout.slots.filter((s) => s.role === "craft_2x2" || s.role === "craft_3x3");
+      const totalNeeded = recipeInfo.ingredients.reduce((acc, it) => acc + it.count, 0);
+      if (allKnown && craftSlots.length >= totalNeeded) {
+        // Interleave ingredients: e.g. [cobble, quartz, cobble, quartz].
+        const queues: Array<{ ingredient: string; slot: number; name?: string; remaining: number }> = sources.map((s) => ({
+          ingredient: s.ingredient, slot: (s as { slot: number }).slot, name: (s as { name?: string }).name, remaining: s.count,
+        }));
+        const placements: Array<{ ingredient: string; from: number; fromName?: string; to: number; toName?: string }> = [];
+        let ci = 0;
+        while (queues.some((q) => q.remaining > 0)) {
+          const q = queues[ci % queues.length];
+          if (q.remaining > 0) {
+            const cell = craftSlots[placements.length];
+            placements.push({ ingredient: q.ingredient, from: q.slot, fromName: q.name, to: cell.index, toName: cell.name });
+            q.remaining -= 1;
+          }
+          ci += 1;
+        }
+        lines.push("Suggested placement plan (execute one step per probe iteration; emit move{from,to,count:'one'}):");
+        for (let i = 0; i < placements.length; i += 1) {
+          const p = placements[i];
+          lines.push(`  Step ${i + 1}: move from=${p.from}${p.fromName ? `(${p.fromName})` : ""} to=${p.to}${p.toName ? `(${p.toName})` : ""}  // place ${p.ingredient}`);
+        }
+        lines.push(`After all ${placements.length} placements, take the crafted result from the result slot.`);
+        lines.push(`Use Recent actions to count how many steps you have already executed; do NOT repeat a step that has already verified OK in Recent.`);
       }
     }
     return lines.join("\n");
