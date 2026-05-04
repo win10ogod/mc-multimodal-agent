@@ -869,7 +869,12 @@ export class McuVisualPolicy {
           };
 
           const SERVO_STEP_CAP = 10;
-          const MAX_RETRIES = 2;
+          // More retries help: the dominant failure mode is the click
+          // landing 5-8 px off slot center (servo deadzone) which misses
+          // MC's tighter effective hit region. Each retry re-runs servo
+          // from the safe spot with slightly different stochastic
+          // positioning so eventually one attempt lands.
+          const MAX_RETRIES = 4;
           const HIT_THRESHOLD_PX = 5;
 
           // Helper: emit a closed-loop action and remember the cam delta
@@ -891,7 +896,38 @@ export class McuVisualPolicy {
             plan.servoSteps += 1;
             const shouldClickNow = plan.servoSteps > SERVO_STEP_CAP || (stepResult && stepResult.click);
             if (shouldClickNow) {
+              // Safety: clicking outside the inventory window drops the
+              // held stack to the world ("throw"). Refuse to fire if the
+              // detected cursor is outside the window bbox.
+              const cursorInsideWindow = !!cursor
+                && cursor.x >= layout.windowX
+                && cursor.x <= layout.windowX + layout.windowW
+                && cursor.y >= layout.windowY
+                && cursor.y <= layout.windowY + layout.windowH;
+              if (!cursorInsideWindow) {
+                console.warn(`[agentbeats] click suppressed: cursor (${cursor?.x},${cursor?.y}) outside inventory window [${layout.windowX},${layout.windowY},${layout.windowW}x${layout.windowH}]; aborting to avoid throwing held item`);
+                state.closedLoopHistory.unshift(`abort ${pc.slotName ?? pc.rasterIndex} (cursor outside window; would throw item)`);
+                state.closedLoopHistory = state.closedLoopHistory.slice(0, 5);
+                plan.pendingClick = null;
+                plan.sessionLayout = null;
+                plan.layoutHint = null;
+                return emit(defaultMcuAction());
+              }
               pc.prePatch = samplePatchFingerprint(payload.obs, slotCenter.cx, slotCenter.cy) ?? undefined;
+              // Pre-condition for "should_empty" actions (pickup/take):
+              // source slot MUST currently have an item (pre.stddev
+              // high). If it looks already empty, the click would do
+              // nothing -- abort and reprobe so the VLM picks a slot
+              // that actually has the ingredient.
+              if (pc.expectAfter === "should_empty"
+                  && pc.prePatch
+                  && pc.prePatch.stddev < 25) {
+                console.warn(`[agentbeats] pickup/take aborted: slot=${pc.rasterIndex}(${pc.slotName ?? "?"}) looks already empty (pre.stddev=${pc.prePatch.stddev.toFixed(1)})`);
+                state.closedLoopHistory.unshift(`abort ${pc.kind ?? "click"} slot=${pc.rasterIndex} (source slot empty; nothing to grab)`);
+                state.closedLoopHistory = state.closedLoopHistory.slice(0, 5);
+                plan.pendingClick = null;
+                return emit(defaultMcuAction());
+              }
               const action = defaultMcuAction();
               action[pc.button] = 1;
               if (pc.shift) action.sneak = 1;
