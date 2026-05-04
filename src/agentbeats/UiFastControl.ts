@@ -485,6 +485,9 @@ export type ClosedLoopCraftPlan = {
   lastEmittedCam: [number, number];
   /** How many consecutive frames the cursor reading has looked stale. */
   staleCursorFrames: number;
+  /** How many frames we've spent trying to park the cursor before the
+   *  current probe. Capped to avoid dead-loop when cursor can't move. */
+  parkSteps: number;
 };
 
 /** Servo control law: given current cursor + target slot pixel center,
@@ -575,6 +578,7 @@ export function planClosedLoopCraft(taskText: string): ClosedLoopCraftPlan | nul
     lastCursorRead: null,
     lastEmittedCam: [0, 0],
     staleCursorFrames: 0,
+    parkSteps: 0,
   };
 }
 

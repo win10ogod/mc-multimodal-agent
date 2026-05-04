@@ -708,22 +708,6 @@ export class McuVisualPolicy {
         const cursor = detectCursor(payload.obs, layout);
         plan.cursor = cursor ?? plan.cursor;
 
-        // Before each new probe, invalidate the locked SoM session and
-        // redetect on the current frame. The VLM should reason on the
-        // freshest perception, not a stale lock from an earlier obs.
-        // (Within an in-flight click sequence the layout still stays
-        // stable -- this only fires when pendingClick is null.)
-        if (plan.pendingClick === null && plan.sessionLayout !== null) {
-          const fresh = detectGuiLayout(payload.obs, plan.layoutHint ?? undefined);
-          if (fresh) {
-            plan.sessionLayout = fresh;
-            plan.layoutHint = fresh.matchedLayoutId;
-            console.log(`[agentbeats] re-detected SoM for fresh probe: ${fresh.matchedLayoutId ?? "unknown"} slots=${fresh.slots.length}`);
-          }
-        }
-        // Re-resolve layout in case we just re-detected.
-        const layoutForProbe = (plan.sessionLayout as ReturnType<typeof detectGuiLayout> | null) ?? layout;
-
         // Before each new probe, park the cursor in a clear left-side
         // spot inside the inventory window. Two reasons:
         //   1. SoM detection runs cleanly when the cursor isn't
@@ -735,12 +719,13 @@ export class McuVisualPolicy {
         // THEN issue the probe. Avoid the closed-loop click machinery
         // (no click here), just emit cam deltas via servoCursorStep.
         if (plan.pendingClick === null) {
+          const PARK_STEP_CAP = 8;
           const parkSpot = {
-            x: layoutForProbe.windowX + 8,
-            y: Math.round(layoutForProbe.windowY + layoutForProbe.windowH / 2),
+            x: layout.windowX + 8,
+            y: Math.round(layout.windowY + layout.windowH / 2),
           };
           const distFromPark = cursor ? Math.hypot(cursor.x - parkSpot.x, cursor.y - parkSpot.y) : Infinity;
-          if (distFromPark > 12) {
+          if (distFromPark > 12 && plan.parkSteps < PARK_STEP_CAP) {
             const stepResult = servoCursorStep({
               cursor,
               target: parkSpot,
@@ -748,10 +733,29 @@ export class McuVisualPolicy {
               hitThresholdPx: 5,
             });
             if (stepResult && !stepResult.click) {
-              console.log(`[agentbeats] park: cursor=(${cursor?.x},${cursor?.y}) -> (${parkSpot.x},${parkSpot.y}) ${stepResult.reason}`);
+              plan.parkSteps += 1;
+              console.log(`[agentbeats] park step=${plan.parkSteps}/${PARK_STEP_CAP}: cursor=(${cursor?.x},${cursor?.y}) -> (${parkSpot.x},${parkSpot.y}) ${stepResult.reason}`);
               return { ...ACTION_PAYLOAD_PREFIX, action: stepResult.action, hold_steps: 1 };
             }
             // No cursor or stuck -> proceed to probe anyway.
+          }
+          if (plan.parkSteps >= PARK_STEP_CAP) {
+            console.warn(`[agentbeats] park step cap reached (${plan.parkSteps}); proceeding to probe with cursor at (${cursor?.x},${cursor?.y})`);
+          }
+          plan.parkSteps = 0;
+          // Re-SOM only NOW, just before calling the VLM. Within an
+          // in-flight click sequence the layout stays stable (we keep
+          // using the locked session); fresh detection only matters at
+          // the moment the VLM is about to make a new decision.
+          let layoutForProbe = layout;
+          {
+            const fresh = detectGuiLayout(payload.obs, plan.layoutHint ?? undefined);
+            if (fresh) {
+              plan.sessionLayout = fresh;
+              plan.layoutHint = fresh.matchedLayoutId;
+              layoutForProbe = fresh;
+              console.log(`[agentbeats] re-detected SoM for fresh probe: ${fresh.matchedLayoutId ?? "unknown"} slots=${fresh.slots.length}`);
+            }
           }
           // CV cursor-holding detection is unreliable: the offset patch
           // (cx+8, cy+8) routinely lands on a real inventory slot's
