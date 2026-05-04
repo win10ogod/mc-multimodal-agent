@@ -521,6 +521,13 @@ export type ClosedLoopCraftPlan = {
    *  populated by tooltip OCR after each hover. Surfaced to the probe in
    *  the next prompt so the VLM doesn't re-hover the same slot. */
   slotMemory: SlotMemory;
+  /** Logical "what item is currently on the cursor" tracked by the
+   *  click chain. Set when a pickup-style click verifies OK and the
+   *  source slot's content was in slotMemory; cleared on a successful
+   *  place / put / take / auto_return. Surfaced to the probe so the
+   *  agent doesn't re-inspect slots whose item is implicitly known
+   *  from the most recent pickup. */
+  cursorItem: string | null;
   /** When non-null, an OCR-on-settle is expected for the next obs frame
    *  (cursor was just hovered onto a slot; tooltip should be rendered). */
   pendingTooltipRead: { slotIndex: number; x: number; y: number; slotName?: string } | null;
@@ -640,6 +647,7 @@ export function planClosedLoopCraft(taskText: string): ClosedLoopCraftPlan {
     slotMemory: new SlotMemory(),
     pendingTooltipRead: null,
     pendingOcrBatch: null,
+    cursorItem: null,
   };
 }
 

@@ -960,6 +960,7 @@ export class McuVisualPolicy {
               recentActions: state.closedLoopHistory,
               cursorHolding,
               pickupSourceSlot: plan.pickupSourceSlot ?? null,
+              cursorItem: plan.cursorItem,
               knownSlots,
             });
             plan.iteration += 1;
@@ -1369,7 +1370,17 @@ export class McuVisualPolicy {
               }
               return emit(defaultMcuAction());
             }
-            const shouldClickNow = plan.servoSteps > SERVO_STEP_CAP || (stepResult && stepResult.click);
+            // Require at least one servo step before allowing a click.
+            // Inventory slots are ~18 px apart, and HIT_THRESHOLD_PX is
+            // a few px. If the prior chain step left the cursor already
+            // within hit threshold of the NEW target, servoCursorStep
+            // would return click=true on the very first tick and fire
+            // a click before the cursor was actually re-aimed for the
+            // new slot -- which can land on a neighbor or fail to
+            // register. Forcing a servo step ensures the cursor settles
+            // freshly on the intended slot center.
+            const shouldClickNow = plan.servoSteps > SERVO_STEP_CAP
+              || (stepResult && stepResult.click && plan.servoSteps >= 1);
             if (shouldClickNow) {
               // Safety: clicking outside the inventory window drops the
               // held stack to the world ("throw"). Refuse to fire if the
@@ -1468,7 +1479,18 @@ export class McuVisualPolicy {
             // memory entry (if any) for this absolute pos is now stale.
             // Forget it; the agent will re-discover via hover if needed.
             if (matched && pc.kind !== ("hover" as never)) {
+              const memBefore = plan.slotMemory.lookup(slotCenter.cx, slotCenter.cy);
               plan.slotMemory.invalidate(slotCenter.cx, slotCenter.cy);
+              // Logical cursor-item tracking: a successful pickup loads
+              // the cursor with whatever the slot's last known item was;
+              // a successful place / put / take / auto_return clears it.
+              if (pc.actionKind === "pickup" || pc.actionKind === "take") {
+                plan.cursorItem = memBefore?.item ?? plan.cursorItem;
+                console.log(`[agentbeats] cursorItem set to '${plan.cursorItem}' after pickup of ${pc.slotName ?? pc.rasterIndex}`);
+              } else if (pc.actionKind === "place_one" || pc.actionKind === "place_all") {
+                console.log(`[agentbeats] cursorItem cleared (was '${plan.cursorItem}') after place at ${pc.slotName ?? pc.rasterIndex}`);
+                plan.cursorItem = null;
+              }
             }
             console.log(
               `[agentbeats] verify ${pc.slotName ?? pc.rasterIndex}: post.stddev=${post.stddev.toFixed(1)} expect=${pc.expectAfter} -> ${matched ? "OK" : "MISMATCH"} (retry ${pc.retries}/${MAX_RETRIES})`,

@@ -219,6 +219,10 @@ export async function probeNextCraftAction(opts: {
   /** Slot the agent originally picked the ingredient up from, so the VLM
    *  can return leftover items to the same place after place_one. */
   pickupSourceSlot?: { index: number; name?: string } | null;
+  /** Logical "item currently held on the cursor", tracked by the click
+   *  state machine. When non-null, the agent should treat this as the
+   *  cursor's contents without re-verifying. Cleared after a place. */
+  cursorItem?: string | null;
   /** Captured tooltip frames from a prior verify_slots request. Each entry
    *  is one slot the runtime hovered + the resulting frame (base64 jpeg).
    *  Attached as additional images so the VLM can read tooltip text for
@@ -257,11 +261,13 @@ export async function probeNextCraftAction(opts: {
     ? "(none yet)"
     : historyLines.map((a, i) => `  ${i === 0 ? "most recent" : `${i + 1} ago`}: ${a}`).join("\n");
 
-  const cursorState = opts.cursorHolding === true
-    ? "CURSOR IS CARRYING AN ITEM (CV-detected)."
-    : opts.cursorHolding === false
-      ? "CURSOR IS EMPTY (CV-detected)."
-      : "CURSOR STATE UNKNOWN.";
+  const cursorState = opts.cursorItem
+    ? `CURSOR IS HOLDING: ${opts.cursorItem} (logical, set by last successful pickup; trust this and do not re-verify the item).`
+    : opts.cursorHolding === true
+      ? "CURSOR IS CARRYING AN ITEM (CV-detected; identity unknown -- check Recent actions for the most recent pickup)."
+      : opts.cursorHolding === false
+        ? "CURSOR IS EMPTY (CV-detected)."
+        : "CURSOR STATE UNKNOWN.";
   const sourceLine = opts.pickupSourceSlot
     ? `Original ingredient source slot: index ${opts.pickupSourceSlot.index}${opts.pickupSourceSlot.name ? ` (${opts.pickupSourceSlot.name})` : ""}. The tool already returns leftover ingredient back to this slot automatically -- do NOT use it as a destination for the crafted result; pick a DIFFERENT empty slot (look for a "." mark in the slot listing) for the result.`
     : "No pickup source recorded yet.";
