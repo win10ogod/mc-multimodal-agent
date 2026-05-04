@@ -938,22 +938,58 @@ export class McuVisualPolicy {
               console.log(`[agentbeats] re-detected SoM for fresh probe: ${fresh.matchedLayoutId ?? "unknown"} slots=${fresh.slots.length}`);
             }
           }
-          // CV cursor-holding detection: sample a small patch at the
-          // cursor's actual pixel position. An empty cursor is mostly
-          // the arrow sprite (a few light pixels on background) -> low
-          // stddev. A holding cursor adds a 10x10 item-icon overlay
-          // near the cursor -> high stddev. The previous "(cx+8,cy+8)"
-          // offset version landed on neighbor slots and reported false
-          // positives; sampling AT the cursor avoids that.
+          // CV cursor-holding detection. Sample the held-item region
+          // (renders below-right of the cursor tip in MC), not the
+          // cursor arrow itself, so cursor-sprite pixels aren't part
+          // of the signal. Compare to a baseline captured the first
+          // time we know the cursor is empty (initial park).
+          const PARK_X = layout.windowX + 4;
+          const PARK_Y = layout.windowY + 4;
+          const cursorAtPark = !!cursor && Math.hypot(cursor.x - PARK_X, cursor.y - PARK_Y) < 6;
+          // Held-item icon renders ~+4..+12 px right and down from
+          // cursor tip. Sample a small patch in that offset region.
+          const HELD_OFF_X = 7;
+          const HELD_OFF_Y = 9;
+          const heldSampleX = (cursor?.x ?? PARK_X) + HELD_OFF_X;
+          const heldSampleY = (cursor?.y ?? PARK_Y) + HELD_OFF_Y;
           const cursorHolding: boolean | null = (() => {
-            if (!cursor) return null;
-            const patch = samplePatchFingerprint(payload.obs, cursor.x, cursor.y, 5);
-            if (!patch) return null;
-            // Empty cursor patches measure stddev ~ 10-25; holding
-            // with an item icon measures > 40 in observed runs.
-            if (patch.stddev > 40) return true;
-            if (patch.stddev < 25) return false;
-            return null;  // ambiguous band
+            // Baseline capture at first park (cursor is empty there).
+            if (cursorAtPark && plan.parkEmptyBaseline === null) {
+              const fp = samplePatchFingerprint(payload.obs, PARK_X + HELD_OFF_X, PARK_Y + HELD_OFF_Y, 4);
+              if (fp) {
+                plan.parkEmptyBaseline = fp;
+                console.log(`[agentbeats] park baseline captured (held-region): meanR=${fp.meanR.toFixed(0)} G=${fp.meanG.toFixed(0)} B=${fp.meanB.toFixed(0)} stddev=${fp.stddev.toFixed(1)}`);
+              }
+              return false;
+            }
+            // Baseline-compare path: only valid when cursor is at park
+            // (the held-item region is then at PARK + HELD_OFF, where
+            // the baseline was sampled).
+            if (cursorAtPark && plan.parkEmptyBaseline) {
+              const live = samplePatchFingerprint(payload.obs, PARK_X + HELD_OFF_X, PARK_Y + HELD_OFF_Y, 4);
+              if (live) {
+                const bl = plan.parkEmptyBaseline;
+                const dr = live.meanR - bl.meanR, dg = live.meanG - bl.meanG, db = live.meanB - bl.meanB;
+                const dist = Math.sqrt(dr * dr + dg * dg + db * db);
+                if (dist > 25) {
+                  console.log(`[agentbeats] cursorHolding=true (park-held dist=${dist.toFixed(1)} from baseline)`);
+                  return true;
+                }
+                if (dist < 12) return false;
+              }
+            }
+            // Cursor not at park (mid-chain): sample the held-item
+            // offset region away from the cursor arrow. Strict bounds
+            // because we cannot tell if the offset lands on a slot
+            // icon (false positive risk).
+            if (cursor) {
+              const patch = samplePatchFingerprint(payload.obs, heldSampleX, heldSampleY, 4);
+              if (patch) {
+                if (patch.stddev > 60) return true;
+                if (patch.stddev < 8) return false;
+              }
+            }
+            return null;
           })();
           try {
             // Build slot-memory snapshot keyed to current raster indices so
