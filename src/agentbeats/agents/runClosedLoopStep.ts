@@ -213,6 +213,101 @@ export async function runClosedLoopStep(
       // system identification (px-per-deg, deadzone boundaries,
       // CV-failure rates). No actual clicks are issued — kind=hover
       // exits the click servo before pressing attack/use.
+      // Pickup test mode: AGENTBEATS_PICKUP_TEST=1 scripts a precise
+      // sequence to exercise diff-based cursor-id end-to-end:
+      //   step 0: park (capture parkEmptyCursorPatch baseline)
+      //   step 1: verify_slots [38,39,40] (populate slot patches)
+      //   step 2: pickup from slot 38 (cursor holds cobblestone)
+      //   step 3: park → diff-id should log 'cursor-diff-id: cob'
+      //   step 4: place_one slot 11 (free main_inv)
+      //   step 5: park → diff-id should clear (cursor empty)
+      // Pure CV-test, no LLM cost. Logs reveal whether diff-id
+      // correctly identifies what the cursor holds vs what intent-
+      // tracking thinks.
+      if (process.env.AGENTBEATS_PICKUP_TEST === "1") {
+        type PT = { phase: "park0" | "verify" | "pickup" | "park1" | "place" | "park2" | "done"; tickAfterIdle: number };
+        const pt = (plan as unknown as { pickupTestState?: PT }).pickupTestState
+          ?? (() => {
+            const init: PT = { phase: "park0", tickAfterIdle: 0 };
+            (plan as unknown as { pickupTestState: PT }).pickupTestState = init;
+            console.log(`[pickup-test] init`);
+            return init;
+          })();
+        if (plan.pendingClick === null && plan.pendingChain.length === 0 && !plan.pendingOcrBatch) {
+          pt.tickAfterIdle += 1;
+          // Wait a couple of probe ticks between phases so park
+          // baseline / patch captures settle.
+          if (pt.tickAfterIdle < 2) {
+            return { kind: "act", action: defaultMcuAction(), holdSteps: 1 };
+          }
+          pt.tickAfterIdle = 0;
+          if (pt.phase === "park0") {
+            console.log(`[pickup-test] phase park0 done; parkEmptyCursorPatch=${plan.parkEmptyCursorPatch ? "captured" : "MISSING"}`);
+            pt.phase = "verify";
+          } else if (pt.phase === "verify") {
+            const slots = layout.slots.filter((s) => [38, 39, 40].includes(s.index));
+            if (slots.length > 0) {
+              plan.pendingOcrBatch = {
+                slots: slots.map((s) => ({ slot: s.index, x: s.cx, y: s.cy, name: s.name })),
+                idx: 0, parking: false,
+              };
+              const first = plan.pendingOcrBatch.slots[0];
+              plan.pendingClick = {
+                rasterIndex: first.slot, slotName: first.name, slotRole: undefined,
+                frozenTarget: { x: first.x, y: first.y },
+                button: "attack", shift: false, expectAfter: "should_fill",
+                phase: "servo", retries: 0, kind: "hover" as "click",
+                actionKind: "pickup" as "pickup",
+              };
+              plan.servoSteps = 0;
+              plan.skipNextPark = true;
+              plan.pendingTooltipRead = { slotIndex: first.slot, x: first.x, y: first.y, slotName: first.name };
+              console.log(`[pickup-test] phase verify: hovering slot ${first.slot}(${first.name ?? "?"})`);
+            }
+            pt.phase = "pickup";
+          } else if (pt.phase === "pickup") {
+            const fromSlot = layout.slots[38];
+            if (fromSlot) {
+              plan.pendingClick = {
+                rasterIndex: fromSlot.index, slotName: fromSlot.name, slotRole: fromSlot.role,
+                frozenTarget: { x: fromSlot.cx, y: fromSlot.cy },
+                button: "attack", shift: false, expectAfter: "should_empty",
+                phase: "servo", retries: 0, kind: "click" as "click",
+                actionKind: "pickup" as "pickup",
+              };
+              plan.servoSteps = 0;
+              console.log(`[pickup-test] phase pickup: clicking slot 38 (cob)`);
+            }
+            pt.phase = "park1";
+          } else if (pt.phase === "park1") {
+            console.log(`[pickup-test] phase park1: cursorItemSignature=${plan.cursorItemSignature?.item ?? "(none)"} — waiting at park for diff-id`);
+            pt.phase = "place";
+          } else if (pt.phase === "place") {
+            const dest = layout.slots[11];
+            if (dest) {
+              plan.pendingClick = {
+                rasterIndex: dest.index, slotName: dest.name, slotRole: dest.role,
+                frozenTarget: { x: dest.cx, y: dest.cy },
+                button: "attack", shift: false, expectAfter: "should_fill",
+                phase: "servo", retries: 0, kind: "click" as "click",
+                actionKind: "place_all" as "place_all",
+                placedItemName: plan.cursorItemSignature?.item,
+              };
+              plan.servoSteps = 0;
+              console.log(`[pickup-test] phase place: place_all at slot 11 (cob → main_inv_0)`);
+            }
+            pt.phase = "park2";
+          } else if (pt.phase === "park2") {
+            console.log(`[pickup-test] phase park2 (final): cursorItemSignature=${plan.cursorItemSignature?.item ?? "(none)"} ${plan.cursorItemSignature ? "STILL HOLDING (bug)" : "EMPTY (correct)"}`);
+            pt.phase = "done";
+          } else {
+            console.log(`[pickup-test] all phases complete; ending session`);
+            plan.done = true;
+            state.earlyStop = true;
+            return { kind: "subgoal_done", summary: "pickup-test complete" };
+          }
+        }
+      }
       if (process.env.AGENTBEATS_SERVO_TEST === "1") {
         const servoTest = (plan as unknown as { servoTestState?: { idx: number; targets: number[] } }).servoTestState
           ?? (() => {
