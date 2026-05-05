@@ -651,7 +651,7 @@ export function planClosedLoopCraft(taskText: string): ClosedLoopCraftPlan {
     cursor: CURSOR_OPEN_CENTER,
     iteration: 0,
     done: false,
-    maxIterations: 16,
+    maxIterations: 32,
     pendingClick: null,
     awaitingVerify: null,
     servoSteps: 0,
