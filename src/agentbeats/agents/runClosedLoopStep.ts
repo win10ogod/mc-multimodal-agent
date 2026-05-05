@@ -555,6 +555,32 @@ export async function runClosedLoopStep(
             console.log(`[agentbeats] closed-loop probe returned no action; invalidating SoM session and reprobing next frame`);
             plan.sessionLayout = null;
             plan.layoutHint = null;
+          } else if (probed.action === "click") {
+            // Single button-click on a UI slot (recipe-book toggle, recipe
+            // entry, custom button, etc.). No item transfer, no IBVS pixel
+            // verify — the side effect is observed by the next planner
+            // re-perception. Build a 1-click chain whose verify is force-
+            // matched.
+            const slot = layoutForProbe.slots[probed.slot];
+            if (!slot) {
+              console.warn(`[agentbeats] click: slot index ${probed.slot} out of layout (${layoutForProbe.slots.length} slots)`);
+              state.closedLoopHistory.unshift(`click slot=${probed.slot} REJECTED (out of layout)`);
+              state.closedLoopHistory = state.closedLoopHistory.slice(0, 5);
+            } else {
+              const single: import("../tools/UiFastControl").PendingClick = {
+                rasterIndex: slot.index, slotName: slot.name, slotRole: slot.role,
+                frozenTarget: { x: slot.cx, y: slot.cy },
+                button: "attack", shift: false, expectAfter: "should_fill",
+                phase: "servo", retries: 0, kind: "click", actionKind: "take",
+              };
+              (single as any).uiToggle = true;
+              plan.pendingClick = single;
+              plan.pendingChain = [];
+              plan.servoSteps = 0;
+              state.closedLoopHistory.unshift(`click ${slot.name ?? probed.slot}`);
+              state.closedLoopHistory = state.closedLoopHistory.slice(0, 5);
+              console.log(`[agentbeats] closed-loop probe iter=${plan.iteration}: click slot=${probed.slot}(${slot.name ?? slot.role ?? "?"}) reason=${probed.reason ?? ""}`);
+            }
           } else if (probed.action === "wait") {
             // Async-output GUIs (smelt/brew): hold a noop for N steps
             // so the simulator timers can tick. Capped at maxHoldSteps.
@@ -1204,7 +1230,13 @@ export async function runClosedLoopStep(
           const isFilled = post.stddev > 35
             || !inEmptyBand
             || (pc.expectAfter === "should_fill" && meanShift > 20);
-          const matched = pc.expectAfter === "should_empty" ? isEmpty : isFilled;
+          // UI-toggle clicks (recipe-book button, recipe entries, etc.)
+          // don't change the clicked slot's pixels — the side effect
+          // shows up elsewhere. Force-match to skip IBVS pixel verify.
+          const isUiToggle = (pc as any).uiToggle === true;
+          const matched = isUiToggle
+            ? true
+            : (pc.expectAfter === "should_empty" ? isEmpty : isFilled);
           // A successful click mutated the slot's contents — the slot
           // memory entry (if any) for this absolute pos is now stale.
           // Forget it; the agent will re-discover via hover if needed.

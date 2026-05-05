@@ -33,7 +33,7 @@ const SCHEMA = {
   required: ["action"],
   additionalProperties: true,
   properties: {
-    action: { type: "string", enum: ["move", "put", "verify_slots", "wait", "done", "fallback_manual"] },
+    action: { type: "string", enum: ["move", "put", "click", "verify_slots", "wait", "done", "fallback_manual"] },
   },
 } as const;
 
@@ -44,11 +44,11 @@ Subtask → action mapping:
 - place_in_craft_grid { item }: (1) pick a craft cell (role starts "craft_2x2_" or "craft_3x3_") matching this item's recipe position. (2) Find the source slot for this item in known_slots. If item is NOT in known_slots, emit verify_slots on up to 3 hotbar/main_inv slots that VISUALLY look like the item — do NOT guess source indices. Once known_slots contains the item, emit move from=source to=craftCell count="one".
 - take_result { expectedItem }: from = slot with role==="result"; to = free slot in known_slots; emit move count="all".
 - wait_for_output { expectedItem }: emit wait with holdSteps proportional to expected sim ticks (cap 60).
-- click_ui { slotIndex?, uiName? }: click a slot. Resolution order:
+- click_ui { slotIndex?, uiName? }: emit { "action": "click", "slot": <resolvedIdx> }. Resolution order:
   1. If slotIndex is present, use that exact index (Planner already identified it from the SoM badges in the shared perception).
   2. Else if uiName matches a layout_slots[i].role exactly (e.g. "recipe_book_button"), use that slot.
   3. Else visually match uiName / "<item>_recipe" against panel cells (recipe entries, custom buttons, etc.) and pick the matching slot index.
-  Emit a single-click move with from===to===<resolvedSlotIdx>, count="one". If unresolved, emit fallback_manual with "BLOCKED: button not found".
+  If unresolved, emit fallback_manual with "BLOCKED: ui '<uiName>' not found".
 - verify_state { condition }: if condition holds in frame+known, emit done; else fallback_manual.
 
 Rules:
@@ -58,6 +58,7 @@ Rules:
 
 Output strict JSON, one action only:
   { "action": "move", "from": A, "to": B, "count": "one"|"all" }
+  { "action": "click", "slot": N }
   { "action": "verify_slots", "slots": [N,...] }
   { "action": "wait", "holdSteps": N }
   { "action": "done" }
