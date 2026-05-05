@@ -527,8 +527,17 @@ export type ClosedLoopCraftPlan = {
    *  Captured from the prePatch of the most recent successful pickup
    *  (when the source slot was filled, before the click emptied it).
    *  Used by the swap guard so place_all onto a slot containing the
-   *  SAME item is allowed (will stack in MC) instead of refused. */
-  cursorItemSignature: { meanR: number; meanG: number; meanB: number } | null;
+   *  SAME item is allowed (will stack in MC) instead of refused.
+   *
+   *  `item`: the LIKELY item name on the cursor — derived either
+   *  from the source slot's slotMemory entry at pickup time, or
+   *  inferred at probe time when Pass A sees a tracked slot's item
+   *  vanished but no other slot was just filled with that item. The
+   *  Planner prompt surfaces this so the agent can plan its next
+   *  move based on what's in hand. Rule-based detection of the
+   *  cursor's held-icon pixels alone is unreliable; the
+   *  what-disappeared inference is far more robust. */
+  cursorItemSignature: { meanR: number; meanG: number; meanB: number; item?: string } | null;
   /** Queued follow-up clicks that should fire after the current pendingClick
    *  verifies successfully. Used to expand a single high-level VLM action
    *  (move, put) into a sequence of low-level clicks the existing state

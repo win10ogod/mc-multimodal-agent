@@ -145,7 +145,9 @@ export async function runClosedLoopStep(
           );
           return { index: closest.s?.index ?? 0, name: closest.s?.name, item: e.item };
         });
-      const cursorHoldingItem = cp.cursorItemSignature ? "(unknown item)" : null;
+      const cursorHoldingItem = cp.cursorItemSignature
+        ? (cp.cursorItemSignature.item ? `(holding ${cp.cursorItemSignature.item})` : "(holding something)")
+        : null;
       const { runPlanner } = await import("./subagents/fastUi/Planner");
       const markedObs = markedObsForLLMs ?? payload.obs;
       const rj = await runPlanner({ client: deps.client, model: deps.model, recordDebug: deps.recordDebug }, {
@@ -488,6 +490,22 @@ export async function runClosedLoopStep(
               disappearedItems.push(mem.item);
               if (mem.fingerprint) disappearedFps.push({ item: mem.item, fp: mem.fingerprint });
               plan.slotMemory.invalidate(s.cx, s.cy);
+              // Infer cursor-holding from disappearance: when a slot's
+              // tracked item vanishes and we don't already have a
+              // cursorItemSignature, the item is likely on the cursor
+              // (the agent moved it but the place verify failed to
+              // confirm transfer). Surface the LIKELY item name to
+              // Planner so the next move can target this item directly
+              // ("place from cursor" instead of "find a source slot").
+              if (!plan.cursorItemSignature && mem.fingerprint) {
+                plan.cursorItemSignature = {
+                  meanR: mem.fingerprint.meanR,
+                  meanG: mem.fingerprint.meanG,
+                  meanB: mem.fingerprint.meanB,
+                  item: mem.item,
+                };
+                console.log(`[agentbeats] inferred cursor holding '${mem.item}' from disappearance at slot ${s.index}(${s.name ?? "?"})`);
+              }
               console.log(`[agentbeats] item disappeared: '${mem.item}' was at slot ${s.index}(${s.name ?? "?"}) -- dist=${distFromBaseline.toFixed(1)} liveLum=${liveLum.toFixed(1)} live.stddev=${live.stddev.toFixed(1)}`);
               continue;
             }
@@ -588,7 +606,9 @@ export async function runClosedLoopStep(
             const layoutForAction = layoutForProbe.slots.map((s) => ({
               index: s.index, name: s.name, role: s.role,
             }));
-            const cursorHoldingItem = plan.cursorItemSignature ? "(unknown item)" : null;
+            const cursorHoldingItem = plan.cursorItemSignature
+              ? (plan.cursorItemSignature.item ? `(holding ${plan.cursorItemSignature.item})` : "(holding something)")
+              : null;
             const activeItem = plan.checklist[plan.activeChecklistIdx];
             activeItem.attempts = (activeItem.attempts ?? 0) + 1;
             // Reuse the SoM-labeled image computed once at the top of body.
@@ -718,7 +738,9 @@ export async function runClosedLoopStep(
                     );
                     return { index: closest.s?.index ?? 0, name: closest.s?.name, item: e.item };
                   });
-                const cursorHoldingItem = plan.cursorItemSignature ? "(unknown item)" : null;
+                const cursorHoldingItem = plan.cursorItemSignature
+              ? (plan.cursorItemSignature.item ? `(holding ${plan.cursorItemSignature.item})` : "(holding something)")
+              : null;
                 const { runPlanner } = await import("./subagents/fastUi/Planner");
                 const markedObs = markedObsForLLMs ?? payload.obs ?? "";
                 const r0 = await runPlanner({ client: deps.client, model: deps.model, recordDebug: deps.recordDebug }, {
@@ -1520,12 +1542,18 @@ export async function runClosedLoopStep(
             //   agent knows it's still holding (e.g. accidentally
             //   swapped with neighbor mid-chain).
             if (pc.actionKind === "pickup" && pc.prePatch) {
+              // What item is on the cursor? Look up the source slot
+              // in slotMemory — the item that was THERE before pickup
+              // is now on the cursor. Far more reliable than trying
+              // to identify the held-item icon pixels directly.
+              const sourceMem = plan.slotMemory.lookup(slotCenter.cx, slotCenter.cy);
               plan.cursorItemSignature = {
                 meanR: pc.prePatch.meanR,
                 meanG: pc.prePatch.meanG,
                 meanB: pc.prePatch.meanB,
+                item: sourceMem?.item && sourceMem.item !== "empty" && sourceMem.item !== "unknown" ? sourceMem.item : undefined,
               };
-              console.log(`[agentbeats] cursorItemSignature set from pickup ${pc.slotName ?? pc.rasterIndex}: rgb=(${pc.prePatch.meanR.toFixed(0)},${pc.prePatch.meanG.toFixed(0)},${pc.prePatch.meanB.toFixed(0)})`);
+              console.log(`[agentbeats] cursorItemSignature set from pickup ${pc.slotName ?? pc.rasterIndex}: item=${plan.cursorItemSignature.item ?? "?"} rgb=(${pc.prePatch.meanR.toFixed(0)},${pc.prePatch.meanG.toFixed(0)},${pc.prePatch.meanB.toFixed(0)})`);
             } else if (pc.actionKind === "place_all" || pc.kind === "auto_return") {
               // CV-verify the placement before clearing cursor signature.
               const dstFp = samplePatchFingerprint(payload.obs, slotCenter.cx, slotCenter.cy, 6);
