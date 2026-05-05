@@ -102,17 +102,14 @@ export async function runClosedLoopStep(
     const cp = state.closedLoopCraft;
     cp.judgeAfterChain = false;
     try {
-      const knownForPlanner = cp.slotMemory.snapshot().map((e) => ({ index: 0, item: e.item }));
-      const sessionLayoutTyped = cp.sessionLayout as ReturnType<typeof detectGuiLayout> | null;
-      const layoutForPlanner = (sessionLayoutTyped?.slots ?? []).map((s) => ({
-        index: s.index, name: s.name, role: s.role,
-      }));
+      const knownItemsForPlanner = Array.from(new Set(cp.slotMemory.snapshot().map((e) => e.item).filter(i => i && i !== "empty")));
+      const cursorHoldingItem = cp.cursorItemSignature ? "(unknown item)" : null;
       const { runPlanner } = await import("./subagents/fastUi/Planner");
       const rj = await runPlanner({ client: deps.client, model: deps.model }, {
         taskText: state.taskText,
         recipeInfo: cp.recipeOverride,
-        knownSlots: knownForPlanner,
-        layoutSlots: layoutForPlanner,
+        knownItems: knownItemsForPlanner,
+        cursorHolding: cursorHoldingItem,
         currentChecklist: cp.checklist,
         trigger: "post_action",
         recentHistory: state.closedLoopHistory.slice(0, 3),
@@ -477,16 +474,30 @@ export async function runClosedLoopStep(
           let probed: import("../tools/InventoryProbe").CraftAction | null;
           if (useActionAgent) {
             const { runAction } = await import("./subagents/fastUi/Action");
-            const knownForAction = plan.slotMemory.snapshot().map((e) => ({ index: 0, item: e.item }));
+            // Cross-ref slotMemory entries (keyed by pixel pos) with the
+            // current layout to surface concrete slot indices to Action.
+            const knownForAction = plan.slotMemory.snapshot().map((e) => {
+              const closest = layoutForProbe.slots.reduce<{ s: typeof layoutForProbe.slots[number] | null; d: number }>(
+                (acc, s) => {
+                  const d = Math.hypot(s.cx - e.x, s.cy - e.y);
+                  return d < acc.d ? { s, d } : acc;
+                },
+                { s: null, d: Number.POSITIVE_INFINITY },
+              );
+              return { index: closest.s?.index ?? 0, name: closest.s?.name, item: e.item };
+            });
             const layoutForAction = layoutForProbe.slots.map((s) => ({
               index: s.index, name: s.name, role: s.role,
             }));
+            const cursorHoldingItem = plan.cursorItemSignature ? "(unknown item)" : null;
             const activeItem = plan.checklist[plan.activeChecklistIdx];
             activeItem.attempts = (activeItem.attempts ?? 0) + 1;
             probed = await runAction({ client: deps.client, model: deps.model }, {
               subtask: activeItem.task,
               knownSlots: knownForAction,
               layoutSlots: layoutForAction,
+              recipeInfo: plan.recipeOverride,
+              cursorHolding: cursorHoldingItem,
               obsBase64: payload.obs ?? "",
             });
           } else {
@@ -589,16 +600,14 @@ export async function runClosedLoopStep(
               state.closedLoopHistory = state.closedLoopHistory.slice(0, 5);
               console.log(`[agentbeats] recipe_lookup '${probed.item}' resolved: ingredients=${ingStr} inShape=${r.inShape ? "yes" : "no"}`);
               try {
-                const knownForPlanner = plan.slotMemory.snapshot().map((e) => ({ index: 0, item: e.item }));
-                const layoutForPlanner = (layoutForProbe.slots).map((s) => ({
-                  index: s.index, name: s.name, role: s.role,
-                }));
+                const knownItemsForPlanner = Array.from(new Set(plan.slotMemory.snapshot().map((e) => e.item).filter(i => i && i !== "empty")));
+                const cursorHoldingItem = plan.cursorItemSignature ? "(unknown item)" : null;
                 const { runPlanner } = await import("./subagents/fastUi/Planner");
                 const r0 = await runPlanner({ client: deps.client, model: deps.model }, {
                   taskText: state.taskText,
                   recipeInfo: r,
-                  knownSlots: knownForPlanner,
-                  layoutSlots: layoutForPlanner,
+                  knownItems: knownItemsForPlanner,
+                  cursorHolding: cursorHoldingItem,
                   currentChecklist: [],
                   trigger: "first",
                   recentHistory: state.closedLoopHistory.slice(0, 3),

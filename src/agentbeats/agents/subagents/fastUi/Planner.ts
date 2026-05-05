@@ -13,13 +13,11 @@ export type PlannerInput = {
    *  for non-craft GUIs (smelting, chest, etc) where the planner
    *  decomposes from task text + frame alone. */
   recipeInfo: RecipeInfo | null;
-  /** OCR-confirmed slot contents at this moment. */
-  knownSlots: Array<{ index: number; name?: string; item: string }>;
-  /** GUI slot-index → role mapping for the currently open window. The
-   *  Planner uses this to set destSlotIndex correctly (e.g. slot 2 =
-   *  craft_2x2_0, slot 0 = armor_helmet). Without this the Planner
-   *  hallucinates dest indices. */
-  layoutSlots: Array<{ index: number; name?: string; role?: string }>;
+  /** Items the planner knows are in inventory (item names only — no
+   *  slot indices). Action does the slot resolution. */
+  knownItems: string[];
+  /** What the cursor is currently carrying, if anything. */
+  cursorHolding: string | null;
   /** Empty on first invocation; otherwise the in-flight list. */
   currentChecklist: ChecklistItem[];
   /** "first" / "post_action" — drives prompt phrasing. */
@@ -55,53 +53,23 @@ const SCHEMA = {
   },
 } as const;
 
-const SYS = `You are the Planner inside a Minecraft GUI control subagent. The subagent operates ANY GUI window — crafting (2x2 or 3x3), smelting, brewing, chest, anvil, enchanting, villager trade. You decompose the current task into an ordered checklist of generic Subtask primitives, then update which steps are done after each observation.
+const SYS = `You plan a checklist of symbolic subtasks for a Minecraft GUI subagent (any GUI: crafting, smelting, brewing, chest, anvil, etc.) and update progress after each Action report.
 
-Subtask kinds (GUI-agnostic primitives):
-- verify_slots: { slots: int[] } — OCR-confirm specific slot indices when Known is too sparse to identify ingredients.
-- move_one: { sourceItem, destSlotIndex } — move ONE unit of sourceItem to a specific slot. Used to place ingredients/inputs.
-- move_all: { sourceSlotIndex, destSlotIndex } — move FULL stack from source to dest. Used to take outputs/results, bulk transfers.
-- wait_for_output: { expectedItem } — wait until an item appears (smelting/brewing async outputs).
-- click_button: { buttonName } — click a labelled UI button (anvil, enchant, trade selection).
-- verify_state: { condition } — confirm-only step (no action), tick done when condition is observed.
+Subtask kinds (no numbers, no slot indices):
+- verify_items_visible { items }
+- place_in_craft_grid { item }
+- take_result { expectedItem }
+- wait_for_output { expectedItem }
+- click_button { buttonName }
+- verify_state { condition }
 
-On the FIRST call (currentChecklist is empty):
-- For crafting tasks (recipeInfo present): decompose into a SHORT list. Use layout_slots to find slot indices by role:
-    * craft cells: role starts with "craft_2x2_" or "craft_3x3_" — these are valid placement destinations.
-    * result slot: role === "result" — the source for taking outputs.
-    * hotbar/main_inv: role starts with "hotbar_" or "main_inv_" — valid sources/destinations for stored items.
-    * armor/offhand: role like "armor_helmet"/"armor_chestplate"/"armor_boots"/"offhand" — NEVER use these as destSlotIndex.
-  Decomposition: skip verify_slots if Known already covers the ingredient items → one move_one per ingredient unit (destSlotIndex = a craft cell) → one move_all (sourceSlotIndex = result slot, destSlotIndex = a free hotbar/main_inv slot) → final verify_state ("target item visible in regular inventory").
-- For other GUIs: decompose appropriately based on task text + frame + layout_slots.
+On the FIRST call: emit the shortest plan. For crafting, that's typically (skip verify if known_items already shows ingredients) → one place_in_craft_grid per ingredient unit → one take_result.
 
-PERCEPTION DISCIPLINE — minimum viable inspection (the benchmark PENALIZES every off-task action):
-The principle: inspect AS LITTLE AS POSSIBLE, AS TASK-RELATIVE AS POSSIBLE. Whether a slot is "relevant" depends entirely on the current task: armor slots are relevant for an equip task, offhand is relevant for a shield task, craft cells are relevant for crafting, etc. YOU pick what's relevant.
-Rules:
-- Do NOT add verify_slots if knownSlots already covers what you need.
-- When verify_slots IS needed, target the SMALLEST possible set (1-3 slots) that you have visual reason to suspect contain the relevant item. Exclude slots already in knownSlots.
-- Skip pre-verification of slots you intend to click anyway (the click's IBVS verify is the perception).
-- The SHORTEST plan that yields the target wins. Extra exploratory steps cost score even if they eventually succeed.
-
-On SUBSEQUENT calls (post_action):
-- KEEP the existing checklist items (preserve ids and ordering).
-- Update the .done field of each item by observing the frame and Known:
-  * move_one is done when Known shows the destSlotIndex contains the sourceItem.
-  * move_all is done when Known shows the destSlotIndex has the expected output OR is empty + dest now has the item.
-  * wait_for_output is done when expectedItem appears anywhere.
-  * verify_state is done when the condition holds.
-- all_done is true only when EVERY item is done AND the task's success state is visible (e.g. recipe target in regular inventory).
-
-CRITICAL — Planner owns retry decisions:
-The Action agent fires once per dispatch. After it runs, IBVS verifies the click outcome (matched / mismatched) and hands control back to you with the result reflected in recent_history (e.g. "place_one slot=2 OK", "pickup slot=46 FAILED post.stddev=..."). YOU then read the current frame + Known + recent_history and decide:
-  (a) success → tick done=true on the item.
-  (b) IBVS mismatched but observation suggests partial progress → keep same activeIdx for ONE retry. The runtime will re-dispatch Action.
-  (c) clearly not making progress → replace the subtask with a different approach OR insert a prerequisite OR mark done=true and rely on downstream recovery.
-HARD CAP: if checklist item's attempts >= 3, you MUST take path (a) or (c). Returning the same activeIdx with attempts >= 3 unchanged is forbidden — it would deadlock the loop.
-Action NEVER decides whether to retry. Only YOU do.
+On post_action calls: tick done where observation supports it; preserve item ids and order. After each Action you'll see what just happened in recent_history — use it plus the frame to judge progress. You decide retries: keep activeIdx for one more attempt only if observation shows partial progress, otherwise advance / replace / mark done. Never return same activeIdx with attempts >= 3 unchanged.
 
 Output strict JSON:
-  { "all_done": bool, "next_idx": int (-1 if all_done; otherwise index of first still-undone item), "checklist": [...] }
-Each checklist item: { id, text, task, done, attempts }. PRESERVE attempts as the runtime sets it; do not reset to 0 unless you are inserting a fresh subtask.`;
+  { "all_done": bool, "next_idx": int (-1 if all_done), "checklist": [...] }
+Each item: { id, text, task, done, attempts }. PRESERVE attempts.`;
 
 export async function runPlanner(deps: PlannerDeps, input: PlannerInput): Promise<PlanResult> {
   const userPayload = {
@@ -113,8 +81,8 @@ export async function runPlanner(deps: PlannerDeps, input: PlannerInput): Promis
           inShape: input.recipeInfo.inShape,
         }
       : null,
-    known_slots: input.knownSlots,
-    layout_slots: input.layoutSlots,
+    known_items: input.knownItems,
+    cursor_holding: input.cursorHolding,
     current_checklist: input.currentChecklist,
     trigger: input.trigger,
     recent_history: input.recentHistory,

@@ -1,6 +1,7 @@
 import type OpenAI from "openai";
 import type { Subtask } from "./types";
 import type { CraftAction } from "../../../tools/InventoryProbe";
+import type { RecipeInfo } from "../../../tools/UiFastControl";
 
 export type ActionDeps = {
   client: OpenAI;
@@ -8,13 +9,21 @@ export type ActionDeps = {
 };
 
 export type ActionInput = {
+  /** ONE symbolic subtask the Planner just dispatched. Action
+   *  resolves it to concrete slot indices using the live layout. */
   subtask: Subtask;
+  /** OCR-confirmed slot contents at this moment (slot index + item name). */
   knownSlots: Array<{ index: number; name?: string; item: string }>;
-  /** GUI slot-index → role mapping for the currently open window.
-   *  Same data the Planner sees, so Action can translate symbolic
-   *  references (e.g. "craft_2x2_0") to concrete slot indices and
-   *  knows which slots are off-limits for the current task. */
+  /** GUI slot-index → role mapping for the open window. Action uses
+   *  this to find craft cells by role, identify the result slot,
+   *  pick free hotbar/main_inv slots, and reject non-task-relevant
+   *  slots as destinations. */
   layoutSlots: Array<{ index: number; name?: string; role?: string }>;
+  /** Active recipe (when in a crafting subtask). Provides target +
+   *  ingredients + inShape so Action can pick the right craft cell. */
+  recipeInfo: RecipeInfo | null;
+  /** Item the cursor currently holds, if any. */
+  cursorHolding: string | null;
   obsBase64: string;
 };
 
@@ -23,33 +32,30 @@ const SCHEMA = {
   required: ["action"],
   additionalProperties: true,
   properties: {
-    action: { type: "string", enum: ["move", "put", "verify_slots", "done", "fallback_manual"] },
+    action: { type: "string", enum: ["move", "put", "verify_slots", "wait", "done", "fallback_manual"] },
   },
 } as const;
 
-const SYS = `You are the Action agent inside a Minecraft GUI control subagent.
-You receive ONE concrete subtask + Known slot contents + the current frame, and emit ONE atomic action toward that subtask. 
-You do NOT track overall progress, recipes, or completion — those are decided by the Planner.
+const SYS = `You execute ONE symbolic subtask in a Minecraft GUI. You receive the subtask plus layout_slots (slot index + role), known_slots (OCR'd contents), recipe (if any), cursor_holding, and the frame with YELLOW NUMBERED BADGES on every slot.
 
-Subtask kinds you may receive:
-- verify_slots { slots }: emit { "action": "verify_slots", "slots": [...], "reason": "..." } to OCR-confirm those slots' contents (cap N <= 4).
-- move_one { sourceItem, destSlotIndex }: find sourceItem in Known slot contents (handle naming variants like quartz<->nether_quartz). Emit move { from: <sourceSlotIdx>, to: destSlotIndex, count: "one" }. If sourceItem isn't in Known, emit verify_slots on AT MOST 1-3 candidates that VISUALLY resemble sourceItem; exclude slots already in Known. Off-task perception is penalized.
-- move_all { sourceSlotIndex, destSlotIndex }: emit move { from: sourceSlotIndex, to: destSlotIndex, count: "all" }.
-- wait_for_output { expectedItem }: ASYNC-OUTPUT GUIs (furnace smelting, brewing stand) need simulator time to tick before the output slot fills. Emit { "action": "wait", "holdSteps": N, "reason": "..." } where N is the noop hold to apply this turn (smelting ~200 ticks/item, brewing ~400; cap N at 60 per call). The next probe re-evaluates and emits verify_slots once expected output should be present.
-- click_button { buttonName }: not yet supported — emit fallback_manual.
-- verify_state { condition }: emit done.
+Subtask → action mapping:
+- verify_items_visible { items }: emit verify_slots with up to 3 candidate slot indices that visually resemble the items.
+- place_in_craft_grid { item }: pick a craft cell (role starts "craft_2x2_" or "craft_3x3_") that matches this item's recipe position; resolve item's source slot from known_slots; emit move from=source to=craftCell count="one".
+- take_result { expectedItem }: from = slot with role==="result"; to = free slot in known_slots; emit move count="all".
+- wait_for_output { expectedItem }: emit wait with holdSteps proportional to expected sim ticks (cap 60).
+- click_button: emit fallback_manual (not supported).
+- verify_state { condition }: if condition holds in frame+known, emit done; else fallback_manual.
 
-CRITICAL: choose dest slots that are NOT in Known (occupied) when placing/taking, OR slots whose Known content matches what cursor will hold (will stack). Never overwrite a different item.
-
-The layout_slots payload tells you each slot's role (craft_2x2_0, armor_helmet, hotbar_3, result, etc.) — use it to validate dest indices match the expected role for the subtask. NEVER use a slot whose role is unrelated to the current task as a destination.
-
-Image has YELLOW NUMBERED BADGES at slot corners — read them directly to choose slot indices, then cross-check against layout_slots.
+Rules:
+- Slot index = the YELLOW BADGE you read off the frame, validated against layout_slots.role for the expected role.
+- Never overwrite a different item in dest.
+- If anything is ambiguous, emit fallback_manual with reason.
 
 Output strict JSON, one action only:
-  { "action": "move", "from": A, "to": B, "count": "one"|"all", "reason": "..." }
-  { "action": "verify_slots", "slots": [N1, ...], "reason": "..." }
-  { "action": "wait", "holdSteps": N, "reason": "..." }
-  { "action": "done", "reason": "..." }
+  { "action": "move", "from": A, "to": B, "count": "one"|"all" }
+  { "action": "verify_slots", "slots": [N,...] }
+  { "action": "wait", "holdSteps": N }
+  { "action": "done" }
   { "action": "fallback_manual", "reason": "..." }`;
 
 export async function runAction(deps: ActionDeps, input: ActionInput): Promise<CraftAction> {
@@ -57,6 +63,14 @@ export async function runAction(deps: ActionDeps, input: ActionInput): Promise<C
     subtask: input.subtask,
     known_slots: input.knownSlots,
     layout_slots: input.layoutSlots,
+    recipe: input.recipeInfo
+      ? {
+          target: input.recipeInfo.target,
+          ingredients: input.recipeInfo.ingredients,
+          inShape: input.recipeInfo.inShape,
+        }
+      : null,
+    cursor_holding: input.cursorHolding,
   };
   const dataUrl = input.obsBase64.startsWith("data:image/")
     ? input.obsBase64
@@ -91,6 +105,6 @@ export async function runAction(deps: ActionDeps, input: ActionInput): Promise<C
     console.warn(`[fastui-action] failed to parse JSON: ${text.slice(0, 200)}`);
     return { action: "fallback_manual", reason: "action LLM returned unparseable JSON" } as CraftAction;
   }
-  console.log(`[fastui-action] subtask=${input.subtask.kind} -> ${parsed.action}${parsed.from !== undefined ? ` from=${parsed.from}` : ""}${parsed.to !== undefined ? ` to=${parsed.to}` : ""}`);
+  console.log(`[fastui-action] subtask=${input.subtask.kind} -> ${parsed.action}${parsed.from!==undefined?` from=${parsed.from}`:""}${parsed.to!==undefined?` to=${parsed.to}`:""}`);
   return parsed as CraftAction;
 }

@@ -1,46 +1,46 @@
-/** Generic Fast-UI subtask. The Planner (one per GUI kind: crafting,
- *  smelting, brewing, chest, anvil, ...) decomposes the current task
- *  into an ordered list of these. The Action agent receives ONE at a
- *  time and emits a concrete click chain. The runtime resolves the
- *  abstract slot/item references via SlotMemory. */
+/** SYMBOLIC Fast-UI subtask. Strictly NUMBER-FREE — no slot indices,
+ *  no row/col coordinates, no count fields. The Planner speaks only
+ *  in semantic terms; the Action agent + runtime own all numeric
+ *  resolution (which slot, which cell, how many) by combining the
+ *  symbolic intent with the live layout, recipe, and Known state.
+ *
+ *  This isolation prevents "number pollution" — once the Planner
+ *  emits a number, the Action agent tends to follow it blindly even
+ *  when it points to the wrong slot in the current layout. */
 export type Subtask =
-  /** OCR-confirm specific slots before any move. Use when Known is
-   *  too sparse to identify which slot holds which item. */
-  | { kind: "verify_slots"; slots: number[] }
-  /** Move ONE unit of `sourceItem` (resolved via SlotMemory) to a
-   *  specific destination slot. Used for placing ingredients into a
-   *  craft grid, fuel into a furnace, item into a chest, etc. */
-  | { kind: "move_one"; sourceItem: string; destSlotIndex: number }
-  /** Move the FULL stack at `sourceSlotIndex` to `destSlotIndex`.
-   *  Used for taking outputs (craft result, smelt result), bulk
-   *  deposits, etc. */
-  | { kind: "move_all"; sourceSlotIndex: number; destSlotIndex: number }
-  /** Wait until a specific item appears in any non-input slot.
-   *  Used for smelting (output appears after fuel burns) and any
-   *  asynchronous-output GUI. */
+  /** Confirm by OCR that named items exist in inventory. Action
+   *  picks candidate slots itself. Skip when caller already trusts
+   *  Known. */
+  | { kind: "verify_items_visible"; items: string[] }
+  /** Place one unit of `item` into the recipe's craft grid. Action
+   *  computes which craft cell to use by looking at recipe.inShape
+   *  (for shaped) or row-major order (for shapeless) combined with
+   *  what's already been placed. */
+  | { kind: "place_in_craft_grid"; item: string }
+  /** Take the crafted result from the recipe result slot to a free
+   *  regular inventory slot. Action finds role==="result" and a free
+   *  hotbar/main_inv slot itself. */
+  | { kind: "take_result"; expectedItem: string }
+  /** Wait for async output (smelting/brewing) to appear. */
   | { kind: "wait_for_output"; expectedItem: string }
-  /** Click a labelled UI button (anvil "rename", enchant "level 1",
-   *  villager trade slot, etc). */
+  /** Click a labelled UI button (anvil, enchant, trade). */
   | { kind: "click_button"; buttonName: string }
-  /** Confirm-only step. Planner ticks done when verifying state, no
-   *  Action invocation needed. */
+  /** Confirm-only step. Action emits done if condition holds in
+   *  Known + frame. */
   | { kind: "verify_state"; condition: string };
 
-/** Subtask augmented with a checkbox state. The Planner ticks `done`
- *  to true based on observation of frame + Known. `id` is monotonic
- *  ("s1", "s2", ...) so the Planner can preserve identity across
- *  re-judgments and not re-shuffle the list. `attempts` counts how many
- *  times the Action agent was dispatched against this item without it
- *  becoming done — Planner uses this to break stuck loops. */
+/** Subtask augmented with checkbox state. Planner ticks `done` based
+ *  on observation; `attempts` counts Action dispatches against the
+ *  item; Planner uses it to break stuck loops. */
 export type ChecklistItem = {
   id: string;
-  text: string;       // human-readable rendering
+  text: string;
   task: Subtask;
   done: boolean;
   attempts: number;
 };
 
-/** Output of any Planner specialization. Generic across GUI kinds. */
+/** Generic Planner output across all GUI kinds. */
 export type PlanResult =
   | { kind: "all_done"; checklist: ChecklistItem[] }
   | { kind: "continue"; checklist: ChecklistItem[]; nextIdx: number };
