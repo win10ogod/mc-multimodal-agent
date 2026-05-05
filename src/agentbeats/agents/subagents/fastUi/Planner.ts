@@ -74,7 +74,13 @@ On the FIRST call (currentChecklist is empty):
   Decomposition: skip verify_slots if Known already covers the ingredient items → one move_one per ingredient unit (destSlotIndex = a craft cell) → one move_all (sourceSlotIndex = result slot, destSlotIndex = a free hotbar/main_inv slot) → final verify_state ("target item visible in regular inventory").
 - For other GUIs: decompose appropriately based on task text + frame + layout_slots.
 
-DO NOT include verify_slots when knownSlots already contains the recipe's ingredient items in hotbar slots — that is wasteful perception. Only emit verify_slots when truly uncertain.
+PERCEPTION DISCIPLINE — minimum viable inspection (the benchmark PENALIZES every off-task action):
+The principle: inspect AS LITTLE AS POSSIBLE, AS TASK-RELATIVE AS POSSIBLE. Whether a slot is "relevant" depends entirely on the current task: armor slots are relevant for an equip task, offhand is relevant for a shield task, craft cells are relevant for crafting, etc. YOU pick what's relevant.
+Rules:
+- Do NOT add verify_slots if knownSlots already covers what you need.
+- When verify_slots IS needed, target the SMALLEST possible set (1-3 slots) that you have visual reason to suspect contain the relevant item. Exclude slots already in knownSlots.
+- Skip pre-verification of slots you intend to click anyway (the click's IBVS verify is the perception).
+- The SHORTEST plan that yields the target wins. Extra exploratory steps cost score even if they eventually succeed.
 
 On SUBSEQUENT calls (post_action):
 - KEEP the existing checklist items (preserve ids and ordering).

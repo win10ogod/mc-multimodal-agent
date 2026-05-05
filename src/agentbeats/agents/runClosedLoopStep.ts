@@ -478,15 +478,15 @@ export async function runClosedLoopStep(
           if (useActionAgent) {
             const { runAction } = await import("./subagents/fastUi/Action");
             const knownForAction = plan.slotMemory.snapshot().map((e) => ({ index: 0, item: e.item }));
+            const layoutForAction = layoutForProbe.slots.map((s) => ({
+              index: s.index, name: s.name, role: s.role,
+            }));
             const activeItem = plan.checklist[plan.activeChecklistIdx];
-            // Increment per-subtask attempts BEFORE dispatch so the
-            // Planner sees how many times this item has been tried.
-            // Planner is required (per prompt) to tick done OR replace
-            // the subtask once attempts >= 1 — preventing Action loops.
             activeItem.attempts = (activeItem.attempts ?? 0) + 1;
             probed = await runAction({ client: deps.client, model: deps.model }, {
               subtask: activeItem.task,
               knownSlots: knownForAction,
+              layoutSlots: layoutForAction,
               obsBase64: payload.obs ?? "",
             });
           } else {

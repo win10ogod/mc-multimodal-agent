@@ -10,6 +10,11 @@ export type ActionDeps = {
 export type ActionInput = {
   subtask: Subtask;
   knownSlots: Array<{ index: number; name?: string; item: string }>;
+  /** GUI slot-index → role mapping for the currently open window.
+   *  Same data the Planner sees, so Action can translate symbolic
+   *  references (e.g. "craft_2x2_0") to concrete slot indices and
+   *  knows which slots are off-limits for the current task. */
+  layoutSlots: Array<{ index: number; name?: string; role?: string }>;
   obsBase64: string;
 };
 
@@ -28,7 +33,7 @@ You do NOT track overall progress, recipes, or completion — those are decided 
 
 Subtask kinds you may receive:
 - verify_slots { slots }: emit { "action": "verify_slots", "slots": [...], "reason": "..." } to OCR-confirm those slots' contents (cap N <= 4).
-- move_one { sourceItem, destSlotIndex }: find sourceItem in Known slot contents (handle naming variants like quartz<->nether_quartz). Emit move { from: <sourceSlotIdx>, to: destSlotIndex, count: "one" }. If sourceItem isn't in Known, emit verify_slots on candidate hotbar slots first.
+- move_one { sourceItem, destSlotIndex }: find sourceItem in Known slot contents (handle naming variants like quartz<->nether_quartz). Emit move { from: <sourceSlotIdx>, to: destSlotIndex, count: "one" }. If sourceItem isn't in Known, emit verify_slots on AT MOST 1-3 candidates that VISUALLY resemble sourceItem; exclude slots already in Known. Off-task perception is penalized.
 - move_all { sourceSlotIndex, destSlotIndex }: emit move { from: sourceSlotIndex, to: destSlotIndex, count: "all" }.
 - wait_for_output { expectedItem }: ASYNC-OUTPUT GUIs (furnace smelting, brewing stand) need simulator time to tick before the output slot fills. Emit { "action": "wait", "holdSteps": N, "reason": "..." } where N is the noop hold to apply this turn (smelting ~200 ticks/item, brewing ~400; cap N at 60 per call). The next probe re-evaluates and emits verify_slots once expected output should be present.
 - click_button { buttonName }: not yet supported — emit fallback_manual.
@@ -36,7 +41,9 @@ Subtask kinds you may receive:
 
 CRITICAL: choose dest slots that are NOT in Known (occupied) when placing/taking, OR slots whose Known content matches what cursor will hold (will stack). Never overwrite a different item.
 
-Image has YELLOW NUMBERED BADGES at slot corners — read them directly to choose slot indices.
+The layout_slots payload tells you each slot's role (craft_2x2_0, armor_helmet, hotbar_3, result, etc.) — use it to validate dest indices match the expected role for the subtask. NEVER use a slot whose role is unrelated to the current task as a destination.
+
+Image has YELLOW NUMBERED BADGES at slot corners — read them directly to choose slot indices, then cross-check against layout_slots.
 
 Output strict JSON, one action only:
   { "action": "move", "from": A, "to": B, "count": "one"|"all", "reason": "..." }
@@ -49,6 +56,7 @@ export async function runAction(deps: ActionDeps, input: ActionInput): Promise<C
   const userPayload = {
     subtask: input.subtask,
     known_slots: input.knownSlots,
+    layout_slots: input.layoutSlots,
   };
   const dataUrl = input.obsBase64.startsWith("data:image/")
     ? input.obsBase64
