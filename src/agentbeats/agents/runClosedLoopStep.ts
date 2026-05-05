@@ -765,23 +765,28 @@ export async function runClosedLoopStep(
             state.closedLoopHistory = state.closedLoopHistory.slice(0, 5);
             return { kind: "act", action: defaultMcuAction(), holdSteps: N };
           } else if (probed.action === "done") {
-            // CV-verify the probe's "done" claim: the result slot
-            // must actually be empty AND the cursor must be empty
-            // (we use cursorItemSignature == null as proxy). If
-            // accepted, set plan.done so control falls through to
-            // the regular VLM which can then set task_done.
-            const resultSlot = layoutForProbe.slots.find((s) => s.role === "result");
-            const resultPatch = resultSlot ? samplePatchFingerprint(payload.obs, resultSlot.cx, resultSlot.cy, 12) : null;
-            const resultEmpty = !!resultPatch && resultPatch.stddev < 25;
-            const cursorEmpty = plan.cursorItemSignature === null;
-            if (resultEmpty && cursorEmpty) {
-              console.log(`[agentbeats] closed-loop probe says done; CV-verified (result empty, cursor empty); accepting`);
-              plan.done = true;
-            } else {
-              console.warn(`[agentbeats] closed-loop probe said done but CV-verify failed (resultEmpty=${resultEmpty}, cursorEmpty=${cursorEmpty}); ignoring`);
-              state.closedLoopHistory.unshift(`done IGNORED (resultEmpty=${resultEmpty}, cursorEmpty=${cursorEmpty})`);
-              state.closedLoopHistory = state.closedLoopHistory.slice(0, 5);
+            // Action's "done" means "I finished THIS subtask" — NOT
+            // "the whole craft is done". Mark the active checklist
+            // item complete and arm a Planner re-judge so the next
+            // subtask gets dispatched. The session only ends when
+            // Planner returns all_done (handled at the post_action
+            // re-judge call site at body top). Without this, a
+            // verify_items_visible "done" was prematurely setting
+            // plan.done=true → closed-loop exits → parent VLM presses
+            // 'inventory' and the GUI closes mid-craft.
+            const activeItem = plan.checklist[plan.activeChecklistIdx];
+            if (activeItem) {
+              activeItem.done = true;
+              console.log(`[agentbeats] subtask done: '${activeItem.id}' (${(activeItem.task as any)?.kind}); arming Planner re-judge`);
             }
+            plan.judgeAfterChain = true;
+            state.closedLoopHistory.unshift(`subtask_done ${activeItem?.id ?? "?"}`);
+            state.closedLoopHistory = state.closedLoopHistory.slice(0, 5);
+            // Return a noop frame so the inventory stays open and
+            // the next obs enters with judgeAfterChain set; the
+            // Planner re-judge at the top of the body will tick the
+            // checklist and dispatch the next subtask.
+            return { kind: "act", action: defaultMcuAction(), holdSteps: 1 };
           } else if (probed.action === "fallback_manual") {
             const blockedReason = probed.reason ?? "fallback_manual";
             console.log(`[agentbeats] closed-loop probe says fallback_manual reason=${blockedReason} -- escalating to GoalPlanner`);

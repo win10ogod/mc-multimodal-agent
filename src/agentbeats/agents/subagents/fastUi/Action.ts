@@ -43,7 +43,7 @@ const SCHEMA = {
   },
 } as const;
 
-const SYS = `You execute ONE symbolic subtask in a Minecraft GUI. You receive the subtask plus layout_slots (slot index + role), slot_state (slots CV detected as having content, named or "unknown item"), recipe (if any), cursor_holding, and the frame with YELLOW NUMBERED BADGES on every slot. Slots NOT in slot_state are LIKELY empty but may also be unverified content the CV missed (low-contrast grey blocks like cobblestone often go undetected).
+const SYS = `You execute ONE symbolic subtask in a Minecraft GUI. You receive the subtask, slot_state (slots CV detected as having content, named or "unknown item"), slots_by_role (which slot indices belong to each role: craft_2x2, craft_3x3, result, hotbar, main_inv, armor, offhand), recipe (if any), cursor_holding, and the frame with YELLOW NUMBERED BADGES on every slot. Slots NOT in slot_state are LIKELY empty but may also be unverified content the CV missed (low-contrast grey blocks like cobblestone often go undetected).
 
 Subtask → action mapping:
 - verify_items_visible { items }: prefer "unknown item" entries in slot_state. If a needed item isn't in slot_state at all, scan up to 3 unlisted hotbar/main_inv slots that VISUALLY look like the item — do NOT assume an inventory lacks the item just because slot_state doesn't name it. If you cannot pick a confident candidate even visually, emit fallback_manual.
@@ -67,10 +67,9 @@ Output strict JSON, one action only:
 let ACTION_CALL_SEQ = 0;
 
 export async function runAction(deps: ActionDeps, input: ActionInput): Promise<CraftAction> {
-  // Unified slot state: every occupied slot listed once, either by
-  // OCR-confirmed item or as "unknown item". Slots not listed are
-  // empty (CV-confirmed). Avoids the ambiguity of separate
-  // known_slots + occupied lists.
+  // Compact context. Listing all 48 layout slots wastes tokens and
+  // distracts the model — Action mainly needs role→indices to find
+  // craft cells / result, and slot_state for occupancy.
   const knownByIdx = new Map(input.knownSlots.map((s) => [s.index, s.item]));
   const allOccupied = new Set<number>([
     ...input.knownSlots.map((s) => s.index),
@@ -79,11 +78,15 @@ export async function runAction(deps: ActionDeps, input: ActionInput): Promise<C
   const slotState = [...allOccupied]
     .sort((a, b) => a - b)
     .map((i) => ({ index: i, item: knownByIdx.get(i) ?? "unknown item" }));
+  const slotsByRole: Record<string, number[]> = {};
+  for (const s of input.layoutSlots) {
+    const role = s.role ?? "other";
+    (slotsByRole[role] ??= []).push(s.index);
+  }
   const userPayload = {
     subtask: input.subtask,
     slot_state: slotState,
-    slot_state_note: "slots not listed are likely empty OR contents not yet inspected (CV may miss low-contrast grey items)",
-    layout_slots: input.layoutSlots,
+    slots_by_role: slotsByRole,
     recipe: input.recipeInfo
       ? {
           target: input.recipeInfo.target,
