@@ -867,20 +867,27 @@ export async function runClosedLoopStep(
             // rest queue in plan.pendingChain and promote on verify.
             const fromSlot = layoutForProbe.slots[probed.from];
             const toSlot = layoutForProbe.slots[probed.to];
-            const movingWholeStack = (probed.count ?? "one") === "all";
-            // Refuse swap: when count=all (whole-stack place into to=B)
-            // and B is CV-detected as already filled (stddev > 35),
-            // refuse the move. Placing on a filled slot triggers a
-            // destructive item swap. Skip this guard for from==to
-            // (legit auto-return to a slot we just emptied).
-            const destPatch = (toSlot && fromSlot && fromSlot.name !== toSlot.name && movingWholeStack)
+            // No-swap invariant. ANY move (count=one or count=all)
+            // into a non-empty destination of a DIFFERENT item is a
+            // destructive swap that wrecks slotMemory tracking. Refuse
+            // unconditionally unless the destination is empty OR
+            // holds the same item as what the cursor would deposit.
+            // Source of truth in priority order:
+            //   (1) slotMemory at toSlot — if it names a known item,
+            //       trust it absolutely (OCR-confirmed or click-
+            //       verified placement).
+            //   (2) cursorItemSignature RGB vs destPatch RGB — fall-
+            //       back when slotMemory has no entry at toSlot but
+            //       the slot still looks filled.
+            //   (3) destPatch.stddev > 35 — last-resort "looks
+            //       filled" indicator.
+            // Skip the guard entirely for from==to (legit auto-return).
+            const fromMem = fromSlot ? plan.slotMemory.lookup(fromSlot.cx, fromSlot.cy) : null;
+            const toMem = toSlot ? plan.slotMemory.lookup(toSlot.cx, toSlot.cy) : null;
+            const cursorItemName = fromMem?.item; // what we'd deposit
+            const destPatch = (toSlot && fromSlot && fromSlot.name !== toSlot.name)
               ? samplePatchFingerprint(payload.obs, toSlot.cx, toSlot.cy, 12)
               : null;
-            // Same-item stacking allowance: if the destination is
-            // filled BUT its color signature matches what the cursor
-            // is currently carrying (cursorItemSignature recorded at
-            // last pickup), the click will STACK same-item piles in
-            // MC -- not swap. Allow it.
             const sigDist = (destPatch && plan.cursorItemSignature)
               ? Math.hypot(
                   destPatch.meanR - plan.cursorItemSignature.meanR,
@@ -888,8 +895,10 @@ export async function runClosedLoopStep(
                   destPatch.meanB - plan.cursorItemSignature.meanB,
                 )
               : null;
-            const destSameItem = sigDist !== null && sigDist < 30;
-            const destLooksFilled = !!destPatch && destPatch.stddev > 35 && !destSameItem;
+            const destKnownDifferent = toMem && toMem.item !== "empty" && toMem.item !== "unknown" && cursorItemName && toMem.item !== cursorItemName;
+            const destPatchSameItem = sigDist !== null && sigDist < 30;
+            const destPatchFilledDifferent = !!destPatch && destPatch.stddev > 35 && !destPatchSameItem;
+            const destLooksFilled = destKnownDifferent || (!toMem && destPatchFilledDifferent);
             if (deps.debugDir && destPatch && toSlot) {
               void deps.recordDebug("pre_check_move", {
                 type: "pre_check_move",
