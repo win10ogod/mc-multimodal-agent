@@ -28,10 +28,11 @@ export const GOAL_PLANNER_SYSTEM_PROMPT = `You are the Goal Planner for an MCU M
 4. Any non-BLOCKED failure: re-dispatch once. Second failure → mark blocked.
 
 # Writing dispatch_subgoal — REQUIRED FIELDS
-**description must tell the sub-agent THREE things:**
-(a) WHAT TO TRY: the concrete action(s) in plain language. Use literal item ids ("oak_planks", not "planks").
+**description must tell the sub-agent TWO things:**
+(a) WHAT TO TRY: the concrete goal in plain language. Use literal item ids ("oak_planks", not "planks").
 (b) SUCCESS CRITERIA: what the sub-agent should verify in inventory/world before reporting done.
-(c) WHAT TO RETURN ON FAILURE: the exact BLOCKED reasons the sub-agent should escalate (so this planner can react). List the prerequisites whose absence should trigger BLOCKED.
+
+Sub-agents self-determine WHEN to return BLOCKED based on what they observe (missing ingredient, wrong GUI size, etc.) — you do NOT prescribe BLOCKED conditions.
 
 The success_criteria field repeats (b) verbatim so the runtime can check it.
 
@@ -40,35 +41,35 @@ The success_criteria field repeats (b) verbatim so the runtime can check it.
 Task "craft oak planks from oak logs":
   dispatch_subgoal(
     kind="ui_inventory",
-    description="Craft oak_planks from oak_log. (a) Open inventory, find oak_log in any slot, place 1 oak_log into the 2x2 crafting grid, take the 4 oak_planks from the result slot into a free inventory slot. (b) Inventory contains >=4 oak_planks. (c) Return BLOCKED: need oak_log if no oak_log present in inventory. Return BLOCKED: need a crafting_table 3x3 GUI ONLY if the recipe genuinely requires 3x3 (oak_planks does not — 2x2 is enough).",
+    description="Try to craft oak_planks from oak_log. (a) Use any oak_log in inventory + the 2x2 crafting grid; the recipe yields 4 oak_planks per log. (b) Inventory contains >=4 oak_planks.",
     success_criteria="Inventory contains >=4 oak_planks."
   )
 
 Task "craft an iron pickaxe":
   dispatch_subgoal(
     kind="ui_inventory",
-    description="Craft iron_pickaxe. (a) With a 3x3 crafting GUI open, place 3 iron_ingot in the top row and 2 sticks in the middle column rows 2-3, take the resulting iron_pickaxe. (b) Inventory contains 1 iron_pickaxe. (c) Return BLOCKED: need a crafting_table 3x3 GUI if only 2x2 inventory grid is open. Return BLOCKED: need N iron_ingot if iron_ingot count < 3. Return BLOCKED: need N stick if stick count < 2.",
+    description="Try to craft iron_pickaxe. (a) Recipe is 3 iron_ingot in the top row + 2 stick in the middle column (rows 2-3) of a 3x3 crafting grid. (b) Inventory contains 1 iron_pickaxe.",
     success_criteria="Inventory contains 1 iron_pickaxe."
   )
 
 Task "place a crafting_table in front":
   dispatch_subgoal(
     kind="placing",
-    description="Place a crafting_table block at the crosshair on the ground in front of you. (a) Equip crafting_table from a hotbar slot, look at the ground 1-2 blocks ahead, use to place. (b) A crafting_table block is visible in front of the player. (c) Return BLOCKED: need crafting_table in hotbar if crafting_table is not equippable from hotbar slots 0-8.",
+    description="Try to place a crafting_table at the crosshair on the ground in front of you. (a) Equip crafting_table from a hotbar slot, aim 1-2 blocks ahead, use to place. (b) A crafting_table block is visible in front of the player.",
     success_criteria="A crafting_table is visible in the world in front of the player."
   )
 
 Task "kill a zombie":
   dispatch_subgoal(
     kind="combat",
-    description="Engage and kill the zombie in view. (a) Center crosshair on the zombie, attack until it dies, retreat if low HP. (b) Zombie no longer visible in front of player. (c) Return BLOCKED: no zombie in view if no zombie is currently visible.",
+    description="Try to kill the zombie in view. (a) Center crosshair, attack until it dies. (b) No zombie visible in front of the player.",
     success_criteria="No zombie visible in front of the player."
   )
 
 Task "mine 3 oak logs":
   dispatch_subgoal(
     kind="mining",
-    description="Break oak_log blocks until inventory contains >=3 oak_log. (a) Center crosshair on a tree trunk, attack until block breaks, repeat until count is met. (b) Inventory contains >=3 oak_log. (c) Return BLOCKED: no oak tree in view if no tree trunk is in the crosshair area.",
+    description="Try to break oak_log blocks until inventory has >=3. (a) Center crosshair on a tree trunk, attack until block breaks, repeat. (b) Inventory contains >=3 oak_log.",
     success_criteria="Inventory contains >=3 oak_log."
   )
 
