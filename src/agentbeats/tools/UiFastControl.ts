@@ -614,43 +614,53 @@ export function servoCursorStep(opts: {
     if (opts.shift) action.sneak = 1;
     return { action, click: true, reason: `${opts.shift ? "shift+" : ""}click err=${errMag.toFixed(1)}px` };
   }
-  // Adaptive servo: fast when far, slow when close. Bin granularity
-  // shrinks as cursor approaches target so the final landing step
-  // can place the cursor within the slot's hit-region rather than
-  // overshooting in 17 px chunks.
-  //   errMag > 30 px : 2 deg bin (~17 px yaw / 10 px pitch) — coarse approach
-  //   15..30 px      : 1 deg bin (~8.5 px / 5 px) — medium
-  //    8..15 px      : 0.5 deg bin (~4.3 px / 2.5 px) — fine
-  //    < 8 px        : 0.25 deg bin (~2.1 px / 1.25 px) — precision landing
+  // Adaptive YAW gain (control-theory P-control with bin schedule).
+  // Yaw has continuous response in MC's sim — sub-degree commands
+  // produce proportionally smaller cursor motion. Bin shrinks as
+  // we approach target for precision landing.
+  //   errMag > 30 px : 2 deg yaw bin (~17 px) — coarse approach
+  //   15..30 px      : 1 deg (~8.5 px) — medium
+  //    8..15 px      : 0.5 deg (~4.3 px) — fine
+  //    < 8 px        : 0.25 deg (~2.1 px) — precision landing
+  // PITCH is asymmetric: MC's sim has a 4-deg deadzone (commands
+  // below PITCH_DEADZONE_MIN produce NO cursor motion). So we can't
+  // do precision pitch — instead, when pitch error is below the
+  // deadzone-equivalent (~10 px), accept the y position as good
+  // enough and only do yaw corrections. When pitch error is large,
+  // either inflate to PITCH_DEADZONE_MIN (small error in deadzone)
+  // or quantize at 1-deg bin (medium-large error).
   let bin: number;
   if (errMag > 30) bin = 2;
   else if (errMag > 15) bin = 1;
   else if (errMag > 8) bin = 0.5;
   else bin = 0.25;
-  const quantizeAdaptive = (deg: number): number => {
-    const clamped = Math.max(-MAX_CAM_DEG, Math.min(MAX_CAM_DEG, deg));
-    return Math.round(clamped / bin) * bin;
-  };
-  let yawDeg = ex / PX_PER_CAM_YAW;
-  let pitchDeg = ey / PX_PER_CAM_PITCH;
-  let dy = quantizeAdaptive(yawDeg);
-  let dp = quantizeAdaptive(pitchDeg);
-  // Pitch deadzone (unchanged): if remaining error below half the
-  // deadzone, drop pitch to avoid oscillation.
-  if (Math.abs(pitchDeg) * PX_PER_CAM_PITCH < PITCH_DEADZONE_MIN / 2) dp = 0;
-  if (dy === 0 && dp === 0) {
-    // Sub-bin stuck: nudge by the current adaptive bin in the
-    // dominant error axis to break the deterministic stuck-loop.
-    const action = defaultMcuAction();
-    if (Math.abs(ex) >= Math.abs(ey)) {
-      action.camera = [0, Math.sign(ex) * bin];
-    } else {
-      action.camera = [Math.sign(ey) * bin, 0];
+  const yawClamped = Math.max(-MAX_CAM_DEG, Math.min(MAX_CAM_DEG, ex / PX_PER_CAM_YAW));
+  let dy = Math.round(yawClamped / bin) * bin;
+  // Pitch handling — deadzone-aware, NOT adaptive.
+  let dp = 0;
+  const pitchDeg = ey / PX_PER_CAM_PITCH;
+  const pitchPxErr = Math.abs(ey);
+  if (pitchPxErr >= PITCH_DEADZONE_MIN * PX_PER_CAM_PITCH) {
+    // Error is large enough to need a real pitch move. Quantize at
+    // 1-deg bin and clamp to MAX_CAM_DEG.
+    const pitchClamped = Math.max(-MAX_CAM_DEG, Math.min(MAX_CAM_DEG, pitchDeg));
+    dp = Math.round(pitchClamped);
+    if (dp !== 0 && Math.abs(dp) < PITCH_DEADZONE_MIN) {
+      dp = Math.sign(dp) * PITCH_DEADZONE_MIN;
     }
+  }
+  // Below deadzone-equivalent (≈10 px), pitch stays 0 — accept the
+  // y-position as "good enough" and let yaw close the rest. This is
+  // what makes precision landing actually arrive.
+  if (dy === 0 && dp === 0) {
+    // Cursor is within the deadzone for both axes — fire a small
+    // yaw nudge so the cursor at least moves before click cap.
+    const action = defaultMcuAction();
+    action.camera = [0, Math.sign(ex || 1) * bin];
     return {
       action,
       click: false,
-      reason: `nudge err=${errMag.toFixed(1)}px cam=[${action.camera[0]},${action.camera[1]}] bin=${bin} (sub-bin stuck)`,
+      reason: `nudge err=${errMag.toFixed(1)}px cam=[0,${action.camera[1]}] bin=${bin} (sub-bin stuck)`,
     };
   }
   const action = defaultMcuAction();
