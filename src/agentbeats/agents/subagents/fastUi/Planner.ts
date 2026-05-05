@@ -18,11 +18,6 @@ export type PlannerInput = {
    *  the perception so a slot index in either prompt unambiguously
    *  refers to the same SoM badge in the live frame. */
   knownSlots: Array<{ index: number; name?: string; item: string }>;
-  /** CV-detected occupied slot indices (chroma+luminance fill test).
-   *  Subtract knownSlots indices to get "occupied but unknown content"
-   *  — those are candidates for verify_items_visible if a recipe
-   *  ingredient hasn't been identified yet. */
-  occupiedSlotIndices: number[];
   /** What the cursor is currently carrying, if anything. */
   cursorHolding: string | null;
   /** Empty on first invocation; otherwise the in-flight list. */
@@ -103,21 +98,17 @@ Output strict JSON:
 Each item: { id, text, task, done, attempts }. PRESERVE attempts.`;
 
 function buildUserText(input: PlannerInput, userPayload: Record<string, unknown>): string {
-  // Unified slot-state listing: every slot with SOMETHING in it is
-  // listed once, either by OCR-confirmed item name or as "unknown
-  // item". Slots not listed are empty (CV-confirmed). This avoids
-  // ambiguity over "did the agent forget about it" vs "it's empty".
-  const knownByIdx = new Map(input.knownSlots.map((s) => [s.index, s.item]));
-  const allOccupied = new Set<number>([
-    ...input.knownSlots.map((s) => s.index),
-    ...input.occupiedSlotIndices,
-  ]);
-  const lines = [...allOccupied]
-    .sort((a, b) => a - b)
-    .map((i) => `  ${i} -> ${knownByIdx.get(i) ?? "unknown item"}`);
-  const slotBlock = lines.length > 0 ? lines.join("\n") : "  (all slots empty)";
+  // Tracked-items block — only OCR-confirmed names. Probe Pass A/B
+  // owns slotMemory mutation; the LLM gets the authoritative list
+  // here. Slots not listed are either empty or not yet inspected
+  // (verify_items_visible is the way to disambiguate).
+  const lines = input.knownSlots
+    .slice()
+    .sort((a, b) => a.index - b.index)
+    .map((s) => `  ${s.index} -> ${s.item}`);
+  const slotBlock = lines.length > 0 ? lines.join("\n") : "  (none yet)";
   const cursorBlock = input.cursorHolding ?? "(empty)";
-  return `Slot state (slots not listed are empty OR contents not yet inspected):
+  return `Tracked items (slot id -> item, OCR-confirmed):
 ${slotBlock}
 Cursor: ${cursorBlock}
 
@@ -137,7 +128,6 @@ export async function runPlanner(deps: PlannerDeps, input: PlannerInput): Promis
         }
       : null,
     known_slots: input.knownSlots,
-    occupied_slot_indices: input.occupiedSlotIndices,
     cursor_holding: input.cursorHolding,
     current_checklist: input.currentChecklist,
     trigger: input.trigger,

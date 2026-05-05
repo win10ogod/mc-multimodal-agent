@@ -11,8 +11,7 @@ import {
   lookupRecipe,
 } from "../tools/UiFastControl";
 import { probeNextCraftAction, vlmVerifySlotState } from "../tools/InventoryProbe";
-import { detectCursorWithExpectation, detectGuiLayout, samplePatchFingerprint, samplePatchDHash, dHashDistance } from "../tools/SlotDetector";
-import { MATCH_RADIUS_PX } from "../tools/SlotMemory";
+import { detectCursorWithExpectation, detectGuiLayout, samplePatchFingerprint } from "../tools/SlotDetector";
 import { repairDecisionForTask, shouldUseModelOnStep } from "../McuPolicyUtils";
 import type { UiFastControlFrame } from "../tools/UiFastControl";
 
@@ -123,157 +122,6 @@ export async function runClosedLoopStep(
     } catch { /* fall back to raw */ }
   }
 
-  // CV-only per-frame item resolver. For every item we have a pixel
-  // fingerprint for (captured at OCR time when the item was hovered),
-  // scan all detected slots this frame and re-bind the item to the
-  // slot whose current fingerprint best matches. This replaces
-  // agent-feedback-driven mutation tracking: knowledge of WHERE every
-  // tracked item is gets re-derived from pixels each observation,
-  // before the Planner sees `known_slots`. As a side-effect, items
-  // that don't match any slot must be on the cursor — that drives
-  // `cursorHoldingMut`.
-  if (state.closedLoopCraft && payload.obs) {
-    const cp = state.closedLoopCraft;
-    // Skip the resolver while a click chain is mid-flight. Pickup
-    // briefly empties the source slot (cursor holds the whole stack)
-    // between pickup-verify and auto_return; running the migration
-    // tracker in that window would see the source as "vanished" and
-    // invalidate the slot's known-item entry, even though auto_return
-    // is about to refill it. Only resolve when the agent is idle and
-    // a probe is what's about to happen.
-    const chainInFlight = cp.pendingClick !== null
-      || cp.pendingChain.length > 0
-      || cp.pendingOcrBatch !== null
-      || cp.pendingTooltipRead !== null;
-    const layoutForMut = chainInFlight ? null : (cp.sessionLayout as ReturnType<typeof detectGuiLayout> | null);
-    if (layoutForMut && layoutForMut.slots.length > 0) {
-      const cursorNow = detectCursorWithExpectation(payload.obs, layoutForMut, null);
-      type Fp = { meanR: number; meanG: number; meanB: number; stddev: number };
-      const chroma = (fp: Fp) => Math.max(fp.meanR, fp.meanG, fp.meanB) - Math.min(fp.meanR, fp.meanG, fp.meanB);
-      // Role-aware fill test. Cobblestone reads chroma=0 stddev≈100
-      // lum≈103 in the raw frame — pure grey, very textured, far
-      // from empty-slot baseline (139). The player-avatar render in
-      // armor slots produces the EXACT same fingerprint shape, so a
-      // single rule can't separate them. Discriminator is role:
-      //   - in armor / offhand / unknown slots: require visible color
-      //     (chroma > 25). Avatar bleed has chroma 1-6 ⇒ stays empty.
-      //   - in hotbar/main_inv/craft/result: any of:
-      //       (a) saturated:           chroma > 25
-      //       (b) colored-textured:    chroma > 12 AND stddev > 18
-      //       (c) grey-textured item:  lum far from 139 AND stddev > 18
-      //     Empty slot (lum~139 stddev<10) and SoM-text overlay
-      //     (lum~139 stddev~35) both fall through to false.
-      const isFilled = (fp: Fp, role?: string) => {
-        const c = chroma(fp);
-        if (c > 25) return true;
-        const isItemSlot = role === "hotbar" || role === "main_inv"
-          || role === "craft_2x2" || role === "craft_3x3" || role === "result";
-        if (!isItemSlot) return false;
-        if (c > 12 && fp.stddev > 18) return true;
-        const lum = (fp.meanR + fp.meanG + fp.meanB) / 3;
-        if (Math.abs(lum - 139) > 30 && fp.stddev > 18) return true;
-        return false;
-      };
-      // Direct cursor-region holding detection. The held-item icon
-      // renders ~8 px NW of the cursor tip. When the cursor is NOT
-      // over a slot (no slot pixels bleeding in), the NW patch is
-      // pure GUI background unless an item is carried; high stddev
-      // or saturation there is an unambiguous "holding" signal.
-      if (cursorNow) {
-        const overSlot = layoutForMut.slots.some((s) => Math.hypot(s.cx - cursorNow.x, s.cy - cursorNow.y) < 12);
-        if (!overSlot) {
-          const heldFp = samplePatchFingerprint(payload.obs, cursorNow.x - 8, cursorNow.y - 8, 4);
-          if (heldFp) {
-            const heldC = chroma(heldFp);
-            if (heldFp.stddev > 35 || heldC > 30) {
-              cp.cursorHoldingMut = true;
-              console.log(`[agentbeats] cursor-NW: holding (stddev=${heldFp.stddev.toFixed(1)} chroma=${heldC.toFixed(1)})`);
-            } else if (heldFp.stddev < 18 && heldC < 15) {
-              cp.cursorHoldingMut = false;
-            }
-          }
-        }
-      }
-      // Per-frame fingerprint + dHash sweep. Skip slots within ~12 px
-      // of the cursor — hover highlight contaminates both signals.
-      // Only sample dHash for slots that pass the chroma fill gate, so
-      // the matcher never burns hash comparisons against empty slots.
-      // Note: the bbox-area-vs-median fallback was removed — it was
-      // dead code because SlotDetector's row-median snap forces every
-      // matched slot's w/h to the row median (so s.w*s.h == medianArea
-      // always). Pure-grey items are caught by isFilled's lum/stddev
-      // path, not by bbox shrinkage.
-      const slotSigs: Array<{ index: number; cx: number; cy: number; fp: Fp; hash: bigint }> = [];
-      for (const s of layoutForMut.slots) {
-        if (cursorNow && Math.hypot(s.cx - cursorNow.x, s.cy - cursorNow.y) < 12) continue;
-        const fp = samplePatchFingerprint(payload.obs, s.cx, s.cy, 6);
-        if (!fp) continue;
-        if (!isFilled(fp, s.role)) continue;
-        const hash = samplePatchDHash(payload.obs, s.cx, s.cy, 16);
-        if (hash === null) continue;
-        slotSigs.push({ index: s.index, cx: s.cx, cy: s.cy, fp, hash });
-      }
-      // Coord→id projection: only slots that are filled AND we don't
-      // already have an identity for. slotMemory is the persistent
-      // truth for OCR-confirmed items — never override its names with
-      // CV "unknown item" noise. Use the same MATCH_RADIUS_PX as
-      // SlotMemory.lookup so a CV-detected slot whose center sits up
-      // to 8 px from a recorded entry won't double-emit as both
-      // known and "unknown item".
-      const knownPositions = cp.slotMemory.snapshot()
-        .filter((e) => e.item !== "empty" && e.item !== "unknown")
-        .map((e) => ({ x: e.x, y: e.y }));
-      cp.occupiedSlotIndices = slotSigs
-        .filter((s) => !knownPositions.some((k) => Math.hypot(k.x - s.cx, k.y - s.cy) < MATCH_RADIUS_PX))
-        .map((s) => s.index);
-      // Debug: dump the raw obs once per iteration so the resolver's
-      // input can be inspected offline. MC's JPEG bytes come out of
-      // jpeg-js with R/B channels swapped (Alex hair reads blue),
-      // so a straight write of the JPEG bytes renders inverted colors
-      // in any viewer. Decode, swap BGR↔RGB, re-encode as PNG so the
-      // dumped image looks like what a human eye would see in-game.
-      const debugDir = process.env.AGENTBEATS_DEBUG_DIR;
-      if (debugDir) {
-        try {
-          // eslint-disable-next-line @typescript-eslint/no-require-imports
-          const fs = require("node:fs") as typeof import("node:fs");
-          // eslint-disable-next-line @typescript-eslint/no-require-imports
-          const pathMod = require("node:path") as typeof import("node:path");
-          // eslint-disable-next-line @typescript-eslint/no-require-imports
-          const jpeg = require("jpeg-js") as typeof import("jpeg-js");
-          // eslint-disable-next-line @typescript-eslint/no-require-imports
-          const { PNG } = require("pngjs") as typeof import("pngjs");
-          const cleaned = payload.obs.replace(/^data:image\/[a-z]+;base64,/, "");
-          const decoded = jpeg.decode(Buffer.from(cleaned, "base64"), { useTArray: true, formatAsRGBA: true });
-          const px = Buffer.from(decoded.data.buffer, decoded.data.byteOffset, decoded.data.byteLength);
-          for (let i = 0; i < px.length; i += 4) {
-            const r = px[i]; px[i] = px[i + 2]; px[i + 2] = r;
-          }
-          const png = new PNG({ width: decoded.width, height: decoded.height });
-          png.data.set(px);
-          const seq = String(cp.iteration).padStart(5, "0");
-          fs.writeFileSync(pathMod.join(debugDir, `resolver_${seq}_raw.png`), PNG.sync.write(png));
-        } catch { /* swallow */ }
-      }
-      // Match each tracked item by Hamming distance on dHash. The hash
-      // captures pixel layout — many MC items share a grey/brown
-      // palette but differ in texture; Hamming distance separates them
-      // where mean-RGB cannot. Loose threshold (≤16/64) tolerates JPEG
-      // noise and minor stack-count rendering changes; chroma-fp is a
-      // tiebreaker.
-      // No-swap invariant: the agent never swaps items between slots
-      // (place onto a different-item slot is forbidden by Action's
-      // SYS prompt). Therefore items never migrate without an
-      // explicit pickup/place action — the click verifier records
-      // those directly into slotMemory. The resolver no longer
-      // attempts to migrate items: that role is owned by the click
-      // handler. We use slotSigs only to populate
-      // occupiedSlotIndices (CV-occupancy hint for slots NOT in
-      // slotMemory) so the LLM sees "unknown item" only for
-      // genuinely-new occupants (e.g., the result slot once a craft
-      // succeeds).
-    }
-  }
 
   // Planner re-judge after a successful chain. Fires once per arm.
   if (state.closedLoopCraft && state.closedLoopCraft.judgeAfterChain && payload.obs) {
@@ -296,16 +144,13 @@ export async function runClosedLoopStep(
           );
           return { index: closest.s?.index ?? 0, name: closest.s?.name, item: e.item };
         });
-      const cursorHoldingItem = cp.cursorItemSignature
-        ? "(unknown item)"
-        : cp.cursorHoldingMut === true ? "(holding something)" : null;
+      const cursorHoldingItem = cp.cursorItemSignature ? "(unknown item)" : null;
       const { runPlanner } = await import("./subagents/fastUi/Planner");
       const markedObs = markedObsForLLMs ?? payload.obs;
       const rj = await runPlanner({ client: deps.client, model: deps.model, recordDebug: deps.recordDebug }, {
         taskText: state.taskText,
         recipeInfo: cp.recipeOverride,
         knownSlots: knownSlotsForPlanner,
-        occupiedSlotIndices: cp.occupiedSlotIndices,
         cursorHolding: cursorHoldingItem,
         currentChecklist: cp.checklist,
         trigger: "post_action",
@@ -559,11 +404,10 @@ export async function runClosedLoopStep(
           // each disappeared item, scan all currently-occupied slots
           // not in memory to find where the item moved -- match by
           // RGB-mean distance to the disappeared item's fingerprint.
-          // disappearedItems remains as an empty hand-off to the
-          // legacy probe (Pass A's invalidate path is removed; a
-          // single noisy frame should never strip OCR-confirmed
-          // identity from slotMemory).
+          // Pass A staging: items invalidated in this probe; Pass B
+          // uses the saved fingerprints to find them at new slots.
           const disappearedItems: string[] = [];
+          const disappearedFps: Array<{ item: string; fp: { meanR: number; meanG: number; meanB: number; stddev: number } }> = [];
           for (const s of layoutForProbe.slots) {
             const mem = plan.slotMemory.lookup(s.cx, s.cy);
             if (!mem || mem.item === "empty" || mem.item === "unknown") continue;
@@ -574,8 +418,7 @@ export async function runClosedLoopStep(
             }
             if (!mem.fingerprint) {
               // Lazy baseline capture from the probe frame (no hover).
-              const hash = samplePatchDHash(payload.obs, s.cx, s.cy, 16);
-              plan.slotMemory.record(s.cx, s.cy, mem.item, mem.step, live, hash ?? undefined);
+              plan.slotMemory.record(s.cx, s.cy, mem.item, mem.step, live);
               console.log(`[agentbeats] fp baseline captured for slot ${s.index}(${s.name ?? "?"}) item='${mem.item}' meanRGB=(${live.meanR.toFixed(0)},${live.meanG.toFixed(0)},${live.meanB.toFixed(0)}) stddev=${live.stddev.toFixed(1)}`);
               knownSlots.push({ index: s.index, name: s.name, item: mem.item, ageIters: plan.iteration - mem.step });
               continue;
@@ -586,16 +429,24 @@ export async function runClosedLoopStep(
             const distFromBaseline = Math.sqrt(dr * dr + dg * dg + db * db);
             const liveLum = (live.meanR + live.meanG + live.meanB) / 3;
             const liveLooksEmpty = live.stddev < 20 && liveLum > 120 && liveLum < 160;
-            // Pass A's old "disappeared" invalidate path was removed:
-            // a single noisy frame (distFromBaseline > 40 +
-            // liveLooksEmpty) should NOT strip an OCR-confirmed
-            // identity. The body-top resolver runs the strict
-            // two-pass migration protocol (only updates on positive
-            // evidence at BOTH old and new positions), and the click
-            // verifier handles intentional moves directly. Items
-            // don't move when no action was taken — slotMemory
-            // entries stay sticky.
-            void distFromBaseline; void liveLooksEmpty;
+            // Pass A: probe-time disappearance scan (baseline 6398f3f
+            // contract). The slot's CV-live patch drifted FAR from
+            // its OCR-time fingerprint AND visually looks like the
+            // empty-slot grey band → the item left this slot.
+            // Invalidate the entry and stage the disappeared identity
+            // for Pass B's appearance match. Runs ONLY at probe time
+            // (cursor parked, no hover highlight contamination), so
+            // a single-frame trigger is safe — Pass A doesn't fire
+            // mid-chain. Disabling this scan was the regression vs
+            // baseline: source slots stayed "filled" in slotMemory
+            // long after the agent picked from them.
+            if (distFromBaseline > 40 && liveLooksEmpty) {
+              disappearedItems.push(mem.item);
+              if (mem.fingerprint) disappearedFps.push({ item: mem.item, fp: mem.fingerprint });
+              plan.slotMemory.invalidate(s.cx, s.cy);
+              console.log(`[agentbeats] item disappeared: '${mem.item}' was at slot ${s.index}(${s.name ?? "?"}) -- dist=${distFromBaseline.toFixed(1)} liveLum=${liveLum.toFixed(1)} live.stddev=${live.stddev.toFixed(1)}`);
+              continue;
+            }
             knownSlots.push({ index: s.index, name: s.name, item: mem.item, ageIters: plan.iteration - mem.step });
           }
           // Pass B: filled-slot identification. For every detected
@@ -653,8 +504,7 @@ export async function runClosedLoopStep(
                 if (dist < bestDist) { bestDist = dist; bestItem = k.item; }
               }
               if (bestItem && bestDist < 30) {
-                const hash = samplePatchDHash(payload.obs, s.cx, s.cy, 16);
-                plan.slotMemory.record(s.cx, s.cy, bestItem, plan.iteration, live, hash ?? undefined);
+                plan.slotMemory.record(s.cx, s.cy, bestItem, plan.iteration, live);
                 knownSlots.push({ index: s.index, name: s.name, item: bestItem, ageIters: 0 });
                 slotUpdates.push(`slot ${s.index}${s.name ? `(${s.name})` : ""} now has ${bestItem}`);
                 console.log(`[agentbeats] slot ${s.index}(${s.name ?? "?"}) matched to known item '${bestItem}' by fingerprint (dist=${bestDist.toFixed(1)})`);
@@ -694,9 +544,7 @@ export async function runClosedLoopStep(
             const layoutForAction = layoutForProbe.slots.map((s) => ({
               index: s.index, name: s.name, role: s.role,
             }));
-            const cursorHoldingItem = plan.cursorItemSignature
-              ? "(unknown item)"
-              : plan.cursorHoldingMut === true ? "(holding something)" : null;
+            const cursorHoldingItem = plan.cursorItemSignature ? "(unknown item)" : null;
             const activeItem = plan.checklist[plan.activeChecklistIdx];
             activeItem.attempts = (activeItem.attempts ?? 0) + 1;
             // Reuse the SoM-labeled image computed once at the top of body.
@@ -704,7 +552,6 @@ export async function runClosedLoopStep(
             probed = await runAction({ client: deps.client, model: deps.model, recordDebug: deps.recordDebug }, {
               subtask: activeItem.task,
               knownSlots: knownForAction,
-              occupiedSlotIndices: plan.occupiedSlotIndices,
               layoutSlots: layoutForAction,
               recipeInfo: plan.recipeOverride,
               cursorHolding: cursorHoldingItem,
@@ -827,16 +674,13 @@ export async function runClosedLoopStep(
                     );
                     return { index: closest.s?.index ?? 0, name: closest.s?.name, item: e.item };
                   });
-                const cursorHoldingItem = plan.cursorItemSignature
-                  ? "(unknown item)"
-                  : plan.cursorHoldingMut === true ? "(holding something)" : null;
+                const cursorHoldingItem = plan.cursorItemSignature ? "(unknown item)" : null;
                 const { runPlanner } = await import("./subagents/fastUi/Planner");
                 const markedObs = markedObsForLLMs ?? payload.obs ?? "";
                 const r0 = await runPlanner({ client: deps.client, model: deps.model, recordDebug: deps.recordDebug }, {
                   taskText: state.taskText,
                   recipeInfo: r,
                   knownSlots: knownSlotsForPlanner,
-                  occupiedSlotIndices: plan.occupiedSlotIndices,
                   cursorHolding: cursorHoldingItem,
                   currentChecklist: [],
                   trigger: "first",
@@ -1507,52 +1351,21 @@ export async function runClosedLoopStep(
             // plan correctly marks the step [DONE -- skip]. Without
             // this, Known never updates from a place success and the
             // probe re-emits the same place every iteration.
-            if ((pc.actionKind === "place_one" || pc.actionKind === "place_all") && pc.placedItemName) {
-              // Capture destination fp+hash NOW so the resolver tracks
-              // this placement on subsequent frames.
-              const dstFp = samplePatchFingerprint(payload.obs, slotCenter.cx, slotCenter.cy, 6) ?? undefined;
-              const dstHash = samplePatchDHash(payload.obs, slotCenter.cx, slotCenter.cy, 16) ?? undefined;
-              // Similarity gate: if any existing slotMemory entry for
-              // placedItemName carries a baseline fp/hash (typically
-              // the source slot, which still holds the same item
-              // since most picks are place_one from a stack), compare
-              // it to what we just sampled at the destination. If the
-              // hash is far OR the fp is wildly different, the place
-              // didn't deposit what we thought (item swap, wrong slot,
-              // overwrote a different item) — log a warning and skip
-              // the slotMemory write so we don't poison Known with a
-              // wrong identity. If no source baseline exists, trust
-              // the click verifier and write unconditionally.
-              // Loose thresholds — same item rendered in different
-              // cell sizes (hotbar vs craft cell) diverges to ham ~30
-              // even though it's clearly the same block. Tighter
-              // thresholds were rejecting legitimate cob/quartz
-              // placements and leaving slotMemory empty at the
-              // destination, which then poisoned downstream prompts
-              // with "unknown item" for the just-placed ingredient.
-              const HAMMING_OK = 36;
-              const FP_OK = 50;
-              let acceptWrite = true;
-              const sources = plan.slotMemory.snapshot()
-                .filter((e) => e.item === pc.placedItemName && (e.hash !== undefined || e.fingerprint));
-              if (sources.length > 0 && dstFp && dstHash !== undefined) {
-                const hasMatch = sources.some((src) => {
-                  const ham = src.hash !== undefined ? dHashDistance(src.hash, dstHash) : 999;
-                  const fd = src.fingerprint
-                    ? Math.hypot(dstFp.meanR - src.fingerprint.meanR, dstFp.meanG - src.fingerprint.meanG, dstFp.meanB - src.fingerprint.meanB)
-                    : 999;
-                  return ham <= HAMMING_OK || fd < FP_OK;
-                });
-                acceptWrite = hasMatch;
-                if (!hasMatch) {
-                  console.warn(`[agentbeats] place verify similarity FAIL: placed='${pc.placedItemName}' but dst pattern doesn't match any tracked baseline; skipping slotMemory write`);
-                }
-              }
-              if (acceptWrite) {
-                plan.slotMemory.record(slotCenter.cx, slotCenter.cy, pc.placedItemName, plan.iteration, dstFp, dstHash);
-                console.log(`[agentbeats] slotMemory write on place verify: slot=${pc.rasterIndex}(${pc.slotName ?? "?"}) item=${pc.placedItemName}${dstHash !== undefined ? ` hash=${dstHash.toString(16).slice(0, 8)}` : ""}`);
-              }
-            }
+            // Baseline 6398f3f contract: click verify does NOT write
+            // slotMemory at the destination. The next probe's Pass B
+            // appearance scan finds the new occupant by fingerprint
+            // match against still-known item baselines, then records
+            // it. Writing here was problematic in two ways:
+            //   - same-item-different-cell-size hash divergence made
+            //     a similarity gate either reject legit placements
+            //     (HAMMING_OK=24) or accept misplacements (HAMMING_OK
+            //     too loose).
+            //   - bypassing Pass B meant invalidate→appear identity
+            //     linkage broke: the source slot's invalidation no
+            //     longer paired with the destination's fill, so the
+            //     appearance match never ran on subsequent frames.
+            // The cursorItemSignature update below carries cursor
+            // identity across the chain in the meantime.
             // Record / clear cursorItemSignature based on this click:
             //   pickup OK  -> cursor now carries the item from the source slot.
             //                Capture the source's prePatch RGB as the signature.

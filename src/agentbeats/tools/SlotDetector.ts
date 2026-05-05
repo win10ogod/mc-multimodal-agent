@@ -599,76 +599,6 @@ export function samplePatchFingerprint(
   return { meanR, meanG, meanB, stddev: Math.sqrt(varSum / n) };
 }
 
-/** Perceptual hash of a slot patch (dHash, 64-bit). Captures spatial
- *  texture at the slot center: each bit compares adjacent grayscale
- *  cells in a 9×8 grid. Two patches showing the same item yield very
- *  close hashes (Hamming distance 0–4); patches with the same mean
- *  RGB but different items (a common Minecraft case — many block
- *  textures share a grey/brown palette but differ in pixel layout)
- *  diverge to Hamming distance 12+. Use a loose threshold (≤16 of 64)
- *  for "same item" matching across frames. */
-export function samplePatchDHash(
-  jpegBase64: string,
-  cx: number,
-  cy: number,
-  size = 16,
-): bigint | null {
-  const cleaned = jpegBase64.startsWith("data:image/")
-    ? jpegBase64.replace(/^data:image\/[a-z]+;base64,/, "")
-    : jpegBase64;
-  let decoded;
-  try {
-    decoded = jpeg.decode(Buffer.from(cleaned, "base64"), { useTArray: true, formatAsRGBA: true });
-  } catch {
-    return null;
-  }
-  const { width: w, height: h, data } = decoded;
-  const half = Math.floor(size / 2);
-  // 9×8 grayscale grid. Each cell averages a (size/9 × size/8) sub-block.
-  const cols = 9, rows = 8;
-  const cellW = size / cols, cellH = size / rows;
-  const grid = new Float32Array(cols * rows);
-  const cnt = new Uint16Array(cols * rows);
-  const x0 = cx - half, y0 = cy - half;
-  for (let dy = 0; dy < size; dy += 1) {
-    const y = y0 + dy;
-    if (y < 0 || y >= h) continue;
-    const rowIdx = Math.min(rows - 1, Math.floor(dy / cellH));
-    for (let dx = 0; dx < size; dx += 1) {
-      const x = x0 + dx;
-      if (x < 0 || x >= w) continue;
-      const colIdx = Math.min(cols - 1, Math.floor(dx / cellW));
-      const i = (y * w + x) * 4;
-      const lum = 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2];
-      grid[rowIdx * cols + colIdx] += lum;
-      cnt[rowIdx * cols + colIdx] += 1;
-    }
-  }
-  for (let i = 0; i < grid.length; i += 1) {
-    if (cnt[i] > 0) grid[i] /= cnt[i];
-  }
-  // dHash: for each row, compare adjacent cells horizontally.
-  let hash = 0n;
-  for (let r = 0; r < rows; r += 1) {
-    for (let c = 0; c < cols - 1; c += 1) {
-      hash <<= 1n;
-      if (grid[r * cols + c] > grid[r * cols + c + 1]) hash |= 1n;
-    }
-  }
-  return hash;
-}
-
-/** Hamming distance between two 64-bit dHashes (popcount of XOR). */
-export function dHashDistance(a: bigint, b: bigint): number {
-  let x = a ^ b;
-  let n = 0;
-  while (x !== 0n) {
-    n += Number(x & 1n);
-    x >>= 1n;
-  }
-  return n;
-}
-
 /** Debug variant: return ALL plausible cursor components (useful for
  *  triaging false positives during calibration). */
 export function detectCursorCandidates(
@@ -946,17 +876,10 @@ function annotateWithLayout(
   //    covers slots with items in them (icon darkens slot interior past
   //    our threshold) -- we still have the layout's pixel center.
   const out: GuiSlot[] = [];
-  // Discovered + matched slots: keep CV centroid AND CV bbox size.
-  // The bbox size carries an occupancy signal — slots with item icons
-  // have a smaller dark-grey interior than empty slots, so their
-  // connected-component bbox shrinks. Downstream isFilled() compares
-  // bbox area to the median to derive occupancy without needing
-  // chroma/stddev. Backfilled slots (no cv match at all) use the
-  // median slotPx since we have no per-slot bbox to inspect.
-  const slotPx = Math.max(8, Math.round(disc.slotPx));
+  // Discovered + matched slots: keep original cv positions but tag with name/role
   for (const m of matched) {
     out.push({
-      index: 0,
+      index: 0,  // assigned after raster sort
       cx: m.disc.cx,
       cy: m.disc.cy,
       w: m.disc.w,
@@ -965,9 +888,11 @@ function annotateWithLayout(
       role: layoutScreen[m.layoutIdx].role,
     });
   }
+  // Backfilled layout slots: use layout's predicted pixel center, default size.
   for (let i = 0; i < layoutScreen.length; i += 1) {
     if (matchedLayout.has(i)) continue;
     const ls = layoutScreen[i];
+    const slotPx = Math.max(8, Math.round(disc.slotPx));
     out.push({
       index: 0,
       cx: ls.p.x,
@@ -977,11 +902,6 @@ function annotateWithLayout(
       name: ls.name,
       role: ls.role,
     });
-  }
-  // Unmatched discovered components (probably spurious or modded extras):
-  // keep them anonymous so the agent can still see them.
-  for (const u of unmatched) {
-    out.push({ index: 0, cx: u.cx, cy: u.cy, w: u.w, h: u.h });
   }
   // Unmatched discovered components (probably spurious or modded extras):
   // keep them anonymous so the agent can still see them.
@@ -1004,32 +924,6 @@ function annotateWithLayout(
     else rows.push([s]);
   }
   for (const row of rows) row.sort((a, b) => a.cx - b.cx);
-  // Per-row outlier snap. Empty slots are well-aligned to the inventory
-  // grid; only filled slots have shrunken cv bboxes that drift cy by
-  // 2-5 px (item icon pulls the centroid). For each row, take the
-  // median bbox area as the row's "true" empty-slot size; any slot
-  // whose area is significantly smaller is filled — snap its cy to
-  // the row's median cy AND expand its w/h to the row median so
-  // downstream sampling/SoM rendering treats it identically to its
-  // empty neighbors. Don't touch slots that already match the row
-  // norm — they're empty and well-aligned.
-  for (const row of rows) {
-    if (row.length < 3) continue;
-    const ys = row.map((s) => s.cy).sort((a, b) => a - b);
-    const ws = row.map((s) => s.w).sort((a, b) => a - b);
-    const hs = row.map((s) => s.h).sort((a, b) => a - b);
-    const medianCy = ys[Math.floor(ys.length / 2)];
-    const medianW = ws[Math.floor(ws.length / 2)];
-    const medianH = hs[Math.floor(hs.length / 2)];
-    const medianArea = medianW * medianH;
-    for (const s of row) {
-      if (s.w * s.h < medianArea * 0.85) {
-        s.cy = medianCy;
-        s.w = medianW;
-        s.h = medianH;
-      }
-    }
-  }
   out.length = 0;
   for (const s of rows.flat()) out.push(s);
   out.forEach((s, i) => { s.index = i; });
@@ -1218,3 +1112,4 @@ export function detectGuiLayout(
     cursorOpenCenter: disc.cursorOpenCenter,
   };
 }
+
