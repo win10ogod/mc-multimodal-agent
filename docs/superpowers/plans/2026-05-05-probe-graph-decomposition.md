@@ -1,21 +1,36 @@
-# Probe-Graph Decomposition Plan
+# Probe Plan-Step Refactor
 
 > **For agentic workers:** REQUIRED SUB-SKILL: superpowers:subagent-driven-development.
 
-**Goal:** Split the monolithic `probeNextCraftAction` LLM call into TWO small, role-focused agents (PlanJudge / Action) connected by a deterministic state machine, eliminating prompt-pollution-induced over-cycling.
+**Goal:** Decompose the closed-loop into a Planner (owns step list, observes results, decides done) + a single-step Action agent. Planner re-runs after every chain-end to tick checkboxes; Action only ever does ONE step per call, with a tiny prompt and no plan visibility.
 
-**Architecture:**
+**Architecture (two agents; Planner orchestrates):**
 ```
-recipe_lookup → INSPECT → PLAN_JUDGE ─┬─[continue]→ EXECUTE one [ ] subtask ─┐
-       (initial plan build)           │                                       │
-                                       └─[all_done]→ subgoal_done             │
-                                       ▲                                      │
-                                       └──── chain-end (take from result) ────┘
+recipe_lookup
+   │ (rule-based seed of initial Subtask[])
+   ▼
+[PLANNER] LLM observes frame + Known + current Subtask[]:
+   │   - applies step_updates (ticks [x] based on what it sees)
+   │   - returns { all_done } OR { next_subtask_idx }
+   ▼
+   ├─ all_done=true → emit subgoal_done
+   │
+   └─ pick next [ ] subtask
+       ▼
+   [ACTION] LLM (slim prompt, ONE subtask only):
+      in: { subtask, Known, frame }
+      out: concrete move/verify_slots/done-for-this-step
+       ▼
+   runtime executes click chain → verify
+       ▼
+   loop back to PLANNER on chain-end (no chain pending)
 ```
 
 **Two LLM agents:**
-- **PlanJudge** — owns the plan AND judges its progress. Fires at: (a) recipe_lookup resolved (build initial plan), (b) chain-end when source was a `role==="result"` slot (post-take re-judge). Sees recipe + Known + frame + current plan. Outputs: full updated `Subtask[]` with `[x] / [ ]` markers + `all_done` bool.
-- **Action** — per-subtask, executes ONE [ ] step. Sees ONE subtask + Known + frame. Outputs concrete `move` or `verify_slots`.
+- **Planner** — sees full step list + frame + Known. Owns checklist. Decides what to do next OR done. Runs once per chain-end.
+- **Action** — sees ONE subtask + Known + frame. Returns ONE atomic move (or verify_slots / fallback). Cannot see the rest of the plan, cannot judge completion. Runs once per dispatched subtask.
+
+**Why two:** Action's narrow context kills hallucinated cross-step assumptions; Planner has the bird's-eye view to update the checklist correctly.
 
 **Tech Stack:** TypeScript, OpenAI Chat Completions, existing `SlotMemory` / `lookupRecipe` / `vlmVerifySlotState`.
 
