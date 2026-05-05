@@ -409,7 +409,7 @@ export async function probeNextCraftAction(opts: {
           const tag = stepStates[i].done ? " [DONE -- skip]" : (i === nextStep ? " [NEXT]" : "");
           lines.push(`  Step ${i + 1}: place at ${slotRef} = ${p.ingredient}${tag}`);
         }
-        lines.push(`Steps marked [DONE -- skip] are already verified by CV -- do NOT re-emit. Execute the [NEXT] step. Resolve by finding the source slot in "Known" matching the ingredient (handle naming variants like "quartz" <-> "nether_quartz"), then emit move{from=<source slot>, to=<dest slot from above>, count:"one"}. After all steps, take the crafted result from the result slot.`);
+        lines.push(`Steps marked [DONE -- skip] are already verified by CV -- do NOT re-emit. Execute the [NEXT] step. Resolve by finding the source slot in "Known" matching the ingredient (handle naming variants like "quartz" <-> "nether_quartz"), then emit move{from=<source slot>, to=<dest slot from above>, count:"one"}. After all 4 steps complete and the crafted result appears in the result slot, take it: emit move{from=<result slot>, to=<EMPTY hotbar or main_inv slot>, count:"all"}. CRITICAL: the destination MUST be a slot that is NOT already in Known slot contents -- placing onto an already-occupied slot triggers a swap and corrupts state. Pick a slot index that does NOT appear in Known.`);
       }
     }
     return lines.join("\n");
