@@ -1026,11 +1026,12 @@ export class McuVisualPolicy {
               const dg = live.meanG - mem.fingerprint.meanG;
               const db = live.meanB - mem.fingerprint.meanB;
               const distFromBaseline = Math.sqrt(dr * dr + dg * dg + db * db);
-              const stddevDrop = mem.fingerprint.stddev - live.stddev;
-              if (distFromBaseline > 40 && stddevDrop > 25 && live.stddev < 25) {
+              const liveLum = (live.meanR + live.meanG + live.meanB) / 3;
+              const liveLooksEmpty = live.stddev < 20 && liveLum > 120 && liveLum < 160;
+              if (distFromBaseline > 40 && liveLooksEmpty) {
                 disappearedItems.push(mem.item);
                 plan.slotMemory.invalidate(s.cx, s.cy);
-                console.log(`[agentbeats] item disappeared: '${mem.item}' was at slot ${s.index}(${s.name ?? "?"}) -- dist=${distFromBaseline.toFixed(1)} stddevDrop=${stddevDrop.toFixed(1)} live.stddev=${live.stddev.toFixed(1)}`);
+                console.log(`[agentbeats] item disappeared: '${mem.item}' was at slot ${s.index}(${s.name ?? "?"}) -- dist=${distFromBaseline.toFixed(1)} liveLum=${liveLum.toFixed(1)} live.stddev=${live.stddev.toFixed(1)}`);
                 continue;
               }
               knownSlots.push({ index: s.index, name: s.name, item: mem.item, ageIters: plan.iteration - mem.step });
@@ -1235,7 +1236,14 @@ export class McuVisualPolicy {
                 const needOcr: typeof queue = [];
                 for (const q of queue) {
                   const patch = samplePatchFingerprint(payload.obs, q.x, q.y, 6);
-                  if (patch && patch.stddev < 25) cvEmpty.push(q);
+                  // Stricter CV-empty: low stddev AND mid-gray
+                  // luminance. A pale item (e.g. nether quartz) has
+                  // low stddev but luminance ~190 -- without the band
+                  // check the fast-path falsely marks it empty and
+                  // skips OCR.
+                  const lum = patch ? (patch.meanR + patch.meanG + patch.meanB) / 3 : 0;
+                  const inEmptyBand = lum > 120 && lum < 160;
+                  if (patch && patch.stddev < 25 && inEmptyBand) cvEmpty.push(q);
                   else needOcr.push(q);
                 }
                 // Record CV-empty results immediately; no servo needed.
