@@ -204,6 +204,45 @@ export async function runClosedLoopStep(
       const cursor = detectCursorWithExpectation(payload.obs, layout, null);
       plan.cursor = cursor ?? plan.cursor;
 
+      // Servo test mode: AGENTBEATS_SERVO_TEST=1 disables LLM /
+      // Planner / Action and just cycles a hover-only pendingClick
+      // through every hotbar+main_inv+craft slot. The trajectory
+      // logger captures (cam, cursor) pairs each frame for offline
+      // system identification (px-per-deg, deadzone boundaries,
+      // CV-failure rates). No actual clicks are issued — kind=hover
+      // exits the click servo before pressing attack/use.
+      if (process.env.AGENTBEATS_SERVO_TEST === "1") {
+        const servoTest = (plan as unknown as { servoTestState?: { idx: number; targets: number[] } }).servoTestState
+          ?? (() => {
+            const targets = layout.slots
+              .filter((s) => s.role === "hotbar" || s.role === "main_inv" || s.role === "craft_2x2" || s.role === "craft_3x3")
+              .map((s) => s.index);
+            const init = { idx: 0, targets };
+            (plan as unknown as { servoTestState: typeof init }).servoTestState = init;
+            console.log(`[servo-test] init: ${targets.length} target slots queued`);
+            return init;
+          })();
+        if (plan.pendingClick === null) {
+          if (servoTest.idx >= servoTest.targets.length) {
+            console.log(`[servo-test] all targets visited (${servoTest.targets.length}); ending session`);
+            plan.done = true;
+            state.earlyStop = true;
+            return { kind: "subgoal_done", summary: "servo-test complete" };
+          }
+          const targetSlot = layout.slots[servoTest.targets[servoTest.idx]];
+          servoTest.idx += 1;
+          plan.pendingClick = {
+            rasterIndex: targetSlot.index, slotName: targetSlot.name, slotRole: targetSlot.role,
+            frozenTarget: { x: targetSlot.cx, y: targetSlot.cy },
+            button: "attack", shift: false, expectAfter: "should_fill",
+            phase: "servo", retries: 0, kind: "hover" as "click",
+            actionKind: "pickup" as "pickup",
+          };
+          plan.servoSteps = 0;
+          console.log(`[servo-test] target ${servoTest.idx}/${servoTest.targets.length}: slot ${targetSlot.index}(${targetSlot.name ?? "?"}) at (${targetSlot.cx},${targetSlot.cy})`);
+        }
+      }
+
       // Park the cursor in a clear left-side spot before each new
       // probe. This is REQUIRED so the VLM can clearly see whether
       // the cursor is carrying an item (held-item icon overlays the
