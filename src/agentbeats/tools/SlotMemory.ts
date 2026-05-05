@@ -31,15 +31,26 @@ export type SlotMemoryEntry = {
   hash?: bigint;
 };
 
-const MATCH_RADIUS_PX = 8;
+/** Tolerance for LOOKUP — slot centers can drift 2–5 px between
+ *  layout detections (CV centroid jitter, row-median snap). 8 px is
+ *  comfortable inside the 18 px slot stride. */
+export const MATCH_RADIUS_PX = 8;
+/** Tolerance for WRITE — must be tighter than the slot stride / 2
+ *  to prevent record() from clobbering an adjacent slot's entry
+ *  when caller's coords are slightly off. 3 px ≈ "same physical
+ *  slot center"; anything further creates a NEW entry. */
+const WRITE_RADIUS_PX = 3;
 const STALE_STEPS = 80;
 
 export class SlotMemory {
   private entries: SlotMemoryEntry[] = [];
 
-  /** Record (or update) what is at an absolute pixel position. */
+  /** Record (or update) what is at an absolute pixel position.
+   *  Uses a tighter radius than lookup to avoid clobbering an
+   *  adjacent slot's entry when the caller's (x,y) is a few pixels
+   *  off from the recorded position. */
   record(x: number, y: number, item: string, step: number, fingerprint?: SlotMemoryEntry["fingerprint"], hash?: bigint): void {
-    const idx = this.findClosestIndex(x, y);
+    const idx = this.findClosestIndex(x, y, WRITE_RADIUS_PX);
     if (idx >= 0) {
       const prev = this.entries[idx];
       this.entries[idx] = { x, y, item, step, fingerprint: fingerprint ?? prev.fingerprint, hash: hash ?? prev.hash };
@@ -51,7 +62,7 @@ export class SlotMemory {
   /** Look up the remembered item at an absolute position, if any.
    *  Returns null when no entry is within MATCH_RADIUS_PX. */
   lookup(x: number, y: number): SlotMemoryEntry | null {
-    const idx = this.findClosestIndex(x, y);
+    const idx = this.findClosestIndex(x, y, MATCH_RADIUS_PX);
     return idx >= 0 ? this.entries[idx] : null;
   }
 
@@ -79,9 +90,9 @@ export class SlotMemory {
     this.entries = [];
   }
 
-  private findClosestIndex(x: number, y: number): number {
+  private findClosestIndex(x: number, y: number, radiusPx: number = MATCH_RADIUS_PX): number {
     let best = -1;
-    let bestD2 = MATCH_RADIUS_PX * MATCH_RADIUS_PX;
+    let bestD2 = radiusPx * radiusPx;
     for (let i = 0; i < this.entries.length; i += 1) {
       const e = this.entries[i];
       const d2 = (e.x - x) * (e.x - x) + (e.y - y) * (e.y - y);

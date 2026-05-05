@@ -12,6 +12,7 @@ import {
 } from "../tools/UiFastControl";
 import { probeNextCraftAction, vlmVerifySlotState } from "../tools/InventoryProbe";
 import { detectCursorWithExpectation, detectGuiLayout, samplePatchFingerprint, samplePatchDHash, dHashDistance } from "../tools/SlotDetector";
+import { MATCH_RADIUS_PX } from "../tools/SlotMemory";
 import { repairDecisionForTask, shouldUseModelOnStep } from "../McuPolicyUtils";
 import type { UiFastControlFrame } from "../tools/UiFastControl";
 
@@ -197,19 +198,17 @@ export async function runClosedLoopStep(
       // of the cursor — hover highlight contaminates both signals.
       // Only sample dHash for slots that pass the chroma fill gate, so
       // the matcher never burns hash comparisons against empty slots.
-      // Bbox-size occupancy: items shrink the dark-grey slot interior
-      // bbox (the icon occludes most of it). Slots whose CV bbox is
-      // significantly smaller than the median neighbor are likely
-      // occupied — a pure-CV signal independent of color/chroma.
-      const allAreas = layoutForMut.slots.map((s) => s.w * s.h).filter((a) => a > 0).sort((a, b) => a - b);
-      const medianArea = allAreas.length > 0 ? allAreas[Math.floor(allAreas.length / 2)] : 0;
+      // Note: the bbox-area-vs-median fallback was removed — it was
+      // dead code because SlotDetector's row-median snap forces every
+      // matched slot's w/h to the row median (so s.w*s.h == medianArea
+      // always). Pure-grey items are caught by isFilled's lum/stddev
+      // path, not by bbox shrinkage.
       const slotSigs: Array<{ index: number; cx: number; cy: number; fp: Fp; hash: bigint }> = [];
       for (const s of layoutForMut.slots) {
         if (cursorNow && Math.hypot(s.cx - cursorNow.x, s.cy - cursorNow.y) < 12) continue;
         const fp = samplePatchFingerprint(payload.obs, s.cx, s.cy, 6);
         if (!fp) continue;
-        const bboxOccluded = medianArea > 0 && s.w * s.h < medianArea * 0.7;
-        if (!isFilled(fp, s.role) && !bboxOccluded) continue;
+        if (!isFilled(fp, s.role)) continue;
         const hash = samplePatchDHash(payload.obs, s.cx, s.cy, 16);
         if (hash === null) continue;
         slotSigs.push({ index: s.index, cx: s.cx, cy: s.cy, fp, hash });
@@ -217,15 +216,15 @@ export async function runClosedLoopStep(
       // Coord→id projection: only slots that are filled AND we don't
       // already have an identity for. slotMemory is the persistent
       // truth for OCR-confirmed items — never override its names with
-      // CV "unknown item" noise. The occupiedSlotIndices list is
-      // therefore reserved for genuinely-new occupants the agent
-      // hasn't named yet (e.g., a freshly crafted item appearing in
-      // the result slot).
+      // CV "unknown item" noise. Use the same MATCH_RADIUS_PX as
+      // SlotMemory.lookup so a CV-detected slot whose center sits up
+      // to 8 px from a recorded entry won't double-emit as both
+      // known and "unknown item".
       const knownPositions = cp.slotMemory.snapshot()
         .filter((e) => e.item !== "empty" && e.item !== "unknown")
         .map((e) => ({ x: e.x, y: e.y }));
       cp.occupiedSlotIndices = slotSigs
-        .filter((s) => !knownPositions.some((k) => Math.hypot(k.x - s.cx, k.y - s.cy) < 6))
+        .filter((s) => !knownPositions.some((k) => Math.hypot(k.x - s.cx, k.y - s.cy) < MATCH_RADIUS_PX))
         .map((s) => s.index);
       // Debug: dump the raw obs once per iteration so the resolver's
       // input can be inspected offline. MC's JPEG bytes come out of
