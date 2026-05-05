@@ -66,36 +66,68 @@ Output strict JSON, one action only:
 
 let ACTION_CALL_SEQ = 0;
 
-export async function runAction(deps: ActionDeps, input: ActionInput): Promise<CraftAction> {
-  // Compact context. Listing all 48 layout slots wastes tokens and
-  // distracts the model — Action mainly needs role→indices to find
-  // craft cells / result, and slot_state for occupancy.
+function summarizeRange(indices: number[]): string {
+  if (indices.length === 0) return "";
+  const sorted = [...indices].sort((a, b) => a - b);
+  const out: string[] = [];
+  let s = sorted[0], e = sorted[0];
+  for (let i = 1; i < sorted.length; i += 1) {
+    if (sorted[i] === e + 1) { e = sorted[i]; continue; }
+    out.push(s === e ? `${s}` : `${s}..${e}`);
+    s = sorted[i]; e = sorted[i];
+  }
+  out.push(s === e ? `${s}` : `${s}..${e}`);
+  return out.join(", ");
+}
+
+function buildActionUserText(input: ActionInput): string {
   const knownByIdx = new Map(input.knownSlots.map((s) => [s.index, s.item]));
   const allOccupied = new Set<number>([
     ...input.knownSlots.map((s) => s.index),
     ...input.occupiedSlotIndices,
   ]);
-  const slotState = [...allOccupied]
+  const slotLines = [...allOccupied]
     .sort((a, b) => a - b)
-    .map((i) => ({ index: i, item: knownByIdx.get(i) ?? "unknown item" }));
-  const slotsByRole: Record<string, number[]> = {};
+    .map((i) => `  ${i} -> ${knownByIdx.get(i) ?? "unknown item"}`);
+  const slotBlock = slotLines.length > 0 ? slotLines.join("\n") : "  (all slots empty)";
+  const byRole: Record<string, number[]> = {};
   for (const s of input.layoutSlots) {
     const role = s.role ?? "other";
-    (slotsByRole[role] ??= []).push(s.index);
+    (byRole[role] ??= []).push(s.index);
   }
-  const userPayload = {
-    subtask: input.subtask,
-    slot_state: slotState,
-    slots_by_role: slotsByRole,
-    recipe: input.recipeInfo
-      ? {
-          target: input.recipeInfo.target,
-          ingredients: input.recipeInfo.ingredients,
-          inShape: input.recipeInfo.inShape,
-        }
-      : null,
-    cursor_holding: input.cursorHolding,
-  };
+  // Order roles so the most action-relevant ones come first.
+  const roleOrder = ["craft_2x2", "craft_3x3", "result", "hotbar", "main_inv", "offhand", "armor", "other"];
+  const roleLines = roleOrder
+    .filter((r) => byRole[r])
+    .map((r) => `  ${r}: ${summarizeRange(byRole[r])}`);
+  const cursorBlock = input.cursorHolding ?? "(empty)";
+  const subtask = input.subtask;
+  const subtaskLine = (() => {
+    switch (subtask.kind) {
+      case "verify_items_visible": return `verify_items_visible items=[${subtask.items.join(", ")}]`;
+      case "place_in_craft_grid":  return `place_in_craft_grid item=${subtask.item}`;
+      case "take_result":          return `take_result expectedItem=${subtask.expectedItem}`;
+      case "wait_for_output":      return `wait_for_output expectedItem=${subtask.expectedItem}`;
+      case "verify_state":         return `verify_state condition=${subtask.condition}`;
+    }
+  })();
+  const recipeBlock = input.recipeInfo
+    ? `Recipe: ${input.recipeInfo.target}\n  ingredients: ${input.recipeInfo.ingredients.map((it) => `${it.count}x ${it.name}`).join(" + ")}\n  inShape: ${JSON.stringify(input.recipeInfo.inShape)}`
+    : "Recipe: (none)";
+  return `Subtask: ${subtaskLine}
+
+Slot state (slots not listed are empty / not yet inspected):
+${slotBlock}
+Cursor: ${cursorBlock}
+
+Slots by role:
+${roleLines.join("\n")}
+
+${recipeBlock}`;
+}
+
+export async function runAction(deps: ActionDeps, input: ActionInput): Promise<CraftAction> {
+  const userText = buildActionUserText(input);
 
   const seq = String(++ACTION_CALL_SEQ).padStart(5, "0");
   const debugDir = process.env.AGENTBEATS_DEBUG_DIR;
@@ -105,7 +137,7 @@ export async function runAction(deps: ActionDeps, input: ActionInput): Promise<C
       const fs = require("node:fs") as typeof import("node:fs");
       // eslint-disable-next-line @typescript-eslint/no-require-imports
       const pathMod = require("node:path") as typeof import("node:path");
-      const promptText = `[fastui-action ${seq}]\nSYSTEM:\n${SYS}\n\nUSER (JSON):\n${JSON.stringify(userPayload, null, 2)}\n`;
+      const promptText = `[fastui-action ${seq}]\nSYSTEM:\n${SYS}\n\nUSER:\n${userText}\n`;
       fs.writeFileSync(pathMod.join(debugDir, `fastui_action_${seq}_prompt.txt`), promptText);
       if (input.obsBase64) {
         const m = input.obsBase64.match(/^data:image\/([a-z]+);base64,(.+)$/);
@@ -129,7 +161,7 @@ export async function runAction(deps: ActionDeps, input: ActionInput): Promise<C
       {
         role: "user",
         content: [
-          { type: "text", text: JSON.stringify(userPayload) },
+          { type: "text", text: userText },
           { type: "image_url", image_url: { url: dataUrl, detail: "high" } },
         ],
       },
