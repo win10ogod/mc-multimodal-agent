@@ -300,7 +300,11 @@ export async function runClosedLoopStep(
             }
           }
         } else {
-        const PARK_STEP_CAP = 6;
+        // Park step cap. Adaptive servo (commit fbdf91b) uses smaller
+        // bins near target — cursor takes ~8 frames to reach park
+        // from screen-center vs ~5 frames at the old 2-deg bin. Bump
+        // the cap so park reliably arrives instead of giving up early.
+        const PARK_STEP_CAP = 16;
         // Park at the TOP-LEFT corner of the window. Cursor sprite
         // tip at (parkSpot) extends down-right ~10x14 px into the
         // window header area where no inventory slots live. The
@@ -1091,7 +1095,12 @@ export async function runClosedLoopStep(
         // approach), missing MC's effective hit region. Strict 5 px
         // threshold + 10-frame stuck cap matches the run that
         // achieved sim_score=1.0.
-        const SERVO_STEP_CAP = 10;
+        // Servo step cap. Was 10 with the 2-deg uniform bin (~17 px
+        // per step). Adaptive servo uses 0.25-deg final bins (~2 px
+        // per step) for precision landing — needs more frames to
+        // traverse the same distance. Bump to 20 so the click servo
+        // doesn't time out before reaching the slot's hit-region.
+        const SERVO_STEP_CAP = 20;
         const MAX_RETRIES = 4;
         const HIT_THRESHOLD_PX = 5;
 
