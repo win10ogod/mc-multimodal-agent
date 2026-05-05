@@ -420,7 +420,11 @@ export class McuVisualPolicy {
         const decision = this.config.agentbeats.useToolAgent
           ? await this.handleToolAgentObservation(contextId, payload as McuObservationPayload)
           : await this.handleObservation(contextId, payload as McuObservationPayload);
-        return JSON.stringify(toCompactMcuAgentActionPayload(decision.action));
+        const compact = toCompactMcuAgentActionPayload(decision.action);
+        if (decision.action.attack === 1 || decision.action.use === 1) {
+          console.log(`[agentbeats] EMIT click action: attack=${decision.action.attack} use=${decision.action.use} hold=${decision.hold_steps} compact=${JSON.stringify(compact)}`);
+        }
+        return JSON.stringify(compact);
       } catch (error) {
         return JSON.stringify({
           type: "ack",

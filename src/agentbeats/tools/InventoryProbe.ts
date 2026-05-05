@@ -443,6 +443,13 @@ export async function probeNextCraftAction(opts: {
       ? ["", "Slot transitions just detected (CV-tracked since last probe):", ...opts.slotUpdates.map((u) => `  - ${u}`)]
       : []),
     "",
+    ...(!knownSlotsText && recipeInfo
+      ? [
+          `MANDATORY FIRST STEP — confirm the materials before any move:`,
+          `  Known slot contents is EMPTY. Visual identification of items in inventory slots is unreliable (similar item icons, tinted backgrounds, occluded badges). You MUST emit a single verify_slots action covering up to 4 candidate slots that visually look like the recipe ingredients (${recipeInfo.ingredients.map((it) => it.name).join(", ")}). Hotbar first (cover ALL 9 hotbar slots in priority order). Do NOT emit any move action until at least one ingredient is confirmed in Known.`,
+          ``,
+        ]
+      : []),
     `The image has YELLOW NUMBERED BADGES drawn at the corner of each slot. Read the badge numbers directly from the image to choose a slot index.`,
     `When searching for an ingredient that is NOT yet in Known slot contents: scan the HOTBAR (the bottom row of slots) FIRST, then the MAIN INVENTORY (three rows above the hotbar). Tasks typically place ingredients in the hotbar at episode start, so the hotbar should be your primary search region. Cover ALL hotbar slots before assuming an ingredient is missing.`,
     "",

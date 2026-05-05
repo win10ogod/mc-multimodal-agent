@@ -135,8 +135,10 @@ export async function runPlannerLoop(
         return { kind: "done" };
       }
       if (fname === "dispatch_subgoal") {
-        await log("planner_dispatch", { hop, subgoal: fargs });
-        return { kind: "dispatch", subgoal: fargs as Subgoal };
+        const sg = fargs as Subgoal;
+        console.log(`[planner] DISPATCH ${sg.kind} <- "${sg.description}" (success: "${sg.success_criteria}")`);
+        await log("planner_dispatch", { hop, subgoal: sg });
+        return { kind: "dispatch", subgoal: sg };
       }
       const tool = stateBoundTools.find(t => t.name === fname);
       if (!tool) {
