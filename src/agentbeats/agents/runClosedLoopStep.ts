@@ -1155,12 +1155,20 @@ export async function runClosedLoopStep(
             return emit(defaultMcuAction());
           }
           // Click only when the cursor is actually INSIDE the slot's
-          // bbox. Servo as long as cursor is still making progress
-          // toward target; bail only if it stalls (lastErrMag - errMag
-          // < STUCK_DELTA) for STUCK_THRESHOLD consecutive steps.
+          // INNER hit-box. The previous +2 px buffer (slotHalfW =
+          // round(w/2) + 2) allowed cursor to land at the slot edge
+          // — which MC's internal hit-test sometimes assigned to the
+          // NEIGHBORING slot. The cursor "tip" pixel (at the cursor
+          // sprite's top-left from template detection) at slot edge
+          // crosses into neighbor territory because slots are 18 px
+          // apart with only 16 px of visible interior. Tighten to
+          // round(w/2) - 2 (≈6 px for a 16 px slot) so cursor must
+          // be CLEARLY inside before firing — eliminates the
+          // accidental swap with neighbor and the place_one click
+          // missing the destination.
           const slotForBox = layout!.slots[pc.rasterIndex];
-          const slotHalfW = Math.max(6, Math.round((slotForBox?.w ?? 16) / 2) + 2);
-          const slotHalfH = Math.max(6, Math.round((slotForBox?.h ?? 16) / 2) + 2);
+          const slotHalfW = Math.max(5, Math.round((slotForBox?.w ?? 16) / 2) - 2);
+          const slotHalfH = Math.max(5, Math.round((slotForBox?.h ?? 16) / 2) - 2);
           const cursorInsideSlot = !!cursor
             && Math.abs(cursor.x - slotCenter.cx) <= slotHalfW
             && Math.abs(cursor.y - slotCenter.cy) <= slotHalfH;

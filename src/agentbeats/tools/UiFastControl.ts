@@ -54,7 +54,12 @@ export type ProbeRequest = {
 const PX_PER_CAM_YAW = 8.5;
 const PX_PER_CAM_PITCH = 5.0;
 const PITCH_DEADZONE_MIN = 4;        // smallest pitch cmd that still produces visible cursor motion in the sim
-const CAM_BIN_DEG = 2;
+// Camera bin granularity. Was 2 deg → ~17 px per yaw step / ~10 px
+// per pitch step, which is too coarse for slot-precision clicking
+// (slots are 18 px apart; a single 17 px jump can land in the
+// neighbor's territory). 1 deg → ~8.5 px yaw / 5 px pitch, bringing
+// landing precision inside MC's slot hit-box.
+const CAM_BIN_DEG = 1;
 const MAX_CAM_DEG = 10;
 
 // Slot pixel centers when inventory GUI is open at 640x360 obs.
