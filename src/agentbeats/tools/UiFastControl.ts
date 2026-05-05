@@ -18,6 +18,7 @@
 import minecraftData from "minecraft-data";
 import { SlotMemory } from "./SlotMemory";
 import { defaultMcuAction, type McuEnvAction } from "../McuPrompt";
+import type { ChecklistItem } from "../agents/probeRoles/types";
 import type { GuiLayout } from "./SlotDetector";
 
 export type UiFastControlFrame = {
@@ -567,6 +568,19 @@ export type ClosedLoopCraftPlan = {
      *  the park position; OCR is suppressed in this phase. */
     parking: boolean;
   } | null;
+  /** Probe-graph step list owned by the Planner agent. Empty until
+   *  recipe_lookup resolves and the rule-based seed builds the initial
+   *  list. The Planner ticks `done` after each chain-end based on
+   *  observation; the Action agent receives one item at a time. */
+  checklist: ChecklistItem[];
+  /** Index of the [ ] item the Action agent is currently executing.
+   *  Cleared after a successful chain-end so the Planner can pick
+   *  the next [ ] on its next turn. */
+  activeChecklistIdx: number;
+  /** Set true on a chain-end where source slot was role==="result".
+   *  The runtime fires the Planner agent on the next entry to update
+   *  the checklist + judge completion. */
+  judgeAfterChain: boolean;
 };
 
 /** Servo control law: given current cursor + target slot pixel center,
@@ -676,6 +690,9 @@ export function planClosedLoopCraft(taskText: string): ClosedLoopCraftPlan {
     recentMatchedPickup: false,
     initialSlotBaselines: new Map(),
     recipeOverride: null,
+    checklist: [],
+    activeChecklistIdx: -1,
+    judgeAfterChain: false,
   };
 }
 
