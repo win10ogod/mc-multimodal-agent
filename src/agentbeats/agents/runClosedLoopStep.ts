@@ -103,11 +103,16 @@ export async function runClosedLoopStep(
     cp.judgeAfterChain = false;
     try {
       const knownForPlanner = cp.slotMemory.snapshot().map((e) => ({ index: 0, item: e.item }));
+      const sessionLayoutTyped = cp.sessionLayout as ReturnType<typeof detectGuiLayout> | null;
+      const layoutForPlanner = (sessionLayoutTyped?.slots ?? []).map((s) => ({
+        index: s.index, name: s.name, role: s.role,
+      }));
       const { runPlanner } = await import("./subagents/fastUi/Planner");
       const rj = await runPlanner({ client: deps.client, model: deps.model }, {
         taskText: state.taskText,
         recipeInfo: cp.recipeOverride,
         knownSlots: knownForPlanner,
+        layoutSlots: layoutForPlanner,
         currentChecklist: cp.checklist,
         trigger: "post_action",
         recentHistory: state.closedLoopHistory.slice(0, 3),
@@ -585,11 +590,15 @@ export async function runClosedLoopStep(
               console.log(`[agentbeats] recipe_lookup '${probed.item}' resolved: ingredients=${ingStr} inShape=${r.inShape ? "yes" : "no"}`);
               try {
                 const knownForPlanner = plan.slotMemory.snapshot().map((e) => ({ index: 0, item: e.item }));
+                const layoutForPlanner = (layoutForProbe.slots).map((s) => ({
+                  index: s.index, name: s.name, role: s.role,
+                }));
                 const { runPlanner } = await import("./subagents/fastUi/Planner");
                 const r0 = await runPlanner({ client: deps.client, model: deps.model }, {
                   taskText: state.taskText,
                   recipeInfo: r,
                   knownSlots: knownForPlanner,
+                  layoutSlots: layoutForPlanner,
                   currentChecklist: [],
                   trigger: "first",
                   recentHistory: state.closedLoopHistory.slice(0, 3),

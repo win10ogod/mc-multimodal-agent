@@ -15,6 +15,11 @@ export type PlannerInput = {
   recipeInfo: RecipeInfo | null;
   /** OCR-confirmed slot contents at this moment. */
   knownSlots: Array<{ index: number; name?: string; item: string }>;
+  /** GUI slot-index → role mapping for the currently open window. The
+   *  Planner uses this to set destSlotIndex correctly (e.g. slot 2 =
+   *  craft_2x2_0, slot 0 = armor_helmet). Without this the Planner
+   *  hallucinates dest indices. */
+  layoutSlots: Array<{ index: number; name?: string; role?: string }>;
   /** Empty on first invocation; otherwise the in-flight list. */
   currentChecklist: ChecklistItem[];
   /** "first" / "post_action" — drives prompt phrasing. */
@@ -61,8 +66,15 @@ Subtask kinds (GUI-agnostic primitives):
 - verify_state: { condition } — confirm-only step (no action), tick done when condition is observed.
 
 On the FIRST call (currentChecklist is empty):
-- For crafting tasks (recipeInfo present): decompose into verify_slots (if Known is sparse) → one move_one per ingredient unit (using the recipe's craft cells as destSlotIndex) → one move_all (taking the result to a free regular slot) → final verify_state ("target item visible in regular inventory").
-- For other GUIs: decompose appropriately based on the task text + frame.
+- For crafting tasks (recipeInfo present): decompose into a SHORT list. Use layout_slots to find slot indices by role:
+    * craft cells: role starts with "craft_2x2_" or "craft_3x3_" — these are valid placement destinations.
+    * result slot: role === "result" — the source for taking outputs.
+    * hotbar/main_inv: role starts with "hotbar_" or "main_inv_" — valid sources/destinations for stored items.
+    * armor/offhand: role like "armor_helmet"/"armor_chestplate"/"armor_boots"/"offhand" — NEVER use these as destSlotIndex.
+  Decomposition: skip verify_slots if Known already covers the ingredient items → one move_one per ingredient unit (destSlotIndex = a craft cell) → one move_all (sourceSlotIndex = result slot, destSlotIndex = a free hotbar/main_inv slot) → final verify_state ("target item visible in regular inventory").
+- For other GUIs: decompose appropriately based on task text + frame + layout_slots.
+
+DO NOT include verify_slots when knownSlots already contains the recipe's ingredient items in hotbar slots — that is wasteful perception. Only emit verify_slots when truly uncertain.
 
 On SUBSEQUENT calls (post_action):
 - KEEP the existing checklist items (preserve ids and ordering).
@@ -96,6 +108,7 @@ export async function runPlanner(deps: PlannerDeps, input: PlannerInput): Promis
         }
       : null,
     known_slots: input.knownSlots,
+    layout_slots: input.layoutSlots,
     current_checklist: input.currentChecklist,
     trigger: input.trigger,
     recent_history: input.recentHistory,
