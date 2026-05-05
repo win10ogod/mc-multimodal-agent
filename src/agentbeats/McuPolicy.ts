@@ -1050,7 +1050,16 @@ export class McuVisualPolicy {
               }
             }
             if (knownItemFps.length > 0) {
+              // Limit Pass B to slot roles that actually receive
+              // placements during normal play. Armor/offhand slots
+              // have a silhouette placeholder icon when empty whose
+              // fingerprint can falsely match a real item like
+              // cobblestone -- skip those. Result slot is also
+              // computed by MC, not a placement target. Anonymous
+              // slots (no role) are also skipped to be safe.
+              const PASS_B_ROLES = new Set(["craft_2x2", "craft_3x3", "hotbar", "main_inv"]);
               for (const s of layoutForProbe.slots) {
+                if (!s.role || !PASS_B_ROLES.has(s.role)) continue;
                 if (plan.slotMemory.lookup(s.cx, s.cy)) continue; // already known
                 const live = samplePatchFingerprint(payload.obs, s.cx, s.cy, 6);
                 if (!live) continue;
