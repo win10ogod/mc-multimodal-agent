@@ -148,7 +148,6 @@ export async function runClosedLoopStep(
     if (layoutForMut && layoutForMut.slots.length > 0) {
       const cursorNow = detectCursorWithExpectation(payload.obs, layoutForMut, null);
       type Fp = { meanR: number; meanG: number; meanB: number; stddev: number };
-      const fpDist = (a: Fp, b: Fp) => Math.hypot(a.meanR - b.meanR, a.meanG - b.meanG, a.meanB - b.meanB);
       const chroma = (fp: Fp) => Math.max(fp.meanR, fp.meanG, fp.meanB) - Math.min(fp.meanR, fp.meanG, fp.meanB);
       // Role-aware fill test. Cobblestone reads chroma=0 stddev≈100
       // lum≈103 in the raw frame — pure grey, very textured, far
@@ -263,78 +262,17 @@ export async function runClosedLoopStep(
       // where mean-RGB cannot. Loose threshold (≤16/64) tolerates JPEG
       // noise and minor stack-count rendering changes; chroma-fp is a
       // tiebreaker.
-      // Migration protocol: an item is "moved" only when both
-      //   (a) its old slot is no longer there / no longer matches its
-      //       baseline fingerprint (item LEFT old position), AND
-      //   (b) a different slot now appears with similar hash/fp
-      //       (item APPEARED at new position).
-      // If only (a) → item is on the cursor (drop entry).
-      // If neither → item is still where we last saw it (keep).
-      // Pure positive evidence on both sides; never invalidate on
-      // noise alone.
-      const HAMMING_MAX = 16;
-      const tracked = cp.slotMemory.snapshot()
-        .filter((e) => e.item !== "empty" && e.item !== "unknown" && (!!e.hash || !!e.fingerprint));
-      const usedSlots = new Set<string>();
-      const stillThere = new Set<string>(); // keys where a tracked item is confirmed still at its recorded position
-      // Pass 1: confirm "still there" — current fp at recorded
-      // position closely matches the recorded baseline.
-      for (const e of tracked) {
-        const slot = slotSigs.find((s) => Math.hypot(s.cx - e.x, s.cy - e.y) < 6);
-        if (!slot) continue;
-        const ham = e.hash !== undefined ? dHashDistance(e.hash, slot.hash) : HAMMING_MAX + 1;
-        const fd = e.fingerprint ? fpDist(e.fingerprint, slot.fp) : Infinity;
-        if (ham <= HAMMING_MAX || fd < 18) {
-          const key = `${slot.cx},${slot.cy}`;
-          stillThere.add(key);
-          usedSlots.add(key);
-        }
-      }
-      // Pass 2: for items NOT confirmed still-there, look for them at
-      // OTHER slots (hash match). Need (a) old slot vanished/changed
-      // AND (b) new slot's hash/fp matches → migrate. Otherwise leave
-      // slotMemory alone (don't invalidate on noise).
-      for (const e of tracked) {
-        const oldKey = `${e.x},${e.y}`; // approximate; recorded entries may have non-grid coords
-        if (stillThere.has(oldKey)) continue;
-        // Did the old slot lose this item? Check the layout slot at
-        // (e.x, e.y) — if it's still in slotSigs and matches, we
-        // already would've caught it in Pass 1. If it's NOT in
-        // slotSigs OR its hash diverged, the item left.
-        const oldSlotInSigs = slotSigs.find((s) => Math.hypot(s.cx - e.x, s.cy - e.y) < 6);
-        const oldSlotHam = oldSlotInSigs && e.hash !== undefined ? dHashDistance(e.hash, oldSlotInSigs.hash) : HAMMING_MAX + 100;
-        const oldSlotChanged = !oldSlotInSigs || oldSlotHam > HAMMING_MAX;
-        if (!oldSlotChanged) continue; // ambiguous; leave alone
-        // Look for hash match in other slots.
-        let bestSlot: typeof slotSigs[number] | null = null;
-        let bestHam = HAMMING_MAX + 1, bestFpD = Infinity;
-        for (const s of slotSigs) {
-          const key = `${s.cx},${s.cy}`;
-          if (usedSlots.has(key)) continue;
-          if (Math.hypot(s.cx - e.x, s.cy - e.y) < 6) continue; // skip old slot
-          const ham = e.hash !== undefined ? dHashDistance(e.hash, s.hash) : HAMMING_MAX;
-          if (ham > HAMMING_MAX) continue;
-          const fd = e.fingerprint ? fpDist(e.fingerprint, s.fp) : 0;
-          if (ham < bestHam || (ham === bestHam && fd < bestFpD)) {
-            bestHam = ham; bestFpD = fd; bestSlot = s;
-          }
-        }
-        if (bestSlot) {
-          // Confirmed migration: old slot changed AND a new slot
-          // matches. Update slotMemory to the new pixel position.
-          usedSlots.add(`${bestSlot.cx},${bestSlot.cy}`);
-          cp.slotMemory.invalidate(e.x, e.y);
-          cp.slotMemory.record(bestSlot.cx, bestSlot.cy, e.item, cp.iteration, bestSlot.fp, bestSlot.hash);
-          console.log(`[agentbeats] item-track: '${e.item}' moved (${e.x},${e.y}) -> (${bestSlot.cx},${bestSlot.cy}) ham=${bestHam} fp_d=${bestFpD.toFixed(1)}`);
-        } else {
-          // Old slot changed but no new slot matched. Item probably
-          // picked up onto cursor. Drop entry; cursor-NW patch test
-          // also flags holding.
-          cp.slotMemory.invalidate(e.x, e.y);
-          cp.cursorHoldingMut = true;
-          console.log(`[agentbeats] item-track: '${e.item}' left (${e.x},${e.y}); no match elsewhere — assumed on cursor`);
-        }
-      }
+      // No-swap invariant: the agent never swaps items between slots
+      // (place onto a different-item slot is forbidden by Action's
+      // SYS prompt). Therefore items never migrate without an
+      // explicit pickup/place action — the click verifier records
+      // those directly into slotMemory. The resolver no longer
+      // attempts to migrate items: that role is owned by the click
+      // handler. We use slotSigs only to populate
+      // occupiedSlotIndices (CV-occupancy hint for slots NOT in
+      // slotMemory) so the LLM sees "unknown item" only for
+      // genuinely-new occupants (e.g., the result slot once a craft
+      // succeeds).
     }
   }
 
