@@ -44,11 +44,11 @@ Subtask → action mapping:
 - place_in_craft_grid { item }: (1) pick a craft cell (role starts "craft_2x2_" or "craft_3x3_") matching this item's recipe position. (2) Find the source slot for this item in known_slots. If item is NOT in known_slots, emit verify_slots on up to 3 hotbar/main_inv slots that VISUALLY look like the item — do NOT guess source indices. Once known_slots contains the item, emit move from=source to=craftCell count="one".
 - take_result { expectedItem }: from = slot with role==="result"; to = free slot in known_slots; emit move count="all".
 - wait_for_output { expectedItem }: emit wait with holdSteps proportional to expected sim ticks (cap 60).
-- click_button { buttonName }: resolve buttonName to a concrete slot:
-  1. EXACT role match: layout_slots[i].role === buttonName (e.g. "recipe_book_button"). Use that slot's index.
-  2. Recipe entry by item: if buttonName ends "_recipe" (e.g. "diorite_recipe"), the panel is a recipe book. Visually find the cell whose icon matches the named item and emit a click on that slot index.
-  3. Otherwise visually match buttonName against any slot whose role/visual best fits the description.
-  Emit a single-click move with from===to===<resolvedSlotIdx>, count="one". If unresolved, emit fallback_manual with "BLOCKED: button '<buttonName>' not found".
+- click_ui { slotIndex?, uiName? }: click a slot. Resolution order:
+  1. If slotIndex is present, use that exact index (Planner already identified it from the SoM badges in the shared perception).
+  2. Else if uiName matches a layout_slots[i].role exactly (e.g. "recipe_book_button"), use that slot.
+  3. Else visually match uiName / "<item>_recipe" against panel cells (recipe entries, custom buttons, etc.) and pick the matching slot index.
+  Emit a single-click move with from===to===<resolvedSlotIdx>, count="one". If unresolved, emit fallback_manual with "BLOCKED: button not found".
 - verify_state { condition }: if condition holds in frame+known, emit done; else fallback_manual.
 
 Rules:
