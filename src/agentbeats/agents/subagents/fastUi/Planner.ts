@@ -36,12 +36,13 @@ const SCHEMA = {
       type: "array",
       items: {
         type: "object",
-        required: ["id", "text", "task", "done"],
+        required: ["id", "text", "task", "done", "attempts"],
         additionalProperties: false,
         properties: {
           id: { type: "string" },
           text: { type: "string" },
           done: { type: "boolean" },
+          attempts: { type: "integer" },
           task: { type: "object", additionalProperties: true },
         },
       },
@@ -72,8 +73,18 @@ On SUBSEQUENT calls (post_action):
   * verify_state is done when the condition holds.
 - all_done is true only when EVERY item is done AND the task's success state is visible (e.g. recipe target in regular inventory).
 
+CRITICAL — anti-loop rule:
+The Action agent fires AT MOST ONCE per subtask. Every checklist item carries an "attempts" counter that reflects how many times Action has been dispatched for it. After Action runs, IBVS verifies and hands back to you.
+- If attempts >= 1 on the item AND your observation supports completion → mark done=true.
+- If attempts >= 1 AND observation does NOT support completion → DO NOT keep the same activeIdx; either:
+   (a) replace this subtask with a different approach (e.g. swap to verify_slots covering a different slot range), or
+   (b) skip it (mark done=true with the assumption it failed silently and let downstream subtasks recover), or
+   (c) insert a new prerequisite subtask BEFORE this one and point next_idx to that prerequisite.
+- NEVER return the same activeIdx with the same subtask + same attempts >= 1. That would loop the Action agent.
+
 Output strict JSON:
-  { "all_done": bool, "next_idx": int (-1 if all_done; otherwise index of first still-undone item), "checklist": [...] }`;
+  { "all_done": bool, "next_idx": int (-1 if all_done; otherwise index of first still-undone item), "checklist": [...] }
+Each checklist item: { id, text, task, done, attempts }. PRESERVE attempts as the runtime sets it; do not reset to 0 unless you are inserting a fresh subtask.`;
 
 export async function runPlanner(deps: PlannerDeps, input: PlannerInput): Promise<PlanResult> {
   const userPayload = {

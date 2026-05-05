@@ -473,8 +473,14 @@ export async function runClosedLoopStep(
           if (useActionAgent) {
             const { runAction } = await import("./subagents/fastUi/Action");
             const knownForAction = plan.slotMemory.snapshot().map((e) => ({ index: 0, item: e.item }));
+            const activeItem = plan.checklist[plan.activeChecklistIdx];
+            // Increment per-subtask attempts BEFORE dispatch so the
+            // Planner sees how many times this item has been tried.
+            // Planner is required (per prompt) to tick done OR replace
+            // the subtask once attempts >= 1 — preventing Action loops.
+            activeItem.attempts = (activeItem.attempts ?? 0) + 1;
             probed = await runAction({ client: deps.client, model: deps.model }, {
-              subtask: plan.checklist[plan.activeChecklistIdx].task,
+              subtask: activeItem.task,
               knownSlots: knownForAction,
               obsBase64: payload.obs ?? "",
             });
@@ -1271,16 +1277,23 @@ export async function runClosedLoopStep(
               console.warn(`[agentbeats] VLM sub-verify call failed: ${e instanceof Error ? e.message : String(e)}; falling through to retry`);
             }
           }
-          if (pc.retries < MAX_RETRIES) {
+          // FastUI Action-agent path: NO IBVS retries — any mismatch
+          // immediately ends the chain and hands control back to the
+          // Planner. The Planner will observe the current state and
+          // either tick the subtask done (if observation supports it),
+          // re-dispatch, or replace it. Legacy probe path keeps the
+          // retry loop for backwards compat.
+          const inActionAgentMode = plan.checklist.length > 0 && plan.activeChecklistIdx >= 0;
+          if (!inActionAgentMode && pc.retries < MAX_RETRIES) {
             pc.retries += 1;
             pc.phase = "servo";
             plan.servoSteps = 0;
             console.log(`[agentbeats] RETRY click on ${pc.slotName ?? pc.rasterIndex} (attempt ${pc.retries + 1}/${MAX_RETRIES + 1})`);
             return { kind: "act", action: defaultMcuAction(), holdSteps: 1 };
           }
-          // Retries exhausted (5 attempts total). Surface back to VLM
-          // reasoning -- drop the rest of the chain too so the LLM
-          // can replan from current observed state.
+          // Retries exhausted OR action-agent mode (no retries). Surface
+          // back to VLM/Planner — drop the rest of the chain too so the
+          // next layer can replan from current observed state.
           const failureLabel = `${pc.actionKind ?? pc.kind ?? "click"} slot=${pc.rasterIndex}${pc.slotName ? `(${pc.slotName})` : ""} FAILED post.stddev=${post.stddev.toFixed(0)}`;
           state.closedLoopHistory.unshift(`${failureLabel} (chain aborted; ${plan.pendingChain.length} dropped)`);
           state.closedLoopHistory = state.closedLoopHistory.slice(0, 5);

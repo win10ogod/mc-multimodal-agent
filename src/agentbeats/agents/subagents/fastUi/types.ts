@@ -29,12 +29,15 @@ export type Subtask =
 /** Subtask augmented with a checkbox state. The Planner ticks `done`
  *  to true based on observation of frame + Known. `id` is monotonic
  *  ("s1", "s2", ...) so the Planner can preserve identity across
- *  re-judgments and not re-shuffle the list. */
+ *  re-judgments and not re-shuffle the list. `attempts` counts how many
+ *  times the Action agent was dispatched against this item without it
+ *  becoming done — Planner uses this to break stuck loops. */
 export type ChecklistItem = {
   id: string;
   text: string;       // human-readable rendering
   task: Subtask;
   done: boolean;
+  attempts: number;
 };
 
 /** Output of any Planner specialization. Generic across GUI kinds. */
