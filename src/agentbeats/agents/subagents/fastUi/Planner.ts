@@ -65,7 +65,7 @@ Subtask kinds (no numbers, no slot indices):
 
 On the FIRST call: emit the shortest plan. For crafting, that's typically (skip verify if known_items already shows ingredients) → one place_in_craft_grid per ingredient unit → one take_result.
 
-On post_action calls: tick done where observation supports it; preserve item ids and order. After each Action you'll see what just happened in recent_history — use it plus the frame to judge progress. You decide retries: keep activeIdx for one more attempt only if observation shows partial progress, otherwise advance / replace / mark done. Never return same activeIdx with attempts >= 3 unchanged.
+On post_action calls: VERIFY the Action's last report against the actual frame + known_items before ticking done. Action sometimes falsely reports success (CV mismatch, click landed on wrong slot, etc.) — never trust its OK at face value. Confirm visually that the expected effect occurred. If the report says success but the frame disagrees, leave the item undone and decide whether to retry or replace it. Preserve item ids and order. Keep activeIdx for one more attempt only if observation shows partial progress; otherwise advance / replace / mark done. Never return same activeIdx with attempts >= 3 unchanged.
 
 Output strict JSON:
   { "all_done": bool, "next_idx": int (-1 if all_done), "checklist": [...] }
