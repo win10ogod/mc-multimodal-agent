@@ -449,12 +449,11 @@ export type PendingClick = {
   kind?: "click" | "cleanup" | "auto_return";
   /** Probe action this click was derived from. */
   actionKind?: "pickup" | "place_one" | "place_all" | "take";
-  /** For place_one/place_all clicks built as part of a "move from A
-   *  to B" chain: the item name held at the SOURCE slot at chain
-   *  build time (read from SlotMemory before the chain ran). On a
-   *  matched place verify, the runtime writes this item name into
-   *  SlotMemory at the destination slot, so the agent sees the
-   *  placed item in its Known list without needing an extra OCR. */
+  /** Item name to record at this click's slot on a CV-matched verify
+   *  for place_one/place_all clicks. Set at chain-build time from the
+   *  source slot's SlotMemory entry. The CV-matched verify is the
+   *  evidence the slot really got the item; the source-slot lookup
+   *  supplies the identity. */
   placedItemName?: string;
 };
 

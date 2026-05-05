@@ -1036,14 +1036,20 @@ export class McuVisualPolicy {
               }
               knownSlots.push({ index: s.index, name: s.name, item: mem.item, ageIters: plan.iteration - mem.step });
             }
-            // Pass B: appeared-item match. For each disappeared item,
-            // scan all currently-non-empty slots whose memory is
-            // empty; if a slot's fingerprint matches the disappeared
-            // item's stored fingerprint, the item moved there. Record
-            // memory at that slot so the agent sees the placement.
-            for (const { item, fp } of disappearedFps) {
-              let bestSlot: typeof layoutForProbe.slots[0] | null = null;
-              let bestDist = Infinity;
+            // Pass B: filled-slot identification. For every detected
+            // slot that has no memory entry but visually contains
+            // SOMETHING (not in the empty band), find the closest
+            // fingerprint match across all currently-known items.
+            // If close, record the item at this slot. Doesn't depend
+            // on disappear detection -- handles place_one from a
+            // 64-stack source (which leaves source visually identical).
+            const knownItemFps: Array<{ item: string; fp: { meanR: number; meanG: number; meanB: number; stddev: number } }> = [];
+            for (const e of plan.slotMemory.snapshot()) {
+              if (e.fingerprint && e.item !== "empty" && e.item !== "unknown") {
+                knownItemFps.push({ item: e.item, fp: e.fingerprint });
+              }
+            }
+            if (knownItemFps.length > 0) {
               for (const s of layoutForProbe.slots) {
                 if (plan.slotMemory.lookup(s.cx, s.cy)) continue; // already known
                 const live = samplePatchFingerprint(payload.obs, s.cx, s.cy, 6);
@@ -1051,19 +1057,20 @@ export class McuVisualPolicy {
                 const lum = (live.meanR + live.meanG + live.meanB) / 3;
                 const looksEmpty = live.stddev < 20 && lum > 120 && lum < 160;
                 if (looksEmpty) continue;
-                const dr = live.meanR - fp.meanR;
-                const dg = live.meanG - fp.meanG;
-                const db = live.meanB - fp.meanB;
-                const dist = Math.sqrt(dr * dr + dg * dg + db * db);
-                if (dist < bestDist) { bestDist = dist; bestSlot = s; }
-              }
-              if (bestSlot && bestDist < 30) {
-                const live = samplePatchFingerprint(payload.obs, bestSlot.cx, bestSlot.cy, 6) ?? undefined;
-                plan.slotMemory.record(bestSlot.cx, bestSlot.cy, item, plan.iteration, live);
-                knownSlots.push({ index: bestSlot.index, name: bestSlot.name, item, ageIters: 0 });
-                console.log(`[agentbeats] item appeared: '${item}' is now at slot ${bestSlot.index}(${bestSlot.name ?? "?"}) -- dist=${bestDist.toFixed(1)}`);
-              } else {
-                console.log(`[agentbeats] item '${item}' disappeared but no matching slot found (best dist=${bestDist.toFixed(1)}); likely on cursor`);
+                let bestItem: string | null = null;
+                let bestDist = Infinity;
+                for (const k of knownItemFps) {
+                  const dr = live.meanR - k.fp.meanR;
+                  const dg = live.meanG - k.fp.meanG;
+                  const db = live.meanB - k.fp.meanB;
+                  const dist = Math.sqrt(dr * dr + dg * dg + db * db);
+                  if (dist < bestDist) { bestDist = dist; bestItem = k.item; }
+                }
+                if (bestItem && bestDist < 30) {
+                  plan.slotMemory.record(s.cx, s.cy, bestItem, plan.iteration, live);
+                  knownSlots.push({ index: s.index, name: s.name, item: bestItem, ageIters: 0 });
+                  console.log(`[agentbeats] slot ${s.index}(${s.name ?? "?"}) matched to known item '${bestItem}' by fingerprint (dist=${bestDist.toFixed(1)})`);
+                }
               }
             }
             const result = await probeNextCraftAction({
@@ -1177,18 +1184,27 @@ export class McuVisualPolicy {
                 state.closedLoopHistory.unshift(`refused move to=${probed.to}(${toSlot.name}) (would swap with returned ingredient stack)`);
                 state.closedLoopHistory = state.closedLoopHistory.slice(0, 5);
               } else {
-                const mkClick = (s: { index: number; name?: string; role?: string; cx: number; cy: number }, button: "attack" | "use", expectAfter: "should_empty" | "should_fill", actionKind: "pickup" | "place_one" | "place_all" | "take", kind: "click" | "auto_return"): import("./tools/UiFastControl").PendingClick => ({
+                // Capture source slot's item name so we can record it
+                // at the destination on a CV-matched place verify --
+                // place_one from a 64-stack leaves source visually
+                // unchanged, so the pure-CV disappear scan can't tell
+                // the item moved. The matched-click verify is the CV
+                // evidence; the source memory entry is the identity.
+                const fromMem = plan.slotMemory.lookup(fromSlot.cx, fromSlot.cy);
+                const placedItemName = fromMem?.item;
+                const mkClick = (s: { index: number; name?: string; role?: string; cx: number; cy: number }, button: "attack" | "use", expectAfter: "should_empty" | "should_fill", actionKind: "pickup" | "place_one" | "place_all" | "take", kind: "click" | "auto_return", placedItemName?: string): import("./tools/UiFastControl").PendingClick => ({
                   rasterIndex: s.index, slotName: s.name, slotRole: s.role,
                   frozenTarget: { x: s.cx, y: s.cy },
                   button, shift: false, expectAfter,
                   phase: "servo", retries: 0, kind, actionKind,
+                  ...(placedItemName ? { placedItemName } : {}),
                 });
                 const chain: import("./tools/UiFastControl").PendingClick[] = [];
                 chain.push(mkClick(fromSlot, "attack", "should_empty", "pickup", "click"));
                 if (probed.count === "all") {
-                  chain.push(mkClick(toSlot, "attack", "should_fill", "place_all", "click"));
+                  chain.push(mkClick(toSlot, "attack", "should_fill", "place_all", "click", placedItemName));
                 } else {
-                  chain.push(mkClick(toSlot, "use", "should_fill", "place_one", "click"));
+                  chain.push(mkClick(toSlot, "use", "should_fill", "place_one", "click", placedItemName));
                   chain.push(mkClick(fromSlot, "attack", "should_fill", "place_all", "auto_return"));
                 }
                 // Only record pickupSourceSlot when picking from a real
