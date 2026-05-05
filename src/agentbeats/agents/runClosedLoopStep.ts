@@ -508,10 +508,14 @@ export async function runClosedLoopStep(
           // the GUI). Anywhere else we cannot tell whether a high-
           // stddev patch is the held-item icon or an underlying slot.
           if (!cursorAtPark) return null;
-          // Held-item icon renders ~8 px NW of cursor tip; at park
-          // that is in the dimmed world-view region (no slot icons).
-          const HELD_NW_X = -8, HELD_NW_Y = -8;
-          const live = samplePatchFingerprint(payload.obs, PARK_X + HELD_NW_X, PARK_Y + HELD_NW_Y, 4);
+          // Held-item icon renders DOWN-RIGHT of the cursor tip (the
+          // tip is the cursor sprite's top-left pixel from template
+          // detection; held icon center is at +8,+8 from there).
+          // Earlier code sampled NW which is the dimmed world view —
+          // no held icon ever appears there, so dist stayed small
+          // and cursorHolding never fired even when cursor was full.
+          const HELD_OFF_X = 8, HELD_OFF_Y = 8;
+          const live = samplePatchFingerprint(payload.obs, PARK_X + HELD_OFF_X, PARK_Y + HELD_OFF_Y, 6);
           if (!live) return null;
           // Baseline capture: first time cursor is at park, cursor is
           // empty by construction (session start, no prior pickup).
@@ -521,7 +525,7 @@ export async function runClosedLoopStep(
           // background pollutes any cursor-area sample.
           if (plan.parkEmptyBaseline === null) {
             plan.parkEmptyBaseline = live;
-            const livePatch = samplePatchPixels(payload.obs, PARK_X + HELD_NW_X, PARK_Y + HELD_NW_Y, 14);
+            const livePatch = samplePatchPixels(payload.obs, PARK_X + HELD_OFF_X, PARK_Y + HELD_OFF_Y, 14);
             if (livePatch) {
               plan.parkEmptyCursorPatch = { w: livePatch.w, h: livePatch.h, rgba: livePatch.rgba };
               console.log(`[agentbeats] park baseline captured: meanR=${live.meanR.toFixed(0)} G=${live.meanG.toFixed(0)} B=${live.meanB.toFixed(0)} stddev=${live.stddev.toFixed(1)} + 14x14 cursor patch`);
@@ -544,7 +548,7 @@ export async function runClosedLoopStep(
           if (dist > 15) {
             console.log(`[agentbeats] cursorHolding=true (park dist=${dist.toFixed(1)})`);
             if (plan.parkEmptyCursorPatch && plan.cursorItemSignature) {
-              const livePatch = samplePatchPixels(payload.obs, PARK_X + HELD_NW_X, PARK_Y + HELD_NW_Y, 14);
+              const livePatch = samplePatchPixels(payload.obs, PARK_X + HELD_OFF_X, PARK_Y + HELD_OFF_Y, 14);
               if (livePatch && livePatch.w === plan.parkEmptyCursorPatch.w && livePatch.h === plan.parkEmptyCursorPatch.h) {
                 // Diff-mask: pixel changed from empty-baseline by >24
                 // RGB-distance ⇒ held-item pixel. Build a synthetic
