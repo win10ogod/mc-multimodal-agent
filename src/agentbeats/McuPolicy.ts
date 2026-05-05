@@ -1049,20 +1049,35 @@ export class McuVisualPolicy {
                 knownItemFps.push({ item: e.item, fp: e.fingerprint });
               }
             }
-            if (knownItemFps.length > 0) {
-              // Limit Pass B to slot roles that actually receive
-              // placements during normal play. Armor/offhand slots
-              // have a silhouette placeholder icon when empty whose
-              // fingerprint can falsely match a real item like
-              // cobblestone -- skip those. Result slot is also
-              // computed by MC, not a placement target. Anonymous
-              // slots (no role) are also skipped to be safe.
-              const PASS_B_ROLES = new Set(["craft_2x2", "craft_3x3", "hotbar", "main_inv"]);
+            // Capture per-slot initial baseline on first probe so we
+            // can later detect "this slot moved away from its starting
+            // state" -- the cleanest filter against false positives on
+            // armor/offhand placeholder icons.
+            if (plan.initialSlotBaselines.size === 0) {
               for (const s of layoutForProbe.slots) {
-                if (!s.role || !PASS_B_ROLES.has(s.role)) continue;
-                if (plan.slotMemory.lookup(s.cx, s.cy)) continue; // already known
+                const fp = samplePatchFingerprint(payload.obs, s.cx, s.cy, 6);
+                if (fp) plan.initialSlotBaselines.set(`${Math.round(s.cx)},${Math.round(s.cy)}`, fp);
+              }
+              console.log(`[agentbeats] captured initial slot baselines for ${plan.initialSlotBaselines.size} slots`);
+            }
+            // Track transitions to notify the agent of slot updates.
+            const slotUpdates: string[] = [];
+            if (knownItemFps.length > 0) {
+              for (const s of layoutForProbe.slots) {
+                // Skip slots already known.
+                if (plan.slotMemory.lookup(s.cx, s.cy)) continue;
                 const live = samplePatchFingerprint(payload.obs, s.cx, s.cy, 6);
                 if (!live) continue;
+                // Skip slots that haven't drifted from their initial
+                // baseline (still empty placeholder, or unchanged
+                // initial item). dist < 12 = still in starting state.
+                const baselineKey = `${Math.round(s.cx)},${Math.round(s.cy)}`;
+                const initial = plan.initialSlotBaselines.get(baselineKey);
+                if (initial) {
+                  const dr0 = live.meanR - initial.meanR, dg0 = live.meanG - initial.meanG, db0 = live.meanB - initial.meanB;
+                  const distFromInitial = Math.sqrt(dr0 * dr0 + dg0 * dg0 + db0 * db0);
+                  if (distFromInitial < 12) continue;  // unchanged from start
+                }
                 const lum = (live.meanR + live.meanG + live.meanB) / 3;
                 const looksEmpty = live.stddev < 20 && lum > 120 && lum < 160;
                 if (looksEmpty) continue;
@@ -1078,7 +1093,14 @@ export class McuVisualPolicy {
                 if (bestItem && bestDist < 30) {
                   plan.slotMemory.record(s.cx, s.cy, bestItem, plan.iteration, live);
                   knownSlots.push({ index: s.index, name: s.name, item: bestItem, ageIters: 0 });
+                  slotUpdates.push(`slot ${s.index}${s.name ? `(${s.name})` : ""} now has ${bestItem}`);
                   console.log(`[agentbeats] slot ${s.index}(${s.name ?? "?"}) matched to known item '${bestItem}' by fingerprint (dist=${bestDist.toFixed(1)})`);
+                } else if (bestItem) {
+                  // Drifted from baseline + visually filled but no
+                  // close match -- could be the crafted result item
+                  // (whose fingerprint we have not seen yet). Notify.
+                  slotUpdates.push(`slot ${s.index}${s.name ? `(${s.name})` : ""} now has an UNKNOWN item (use verify_slots to identify)`);
+                  console.log(`[agentbeats] slot ${s.index}(${s.name ?? "?"}) drifted from initial; closest known='${bestItem}' but dist=${bestDist.toFixed(1)} too high`);
                 }
               }
             }
@@ -1093,6 +1115,7 @@ export class McuVisualPolicy {
               cursorHolding,
               pickupSourceSlot: plan.pickupSourceSlot ?? null,
               disappearedItems,
+              slotUpdates,
               knownSlots,
             });
             plan.iteration += 1;

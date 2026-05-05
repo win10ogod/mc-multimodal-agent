@@ -534,6 +534,15 @@ export type ClosedLoopCraftPlan = {
    *  significant L2 distance means an item icon is overlaid on the
    *  cursor sprite at park, so the cursor is holding. */
   parkEmptyBaseline: { meanR: number; meanG: number; meanB: number; stddev: number } | null;
+  /** Per-slot pixel fingerprint captured at the FIRST probe of the
+   *  session (cursor at park, slots in their natural starting state).
+   *  Pass B uses this as the per-slot "is this slot at its initial
+   *  state?" reference -- a slot whose live patch closely matches its
+   *  initial baseline is unchanged (still empty / still its starting
+   *  item) and won't be misidentified as a freshly placed item. Keyed
+   *  by absolute pixel position rounded to ints to survive minor
+   *  detection jitter. */
+  initialSlotBaselines: Map<string, { meanR: number; meanG: number; meanB: number; stddev: number }>;
   /** True for one probe cycle right after a CV-matched pickup verify
    *  (slot's pixels confirmed transition filled->empty). The
    *  cursor-holding signal AND-gates this with a park-baseline pixel
@@ -661,6 +670,7 @@ export function planClosedLoopCraft(taskText: string): ClosedLoopCraftPlan {
     pendingOcrBatch: null,
     parkEmptyBaseline: null,
     recentMatchedPickup: false,
+    initialSlotBaselines: new Map(),
   };
 }
 

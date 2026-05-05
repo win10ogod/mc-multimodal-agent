@@ -237,6 +237,11 @@ export async function probeNextCraftAction(opts: {
    *  likely just got picked up onto the cursor. Surfaced to the agent
    *  as "Cursor likely holds: X". CV-only signal. */
   disappearedItems?: string[];
+  /** Slot transitions detected this probe (CV match): "slot N now has
+   *  X". Surfaced to the agent so it sees fresh placements (e.g. an
+   *  item appearing in a craft cell or the result slot) without
+   *  needing to re-OCR. */
+  slotUpdates?: string[];
 }): Promise<CraftProbeResult> {
   // Set-of-Mark: render the obs frame with numbered badges drawn at every
   // slot's pixel center so the VLM grounds slot indices visually instead of
@@ -397,6 +402,9 @@ export async function probeNextCraftAction(opts: {
     `Task: ${opts.taskText}`,
     ...(recipeHint ? ["", recipeHint] : []),
     ...(knownSlotsText ? ["", knownSlotsText] : []),
+    ...(opts.slotUpdates && opts.slotUpdates.length > 0
+      ? ["", "Slot transitions just detected (CV-tracked since last probe):", ...opts.slotUpdates.map((u) => `  - ${u}`)]
+      : []),
     "",
     `The image has YELLOW NUMBERED BADGES drawn at the corner of each slot. Read the badge numbers directly from the image to choose a slot index.`,
     `When searching for an ingredient that is NOT yet in Known slot contents: scan the HOTBAR (the bottom row of slots) FIRST, then the MAIN INVENTORY (three rows above the hotbar). Tasks typically place ingredients in the hotbar at episode start, so the hotbar should be your primary search region. Cover ALL hotbar slots before assuming an ingredient is missing.`,
