@@ -4,6 +4,7 @@ import { GOAL_PLANNER_SYSTEM_PROMPT } from "../prompts/goal_planner";
 import { inspectInventoryTool } from "./plannerTools/InspectInventoryTool";
 import { verifySlotsTool } from "./plannerTools/VerifySlotsTool";
 import { lookAroundTool } from "./plannerTools/LookAroundTool";
+import { addChecklistItemTool, markChecklistItemTool, readChecklistTool } from "./plannerTools/ChecklistTools";
 
 export type PlannerLoopResult =
   | { kind: "dispatch"; subgoal: Subgoal }
@@ -47,16 +48,39 @@ export async function runPlannerLoop(
   obsBase64: string,
   contextId: string,
 ): Promise<PlannerLoopResult> {
-  if (state.plannerMessages.length === 0) {
+  if (state.pendingReflection) {
+    const r = state.pendingReflection;
+    if (state.plannerMessages.length === 0) {
+      state.plannerMessages.push({ role: "system", content: GOAL_PLANNER_SYSTEM_PROMPT });
+      state.plannerMessages.push({ role: "user", content: `Task: ${state.taskText}` });
+    }
+    state.plannerMessages.push({
+      role: "user",
+      content:
+        `The sub-agent for "${r.subgoal.description}" returned: ${r.outcome.toUpperCase()}.\n` +
+        `Summary: ${r.summary}\n\n` +
+        `REFLECT before your next move:\n` +
+        `1. Call read_checklist.\n` +
+        `2. If success, VERIFY the result with inspect_inventory or verify_slots BEFORE marking done.\n` +
+        `3. If failure starts with "BLOCKED:", insert prerequisite checklist items, then dispatch the first prerequisite.\n` +
+        `4. After the checklist reflects reality, either dispatch the next pending item or call task_complete (only if every item is done).`,
+    });
+    state.pendingReflection = null;
+  } else if (state.plannerMessages.length === 0) {
     state.plannerMessages.push({ role: "system", content: GOAL_PLANNER_SYSTEM_PROMPT });
     state.plannerMessages.push({ role: "user", content: `Task: ${state.taskText}` });
-  } else if (state.completedSummaries.length > 0) {
-    const last = state.completedSummaries[state.completedSummaries.length - 1];
-    state.plannerMessages.push({ role: "user", content: `Subgoal result: ${last}` });
   }
 
+  const stateBoundTools = [
+    inspectInventoryTool,
+    verifySlotsTool,
+    lookAroundTool,
+    addChecklistItemTool(state),
+    markChecklistItemTool(state),
+    readChecklistTool(state),
+  ];
   const tools: any[] = [
-    ...READ_TOOLS.map(t => ({ type: "function" as const, function: { name: t.name, description: t.description, parameters: t.parameters } })),
+    ...stateBoundTools.map(t => ({ type: "function" as const, function: { name: t.name, description: t.description, parameters: t.parameters } })),
     DISPATCH_TOOL_DEF,
     FINISH_TOOL_DEF,
   ];
@@ -80,12 +104,19 @@ export async function runPlannerLoop(
       const fargs = JSON.parse(tc.function.arguments || "{}");
 
       if (fname === "task_complete") {
+        if (!state.checklist.allDone()) {
+          state.plannerMessages.push({
+            role: "tool", tool_call_id: tc.id,
+            content: `error: cannot complete — checklist still has items not 'done':\n${state.checklist.format()}`,
+          });
+          continue; // keep looping so planner addresses remaining items
+        }
         return { kind: "done" };
       }
       if (fname === "dispatch_subgoal") {
         return { kind: "dispatch", subgoal: fargs as Subgoal };
       }
-      const tool = READ_TOOLS.find(t => t.name === fname);
+      const tool = stateBoundTools.find(t => t.name === fname);
       if (!tool) {
         state.plannerMessages.push({ role: "tool", tool_call_id: tc.id as string, content: `error: unknown tool ${fname}` });
         continue;

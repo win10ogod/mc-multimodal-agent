@@ -79,6 +79,7 @@ export async function dispatchObservation(
   }
 
   if (step.kind === "subgoal_done") {
+    state.pendingReflection = { subgoal: current, outcome: "done", summary: step.summary };
     state.completedSummaries.push(step.summary);
     state.history.push(`done: ${current.description} -> ${step.summary}`);
     state.idx += 1;
@@ -92,6 +93,7 @@ export async function dispatchObservation(
   }
 
   // subgoal_failed
+  state.pendingReflection = { subgoal: current, outcome: "failed", summary: step.reason };
   state.history.push(`failed: ${current.description} -> ${step.reason}`);
   const out = await planGoals({ client: deps.client, model: deps.plannerModel }, state.taskText, [...state.completedSummaries, `FAILED: ${step.reason}`]);
   if (out.overall_done || out.subgoals.length === 0) { state.earlyStop = true; return NOOP_DONE; }

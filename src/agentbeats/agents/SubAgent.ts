@@ -1,6 +1,7 @@
 import type { McuEnvAction } from "../McuPrompt";
 import type { ClosedLoopCraftPlan } from "../tools/UiFastControl";
 import type { GuiLayout } from "../tools/SlotDetector";
+import { TaskChecklist } from "./TaskChecklist";
 
 export type SubAgentKind =
   | "ui_inventory"
@@ -50,6 +51,8 @@ export type EpisodeState = {
     tool_call_id?: string;
     tool_calls?: any[];
   }>;
+  checklist: TaskChecklist;
+  pendingReflection: { subgoal: Subgoal; outcome: "done" | "failed"; summary: string } | null;
 };
 
 export function makeEpisodeState(taskText: string): EpisodeState {
@@ -63,5 +66,7 @@ export function makeEpisodeState(taskText: string): EpisodeState {
     history: [],
     iteration: 0,
     plannerMessages: [],
+    checklist: new TaskChecklist(),
+    pendingReflection: null,
   };
 }
