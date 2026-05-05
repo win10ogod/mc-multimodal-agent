@@ -18,7 +18,7 @@
 import minecraftData from "minecraft-data";
 import { SlotMemory } from "./SlotMemory";
 import { defaultMcuAction, type McuEnvAction } from "../McuPrompt";
-import type { ChecklistItem } from "../agents/probeRoles/types";
+import type { ChecklistItem } from "../agents/subagents/fastUi/types";
 import type { GuiLayout } from "./SlotDetector";
 
 export type UiFastControlFrame = {
