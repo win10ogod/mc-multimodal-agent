@@ -40,7 +40,7 @@ const SYS = `You execute ONE symbolic subtask in a Minecraft GUI. You receive th
 
 Subtask → action mapping:
 - verify_items_visible { items }: emit verify_slots ONLY for slots you are visually CONFIDENT contain one of the listed items. Do not include uncertain or off-target slots — empty/random slots fire wasted OCR. If you cannot identify any candidate confidently, emit fallback_manual.
-- place_in_craft_grid { item }: pick a craft cell (role starts "craft_2x2_" or "craft_3x3_") that matches this item's recipe position; resolve item's source slot from known_slots; emit move from=source to=craftCell count="one".
+- place_in_craft_grid { item }: (1) pick a craft cell (role starts "craft_2x2_" or "craft_3x3_") matching this item's recipe position. (2) Find the source slot for this item in known_slots. If item is NOT in known_slots, emit verify_slots on up to 3 hotbar/main_inv slots that VISUALLY look like the item — do NOT guess source indices. Once known_slots contains the item, emit move from=source to=craftCell count="one".
 - take_result { expectedItem }: from = slot with role==="result"; to = free slot in known_slots; emit move count="all".
 - wait_for_output { expectedItem }: emit wait with holdSteps proportional to expected sim ticks (cap 60).
 - click_button: emit fallback_manual (not supported).
