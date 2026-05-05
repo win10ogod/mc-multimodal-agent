@@ -215,10 +215,19 @@ export async function runClosedLoopStep(
         if (hash === null) continue;
         slotSigs.push({ index: s.index, cx: s.cx, cy: s.cy, fp, hash });
       }
-      // Coord→id projection: every filled slot's layout index. Surfaces
-      // to Planner + Action so they see "this slot has something in it"
-      // even when we haven't OCR'd the item name yet.
-      cp.occupiedSlotIndices = slotSigs.map((s) => s.index);
+      // Coord→id projection: only slots that are filled AND we don't
+      // already have an identity for. slotMemory is the persistent
+      // truth for OCR-confirmed items — never override its names with
+      // CV "unknown item" noise. The occupiedSlotIndices list is
+      // therefore reserved for genuinely-new occupants the agent
+      // hasn't named yet (e.g., a freshly crafted item appearing in
+      // the result slot).
+      const knownPositions = cp.slotMemory.snapshot()
+        .filter((e) => e.item !== "empty" && e.item !== "unknown")
+        .map((e) => ({ x: e.x, y: e.y }));
+      cp.occupiedSlotIndices = slotSigs
+        .filter((s) => !knownPositions.some((k) => Math.hypot(k.x - s.cx, k.y - s.cy) < 6))
+        .map((s) => s.index);
       // Debug: dump the raw obs once per iteration so the resolver's
       // input can be inspected offline. MC's JPEG bytes come out of
       // jpeg-js with R/B channels swapped (Alex hair reads blue),
@@ -613,8 +622,11 @@ export async function runClosedLoopStep(
           // each disappeared item, scan all currently-occupied slots
           // not in memory to find where the item moved -- match by
           // RGB-mean distance to the disappeared item's fingerprint.
+          // disappearedItems remains as an empty hand-off to the
+          // legacy probe (Pass A's invalidate path is removed; a
+          // single noisy frame should never strip OCR-confirmed
+          // identity from slotMemory).
           const disappearedItems: string[] = [];
-          const disappearedFps: Array<{ item: string; fp: { meanR: number; meanG: number; meanB: number; stddev: number } }> = [];
           for (const s of layoutForProbe.slots) {
             const mem = plan.slotMemory.lookup(s.cx, s.cy);
             if (!mem || mem.item === "empty" || mem.item === "unknown") continue;
@@ -637,13 +649,16 @@ export async function runClosedLoopStep(
             const distFromBaseline = Math.sqrt(dr * dr + dg * dg + db * db);
             const liveLum = (live.meanR + live.meanG + live.meanB) / 3;
             const liveLooksEmpty = live.stddev < 20 && liveLum > 120 && liveLum < 160;
-            if (distFromBaseline > 40 && liveLooksEmpty) {
-              disappearedItems.push(mem.item);
-              disappearedFps.push({ item: mem.item, fp: mem.fingerprint });
-              plan.slotMemory.invalidate(s.cx, s.cy);
-              console.log(`[agentbeats] item disappeared: '${mem.item}' was at slot ${s.index}(${s.name ?? "?"}) -- dist=${distFromBaseline.toFixed(1)} liveLum=${liveLum.toFixed(1)} live.stddev=${live.stddev.toFixed(1)}`);
-              continue;
-            }
+            // Pass A's old "disappeared" invalidate path was removed:
+            // a single noisy frame (distFromBaseline > 40 +
+            // liveLooksEmpty) should NOT strip an OCR-confirmed
+            // identity. The body-top resolver runs the strict
+            // two-pass migration protocol (only updates on positive
+            // evidence at BOTH old and new positions), and the click
+            // verifier handles intentional moves directly. Items
+            // don't move when no action was taken — slotMemory
+            // entries stay sticky.
+            void distFromBaseline; void liveLooksEmpty;
             knownSlots.push({ index: s.index, name: s.name, item: mem.item, ageIters: plan.iteration - mem.step });
           }
           // Pass B: filled-slot identification. For every detected
