@@ -1127,6 +1127,25 @@ export async function runClosedLoopStep(
               plan.layoutHint = null;
               return emit(defaultMcuAction());
             }
+            // Safety: even when SERVO_STEP_CAP forces a fire, refuse if
+            // cursor is OUTSIDE the slot's own bbox — a click landing on
+            // the gray gap between buttons triggers nothing (recipe-book
+            // toggle), or fires on the wrong slot (item slots). Better
+            // to abort and let the planner re-perceive than to silently
+            // miss the click.
+            const slotForGuard = layout!.slots[pc.rasterIndex];
+            const slotHalfW = Math.max(6, Math.round((slotForGuard?.w ?? 16) / 2) + 2);
+            const slotHalfH = Math.max(6, Math.round((slotForGuard?.h ?? 16) / 2) + 2);
+            const insideSlot = !!cursor
+              && Math.abs(cursor.x - slotCenter.cx) <= slotHalfW
+              && Math.abs(cursor.y - slotCenter.cy) <= slotHalfH;
+            if (!insideSlot) {
+              console.warn(`[agentbeats] click suppressed: cursor (${cursor?.x},${cursor?.y}) outside slot ${pc.slotName ?? pc.rasterIndex} bbox @(${slotCenter.cx},${slotCenter.cy}) ±(${slotHalfW},${slotHalfH}); aborting`);
+              state.closedLoopHistory.unshift(`abort ${pc.slotName ?? pc.rasterIndex} (cursor outside slot bbox)`);
+              state.closedLoopHistory = state.closedLoopHistory.slice(0, 5);
+              plan.pendingClick = null;
+              return emit(defaultMcuAction());
+            }
             pc.prePatch = samplePatchFingerprint(payload.obs, slotCenter.cx, slotCenter.cy) ?? undefined;
             // Pre-condition for "should_empty" actions (pickup/take):
             // source slot MUST currently have an item. Use the same
