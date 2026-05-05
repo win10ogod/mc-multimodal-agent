@@ -1119,7 +1119,27 @@ export async function runClosedLoopStep(
         // We need cursor from the outer scope. It's defined above within the layout block.
         // Since pendingClick is set only after entering the layout block, cursor is always
         // available here via the outer closure reference. TypeScript will track this.
-        const cursor = plan.cursor ?? null;
+        // Dead-reckoning: when CV cursor detection fails (cursor sprite is occluded
+        // by an item icon under it), predict cursor position from the prior detected
+        // cursor + the last emitted camera delta. Without this fallback, the servo
+        // sees "no cursor" for 3-4 frames in a row, can't iterate the control law,
+        // and the stuck guard aborts. With it, the controller keeps issuing
+        // corrections through the blind window — which is exactly the closed-loop
+        // robustness the deadzone-compensation papers stress.
+        let cursor = plan.cursor ?? null;
+        if (!cursor && plan.lastCursorRead && plan.lastEmittedCam) {
+          // Dead-reckoning: predict cursor from prior detected pos + last
+          // emitted camera delta. ~6.7 px/deg empirically (logs show
+          // cam=10 → ~67 px). Coarse but enough to keep the controller
+          // iterating through CV-failed frames so it doesn't hit the
+          // stuck guard; next successful detection re-anchors.
+          const PX_PER_DEG = 6.7;
+          cursor = {
+            x: Math.round(plan.lastCursorRead.x - plan.lastEmittedCam[1] * PX_PER_DEG),
+            y: Math.round(plan.lastCursorRead.y - plan.lastEmittedCam[0] * PX_PER_DEG),
+          };
+          console.log(`[agentbeats] cursor undetected; dead-reckoning predicted=(${cursor.x},${cursor.y}) from prior (${plan.lastCursorRead.x},${plan.lastCursorRead.y}) + cam=[${plan.lastEmittedCam[0]},${plan.lastEmittedCam[1]}]`);
+        }
 
         // === Phase: servo === move cursor to slot, then click
         if (pc.phase === "servo") {
