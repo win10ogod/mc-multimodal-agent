@@ -81,6 +81,22 @@ export async function runClosedLoopStep(
     return emitMacroFrame(frame);
   }
 
+  // Auto-arm Planner re-judge whenever IBVS is idle (no pending click,
+  // chain, or OCR batch) AND there's an active subtask in the checklist.
+  // Any IBVS termination — successful chain end, OCR batch end, mismatch
+  // abort, cursor-out-of-window safety bail — leaves us in this idle
+  // state. Letting Planner observe + update the checklist on each idle
+  // entry guarantees we never get stuck re-emitting the same subtask.
+  if (
+    state.closedLoopCraft
+    && !state.closedLoopCraft.pendingClick
+    && state.closedLoopCraft.pendingChain.length === 0
+    && !state.closedLoopCraft.pendingOcrBatch
+    && state.closedLoopCraft.checklist.length > 0
+  ) {
+    state.closedLoopCraft.judgeAfterChain = true;
+  }
+
   // Planner re-judge after a successful chain. Fires once per arm.
   if (state.closedLoopCraft && state.closedLoopCraft.judgeAfterChain && payload.obs) {
     const cp = state.closedLoopCraft;
