@@ -355,7 +355,7 @@ export async function probeNextCraftAction(opts: {
     const recipeNeedsRows = recipeInfo.inShape ? recipeInfo.inShape.length : 0;
     const recipeNeedsCols = recipeInfo.inShape ? Math.max(...recipeInfo.inShape.map((r) => r.length)) : 0;
     if (recipeNeedsRows > 0 && recipeNeedsCols > 0 && (recipeNeedsRows > gridRows || recipeNeedsCols > gridCols)) {
-      lines.push(`GRID TOO SMALL: this recipe needs a ${recipeNeedsRows}x${recipeNeedsCols} grid but the current GUI only offers ${gridRows}x${gridCols}. You must close the inventory (press 'inventory' button), place a crafting_table block in the world, look at it, and 'use' to open the 3x3 crafting interface BEFORE attempting placements. The crafting_table item is in your inventory; emit a fallback_manual action so the world-control sub-agent takes over until the 3x3 GUI is open.`);
+      lines.push(`GRID TOO SMALL: this recipe needs a ${recipeNeedsRows}x${recipeNeedsCols} grid but the current GUI only offers ${gridRows}x${gridCols}. You must use a crafting_table to access a 3x3 grid. Steps: (1) close the inventory (press 'inventory' button); (2) if you have a crafting_table item in your hotbar, select it and 'use' on a free block face to place it in the world; if you don't have one, scan around -- there may already be a crafting_table placed nearby; (3) look at the placed crafting_table and 'use' to open its 3x3 crafting interface; (4) only then place ingredients per the plan. Emit fallback_manual now so the world-control sub-agent takes over until the 3x3 GUI is open.`);
     }
     if (gridCols > 0) {
       lines.push(`Craft grid: ${gridRows} rows x ${gridCols} cols. Cells are 1-indexed row-major (Row 1 Col 1 is top-left).`);
