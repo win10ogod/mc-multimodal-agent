@@ -194,6 +194,12 @@ export type CraftAction =
    *  blocks based on this lookup. Use this ONCE at task start to
    *  establish the target item, before placing anything. */
   | { action: "recipe_lookup"; item: string; reason?: string }
+  /** Pure-noop wait. Used by Action agent for async-output GUIs
+   *  (smelting, brewing) where the next state change requires the
+   *  simulator to advance its internal timers (smelt cook time, brew
+   *  duration). Runtime emits defaultMcuAction with `holdSteps`
+   *  bumped, then re-probes. */
+  | { action: "wait"; holdSteps: number; reason?: string }
   | { action: "done"; reason?: string }
   | { action: "fallback_manual"; reason?: string }
   // Low-level operations kept for backwards compatibility / fine-grained

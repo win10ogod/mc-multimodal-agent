@@ -484,6 +484,14 @@ export async function runClosedLoopStep(
             console.log(`[agentbeats] closed-loop probe returned no action; invalidating SoM session and reprobing next frame`);
             plan.sessionLayout = null;
             plan.layoutHint = null;
+          } else if (probed.action === "wait") {
+            // Async-output GUIs (smelt/brew): hold a noop for N steps
+            // so the simulator timers can tick. Capped at maxHoldSteps.
+            const N = Math.max(1, Math.min(deps.maxHoldSteps, probed.holdSteps ?? 8));
+            console.log(`[agentbeats] wait action holdSteps=${N} reason=${probed.reason ?? ""}`);
+            state.closedLoopHistory.unshift(`wait holdSteps=${N}`);
+            state.closedLoopHistory = state.closedLoopHistory.slice(0, 5);
+            return { kind: "act", action: defaultMcuAction(), holdSteps: N };
           } else if (probed.action === "done") {
             // CV-verify the probe's "done" claim: the result slot
             // must actually be empty AND the cursor must be empty
