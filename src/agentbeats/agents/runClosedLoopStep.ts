@@ -1197,6 +1197,34 @@ export async function runClosedLoopStep(
             integrator: (pc as any).servoIntegrator,
           });
           plan.servoSteps += 1;
+          // Trajectory log: capture EVERY servo frame regardless of
+          // hover/click branch. Provides ground truth for offline
+          // system identification (px-per-deg, deadzone, CV-failure).
+          const tDir = process.env.AGENTBEATS_DEBUG_DIR;
+          if (tDir) {
+            try {
+              // eslint-disable-next-line @typescript-eslint/no-require-imports
+              const fs = require("node:fs") as typeof import("node:fs");
+              // eslint-disable-next-line @typescript-eslint/no-require-imports
+              const pathMod = require("node:path") as typeof import("node:path");
+              const camY = stepResult ? stepResult.action.camera[1] : 0;
+              const camP = stepResult ? stepResult.action.camera[0] : 0;
+              const row = JSON.stringify({
+                ts: Date.now(),
+                step,
+                iter: plan.iteration,
+                target: { x: slotCenter.cx, y: slotCenter.cy, slot: pc.rasterIndex, name: pc.slotName },
+                cursor: cursor ? { x: cursor.x, y: cursor.y } : null,
+                cursor_observed: !!plan.cursor,
+                cam: { pitch: camP, yaw: camY },
+                kind: pc.kind,
+                phase: pc.phase,
+                errMag: cursor ? Math.hypot(cursor.x - slotCenter.cx, cursor.y - slotCenter.cy) : null,
+                reason: stepResult?.reason ?? "no-cursor",
+              });
+              fs.appendFileSync(pathMod.join(tDir, "servo_trajectory.jsonl"), row + "\n");
+            } catch { /* swallow */ }
+          }
           // Hover: servo to slot, then exit WITHOUT clicking. Cursor
           // is left on the slot for MC to render its tooltip in the
           // next probe image.
@@ -1317,31 +1345,8 @@ export async function runClosedLoopStep(
             console.log(
               `[agentbeats] servo step=${step} cursor=(${cursor?.x},${cursor?.y}) target=(${slotCenter.cx},${slotCenter.cy}) name=${pc.slotName ?? "?"} ${stepResult.reason}`,
             );
-            // Trajectory log for offline modeling: append one JSONL
-            // line per servo frame with target, observed cursor, and
-            // emitted cam delta. Enables fitting actual px-per-deg
-            // ratios, deadzone boundaries, and response curves.
-            const tDir = process.env.AGENTBEATS_DEBUG_DIR;
-            if (tDir) {
-              try {
-                // eslint-disable-next-line @typescript-eslint/no-require-imports
-                const fs = require("node:fs") as typeof import("node:fs");
-                // eslint-disable-next-line @typescript-eslint/no-require-imports
-                const pathMod = require("node:path") as typeof import("node:path");
-                const row = JSON.stringify({
-                  ts: Date.now(),
-                  step,
-                  iter: plan.iteration,
-                  target: { x: slotCenter.cx, y: slotCenter.cy, slot: pc.rasterIndex, name: pc.slotName },
-                  cursor: cursor ? { x: cursor.x, y: cursor.y } : null,
-                  predicted: !plan.cursor && cursor ? true : false,
-                  cam: { pitch: stepResult.action.camera[0], yaw: stepResult.action.camera[1] },
-                  errMag: cursor ? Math.hypot(cursor.x - slotCenter.cx, cursor.y - slotCenter.cy) : null,
-                  reason: stepResult.reason,
-                });
-                fs.appendFileSync(pathMod.join(tDir, "servo_trajectory.jsonl"), row + "\n");
-              } catch { /* swallow */ }
-            }
+            // Trajectory log already fired earlier (universal post-
+            // servoCursorStep hook covering both hover and click paths).
             return emit(stepResult.action);
           }
           console.log(`[agentbeats] servo step=${step}: no cursor detected; noop`);
