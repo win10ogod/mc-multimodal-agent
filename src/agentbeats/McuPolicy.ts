@@ -1645,9 +1645,12 @@ export class McuVisualPolicy {
             // speculatively write the cursor's item into the
             // destination -- per the user's "perception only" rule,
             // memory only contains entries confirmed by OCR.
-            if (matched && pc.kind !== ("hover" as never)) {
-              plan.slotMemory.invalidate(slotCenter.cx, slotCenter.cy);
-            }
+            // Do NOT invalidate slotMemory on matched click. The
+            // per-probe disappear/appear scan handles state changes
+            // from CV evidence -- if we invalidate here, the scan
+            // never sees the "had item X, slot now empty" transition
+            // and the appeared-item match (which depends on knowing
+            // what disappeared) loses its identity link.
             console.log(
               `[agentbeats] verify ${pc.slotName ?? pc.rasterIndex}: post.stddev=${post.stddev.toFixed(1)} expect=${pc.expectAfter} -> ${matched ? "OK" : "MISMATCH"} (retry ${pc.retries}/${MAX_RETRIES})`,
             );
