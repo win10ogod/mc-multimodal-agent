@@ -99,6 +99,20 @@ export async function runClosedLoopStep(
     state.closedLoopCraft.judgeAfterChain = true;
   }
 
+  // Compute the SoM-labeled image ONCE per obs and share it between
+  // the Planner re-judge and the Action dispatch — both see the same
+  // pixels with the same yellow badges since neither side mutates the
+  // frame, and the session-locked layout fixes badge positions for the
+  // lifetime of the GUI session.
+  let markedObsForLLMs: string | null = null;
+  if (state.closedLoopCraft && payload.obs && state.closedLoopCraft.sessionLayout) {
+    try {
+      const { markInventoryFrame } = await import("../tools/SlotMarker");
+      const marked = markInventoryFrame(payload.obs, state.closedLoopCraft.sessionLayout as any);
+      markedObsForLLMs = `data:image/png;base64,${marked.pngBase64}`;
+    } catch { /* fall back to raw */ }
+  }
+
   // Planner re-judge after a successful chain. Fires once per arm.
   if (state.closedLoopCraft && state.closedLoopCraft.judgeAfterChain && payload.obs) {
     const cp = state.closedLoopCraft;
@@ -107,12 +121,7 @@ export async function runClosedLoopStep(
       const knownItemsForPlanner = Array.from(new Set(cp.slotMemory.snapshot().map((e) => e.item).filter(i => i && i !== "empty")));
       const cursorHoldingItem = cp.cursorItemSignature ? "(unknown item)" : null;
       const { runPlanner } = await import("./subagents/fastUi/Planner");
-      const { markInventoryFrame } = await import("../tools/SlotMarker");
-      let markedObs = payload.obs;
-      try {
-        const marked = markInventoryFrame(payload.obs, cp.sessionLayout as any);
-        markedObs = `data:image/png;base64,${marked.pngBase64}`;
-      } catch { /* fall back to raw */ }
+      const markedObs = markedObsForLLMs ?? payload.obs;
       const rj = await runPlanner({ client: deps.client, model: deps.model, recordDebug: deps.recordDebug }, {
         taskText: state.taskText,
         recipeInfo: cp.recipeOverride,
@@ -482,7 +491,6 @@ export async function runClosedLoopStep(
           let probed: import("../tools/InventoryProbe").CraftAction | null;
           if (useActionAgent) {
             const { runAction } = await import("./subagents/fastUi/Action");
-            const { markInventoryFrame } = await import("../tools/SlotMarker");
             // Cross-ref slotMemory entries (keyed by pixel pos) with the
             // current layout to surface concrete slot indices to Action.
             const knownForAction = plan.slotMemory.snapshot().map((e) => {
@@ -501,15 +509,8 @@ export async function runClosedLoopStep(
             const cursorHoldingItem = plan.cursorItemSignature ? "(unknown item)" : null;
             const activeItem = plan.checklist[plan.activeChecklistIdx];
             activeItem.attempts = (activeItem.attempts ?? 0) + 1;
-            // Apply Set-of-Mark labels so Action sees the YELLOW BADGES
-            // its prompt instructs it to read.
-            let markedObs = payload.obs ?? "";
-            try {
-              const marked = markInventoryFrame(payload.obs ?? "", plan.sessionLayout as any);
-              markedObs = `data:image/png;base64,${marked.pngBase64}`;
-            } catch (e) {
-              console.warn(`[fastui-action] SoM render failed: ${e instanceof Error ? e.message : String(e)}; using raw frame`);
-            }
+            // Reuse the SoM-labeled image computed once at the top of body.
+            const markedObs = markedObsForLLMs ?? payload.obs ?? "";
             probed = await runAction({ client: deps.client, model: deps.model, recordDebug: deps.recordDebug }, {
               subtask: activeItem.task,
               knownSlots: knownForAction,
@@ -621,12 +622,7 @@ export async function runClosedLoopStep(
                 const knownItemsForPlanner = Array.from(new Set(plan.slotMemory.snapshot().map((e) => e.item).filter(i => i && i !== "empty")));
                 const cursorHoldingItem = plan.cursorItemSignature ? "(unknown item)" : null;
                 const { runPlanner } = await import("./subagents/fastUi/Planner");
-                const { markInventoryFrame } = await import("../tools/SlotMarker");
-                let markedObs = payload.obs ?? "";
-                try {
-                  const marked = markInventoryFrame(payload.obs ?? "", plan.sessionLayout as any);
-                  markedObs = `data:image/png;base64,${marked.pngBase64}`;
-                } catch { /* fall back to raw */ }
+                const markedObs = markedObsForLLMs ?? payload.obs ?? "";
                 const r0 = await runPlanner({ client: deps.client, model: deps.model, recordDebug: deps.recordDebug }, {
                   taskText: state.taskText,
                   recipeInfo: r,
