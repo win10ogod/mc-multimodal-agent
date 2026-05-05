@@ -81,6 +81,34 @@ export async function runClosedLoopStep(
     return emitMacroFrame(frame);
   }
 
+  // Planner re-judge after a successful chain. Fires once per arm.
+  if (state.closedLoopCraft && state.closedLoopCraft.judgeAfterChain && payload.obs) {
+    const cp = state.closedLoopCraft;
+    cp.judgeAfterChain = false;
+    try {
+      const knownForPlanner = cp.slotMemory.snapshot().map((e) => ({ index: 0, item: e.item }));
+      const { runPlanner } = await import("./subagents/fastUi/Planner");
+      const rj = await runPlanner({ client: deps.client, model: deps.model }, {
+        taskText: state.taskText,
+        recipeInfo: cp.recipeOverride,
+        knownSlots: knownForPlanner,
+        currentChecklist: cp.checklist,
+        trigger: "post_action",
+        recentHistory: state.closedLoopHistory.slice(0, 3),
+        obsBase64: payload.obs,
+      });
+      cp.checklist = rj.checklist;
+      if (rj.kind === "all_done") {
+        cp.done = true;
+        state.earlyStop = true;
+        return { kind: "subgoal_done", summary: `FastUI Planner all_done` };
+      }
+      cp.activeChecklistIdx = rj.nextIdx;
+    } catch (e) {
+      console.warn(`[fastui-planner] post_action re-judge failed: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  }
+
   // Closed-loop crafting (Image-Based Visual Servoing):
   //   - Each obs: detect layout + cursor.
   //   - If no pendingClick: probe VLM for next action, set the click target.
@@ -500,6 +528,23 @@ export async function runClosedLoopStep(
               state.closedLoopHistory.unshift(`recipe_lookup '${probed.item}' -> ${r.target} (${ingStr})`);
               state.closedLoopHistory = state.closedLoopHistory.slice(0, 5);
               console.log(`[agentbeats] recipe_lookup '${probed.item}' resolved: ingredients=${ingStr} inShape=${r.inShape ? "yes" : "no"}`);
+              try {
+                const knownForPlanner = plan.slotMemory.snapshot().map((e) => ({ index: 0, item: e.item }));
+                const { runPlanner } = await import("./subagents/fastUi/Planner");
+                const r0 = await runPlanner({ client: deps.client, model: deps.model }, {
+                  taskText: state.taskText,
+                  recipeInfo: r,
+                  knownSlots: knownForPlanner,
+                  currentChecklist: [],
+                  trigger: "first",
+                  recentHistory: state.closedLoopHistory.slice(0, 3),
+                  obsBase64: payload.obs ?? "",
+                });
+                plan.checklist = r0.checklist;
+                plan.activeChecklistIdx = r0.kind === "continue" ? r0.nextIdx : -1;
+              } catch (e) {
+                console.warn(`[fastui-planner] initial seed failed: ${e instanceof Error ? e.message : String(e)}`);
+              }
             } else {
               state.closedLoopHistory.unshift(`recipe_lookup '${probed.item}' -> NOT FOUND in minecraft-data`);
               state.closedLoopHistory = state.closedLoopHistory.slice(0, 5);
@@ -1116,6 +1161,12 @@ export async function runClosedLoopStep(
               console.log(`[agentbeats] cursorItemSignature set from pickup ${pc.slotName ?? pc.rasterIndex}: rgb=(${pc.prePatch.meanR.toFixed(0)},${pc.prePatch.meanG.toFixed(0)},${pc.prePatch.meanB.toFixed(0)})`);
             } else if (pc.actionKind === "place_all" || pc.kind === "auto_return") {
               plan.cursorItemSignature = null;
+            }
+            // Arm Planner re-judge after the LAST click in a chain
+            // (i.e. when no more clicks queued). The runtime fires
+            // Planner on the next entry to this function.
+            if (plan.pendingChain.length === 0) {
+              plan.judgeAfterChain = true;
             }
             // Advance the chain: if there's a queued follow-up click
             // (e.g. the place_one or auto_return inside a "move" op),
