@@ -1081,6 +1081,16 @@ export async function runClosedLoopStep(
           if (matched) {
             state.closedLoopHistory.unshift(`${pc.actionKind ?? pc.kind ?? "click"} slot=${pc.rasterIndex}${pc.slotName ? `(${pc.slotName})` : ""} OK`);
             state.closedLoopHistory = state.closedLoopHistory.slice(0, 5);
+            // On a matched place_* verify, write the placed item name
+            // into slotMemory at the destination so the next probe sees
+            // it under "Known slot contents" and the recipe Placement
+            // plan correctly marks the step [DONE -- skip]. Without
+            // this, Known never updates from a place success and the
+            // probe re-emits the same place every iteration.
+            if ((pc.actionKind === "place_one" || pc.actionKind === "place_all") && pc.placedItemName) {
+              plan.slotMemory.record(slotCenter.cx, slotCenter.cy, pc.placedItemName, plan.iteration);
+              console.log(`[agentbeats] slotMemory write on place verify: slot=${pc.rasterIndex}(${pc.slotName ?? "?"}) item=${pc.placedItemName}`);
+            }
             // Record / clear cursorItemSignature based on this click:
             //   pickup OK  -> cursor now carries the item from the source slot.
             //                Capture the source's prePatch RGB as the signature.
