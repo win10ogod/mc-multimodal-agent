@@ -127,14 +127,29 @@ export async function runClosedLoopStep(
     const cp = state.closedLoopCraft;
     cp.judgeAfterChain = false;
     try {
-      const knownItemsForPlanner = Array.from(new Set(cp.slotMemory.snapshot().map((e) => e.item).filter(i => i && i !== "empty")));
+      // Cross-ref slotMemory pixel positions with the live layout to surface
+      // concrete slot indices to the Planner (same shape Action sees).
+      const sessionLayoutTyped = cp.sessionLayout as ReturnType<typeof detectGuiLayout> | null;
+      const planLayoutSlots = sessionLayoutTyped?.slots ?? [];
+      const knownSlotsForPlanner = cp.slotMemory.snapshot()
+        .filter((e) => e.item && e.item !== "empty")
+        .map((e) => {
+          const closest = planLayoutSlots.reduce<{ s: typeof planLayoutSlots[number] | null; d: number }>(
+            (acc, s) => {
+              const d = Math.hypot(s.cx - e.x, s.cy - e.y);
+              return d < acc.d ? { s, d } : acc;
+            },
+            { s: null, d: Number.POSITIVE_INFINITY },
+          );
+          return { index: closest.s?.index ?? 0, name: closest.s?.name, item: e.item };
+        });
       const cursorHoldingItem = cp.cursorItemSignature ? "(unknown item)" : null;
       const { runPlanner } = await import("./subagents/fastUi/Planner");
       const markedObs = markedObsForLLMs ?? payload.obs;
       const rj = await runPlanner({ client: deps.client, model: deps.model, recordDebug: deps.recordDebug }, {
         taskText: state.taskText,
         recipeInfo: cp.recipeOverride,
-        knownItems: knownItemsForPlanner,
+        knownSlots: knownSlotsForPlanner,
         cursorHolding: cursorHoldingItem,
         currentChecklist: cp.checklist,
         trigger: "post_action",
@@ -628,14 +643,25 @@ export async function runClosedLoopStep(
               state.closedLoopHistory = state.closedLoopHistory.slice(0, 5);
               console.log(`[agentbeats] recipe_lookup '${probed.item}' resolved: ingredients=${ingStr} inShape=${r.inShape ? "yes" : "no"}`);
               try {
-                const knownItemsForPlanner = Array.from(new Set(plan.slotMemory.snapshot().map((e) => e.item).filter(i => i && i !== "empty")));
+                const knownSlotsForPlanner = plan.slotMemory.snapshot()
+                  .filter((e) => e.item && e.item !== "empty")
+                  .map((e) => {
+                    const closest = layoutForProbe.slots.reduce<{ s: typeof layoutForProbe.slots[number] | null; d: number }>(
+                      (acc, s) => {
+                        const d = Math.hypot(s.cx - e.x, s.cy - e.y);
+                        return d < acc.d ? { s, d } : acc;
+                      },
+                      { s: null, d: Number.POSITIVE_INFINITY },
+                    );
+                    return { index: closest.s?.index ?? 0, name: closest.s?.name, item: e.item };
+                  });
                 const cursorHoldingItem = plan.cursorItemSignature ? "(unknown item)" : null;
                 const { runPlanner } = await import("./subagents/fastUi/Planner");
                 const markedObs = markedObsForLLMs ?? payload.obs ?? "";
                 const r0 = await runPlanner({ client: deps.client, model: deps.model, recordDebug: deps.recordDebug }, {
                   taskText: state.taskText,
                   recipeInfo: r,
-                  knownItems: knownItemsForPlanner,
+                  knownSlots: knownSlotsForPlanner,
                   cursorHolding: cursorHoldingItem,
                   currentChecklist: [],
                   trigger: "first",

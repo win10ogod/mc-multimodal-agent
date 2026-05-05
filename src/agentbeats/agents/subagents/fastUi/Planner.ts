@@ -14,9 +14,10 @@ export type PlannerInput = {
    *  for non-craft GUIs (smelting, chest, etc) where the planner
    *  decomposes from task text + frame alone. */
   recipeInfo: RecipeInfo | null;
-  /** Items the planner knows are in inventory (item names only — no
-   *  slot indices). Action does the slot resolution. */
-  knownItems: string[];
+  /** OCR-confirmed slot contents. Same shape Action sees — both share
+   *  the perception so a slot index in either prompt unambiguously
+   *  refers to the same SoM badge in the live frame. */
+  knownSlots: Array<{ index: number; name?: string; item: string }>;
   /** What the cursor is currently carrying, if anything. */
   cursorHolding: string | null;
   /** Empty on first invocation; otherwise the in-flight list. */
@@ -74,6 +75,9 @@ const SCHEMA = {
   },
 } as const;
 
+// Static role/contract for the Planner LLM. Per-call data (known_slots,
+// cursor_holding, recipe, history, etc.) is rendered into the USER message
+// — this prompt is identical across calls so it stays cache-friendly.
 const SYS = `You plan a checklist of symbolic subtasks for a Minecraft GUI subagent (any GUI: crafting, smelting, brewing, chest, anvil, etc.) and update progress after each Action report.
 
 Subtask kinds (no numbers, no slot indices):
@@ -83,13 +87,26 @@ Subtask kinds (no numbers, no slot indices):
 - wait_for_output { expectedItem }
 - verify_state { condition }
 
-On the FIRST call for a crafting task: emit one place_in_craft_grid per ingredient unit (one slot is one item) → take_result { expectedItem }. Use verify_items_visible first only if known_items doesn't already cover the recipe ingredients.
+On the FIRST call for a crafting task: emit one place_in_craft_grid per ingredient unit (one slot is one item) → take_result { expectedItem }. Use verify_items_visible first only if the tracked status doesn't already cover the recipe ingredients.
 
-On post_action calls: VERIFY the Action's last report against the actual frame + known_items before ticking done. Action sometimes falsely reports success — never trust its OK at face value. Confirm visually that the expected effect occurred. If the report says success but the frame disagrees, leave the item undone. Preserve item ids and order. Keep activeIdx for one more attempt only if observation shows partial progress; otherwise advance / replace / mark done. Never return same activeIdx with attempts >= 3 unchanged.
+On post_action calls: VERIFY the Action's last report against the actual frame + tracked status before ticking done. Action sometimes falsely reports success — never trust its OK at face value. Confirm visually that the expected effect occurred. If the report says success but the frame disagrees, leave the item undone. Preserve item ids and order. Keep activeIdx for one more attempt only if observation shows partial progress; otherwise advance / replace / mark done. Never return same activeIdx with attempts >= 3 unchanged.
 
 Output strict JSON:
   { "all_done": bool, "next_idx": int (-1 if all_done), "checklist": [...] }
 Each item: { id, text, task, done, attempts }. PRESERVE attempts.`;
+
+function buildUserText(input: PlannerInput, userPayload: Record<string, unknown>): string {
+  const knownSlotsBlock = input.knownSlots.length > 0
+    ? input.knownSlots.map((s) => `  slot ${s.index}${s.name ? `(${s.name})` : ""} = ${s.item}`).join("\n")
+    : "  (none yet — Action agent will OCR-confirm slots as it works)";
+  const cursorBlock = input.cursorHolding ?? "(empty)";
+  return `Tracked status from action agent (OCR-confirmed — trust this):
+${knownSlotsBlock}
+Cursor holding: ${cursorBlock}
+
+Payload:
+${JSON.stringify(userPayload, null, 2)}`;
+}
 
 let PLANNER_CALL_SEQ = 0;
 
@@ -103,13 +120,14 @@ export async function runPlanner(deps: PlannerDeps, input: PlannerInput): Promis
           inShape: input.recipeInfo.inShape,
         }
       : null,
-    known_items: input.knownItems,
+    known_slots: input.knownSlots,
     cursor_holding: input.cursorHolding,
     current_checklist: input.currentChecklist,
     trigger: input.trigger,
     recent_history: input.recentHistory,
   };
 
+  const userText = buildUserText(input, userPayload);
   const seq = String(++PLANNER_CALL_SEQ).padStart(5, "0");
   const debugDir = process.env.AGENTBEATS_DEBUG_DIR;
   if (debugDir) {
@@ -118,7 +136,7 @@ export async function runPlanner(deps: PlannerDeps, input: PlannerInput): Promis
       const fs = require("node:fs") as typeof import("node:fs");
       // eslint-disable-next-line @typescript-eslint/no-require-imports
       const pathMod = require("node:path") as typeof import("node:path");
-      const promptText = `[fastui-planner ${seq}]\nSYSTEM:\n${SYS}\n\nUSER (JSON):\n${JSON.stringify(userPayload, null, 2)}\n`;
+      const promptText = `[fastui-planner ${seq}]\nSYSTEM:\n${SYS}\n\nUSER:\n${userText}\n`;
       fs.writeFileSync(pathMod.join(debugDir, `fastui_planner_${seq}_prompt.txt`), promptText);
       if (input.obsBase64) {
         const m = input.obsBase64.match(/^data:image\/([a-z]+);base64,(.+)$/);
@@ -143,7 +161,7 @@ export async function runPlanner(deps: PlannerDeps, input: PlannerInput): Promis
       {
         role: "user",
         content: [
-          { type: "text", text: JSON.stringify(userPayload) },
+          { type: "text", text: userText },
           { type: "image_url", image_url: { url: dataUrl, detail: "low" } },
         ],
       },
