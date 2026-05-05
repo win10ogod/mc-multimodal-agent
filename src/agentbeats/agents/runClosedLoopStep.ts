@@ -133,7 +133,18 @@ export async function runClosedLoopStep(
   // `cursorHoldingMut`.
   if (state.closedLoopCraft && payload.obs) {
     const cp = state.closedLoopCraft;
-    const layoutForMut = cp.sessionLayout as ReturnType<typeof detectGuiLayout> | null;
+    // Skip the resolver while a click chain is mid-flight. Pickup
+    // briefly empties the source slot (cursor holds the whole stack)
+    // between pickup-verify and auto_return; running the migration
+    // tracker in that window would see the source as "vanished" and
+    // invalidate the slot's known-item entry, even though auto_return
+    // is about to refill it. Only resolve when the agent is idle and
+    // a probe is what's about to happen.
+    const chainInFlight = cp.pendingClick !== null
+      || cp.pendingChain.length > 0
+      || cp.pendingOcrBatch !== null
+      || cp.pendingTooltipRead !== null;
+    const layoutForMut = chainInFlight ? null : (cp.sessionLayout as ReturnType<typeof detectGuiLayout> | null);
     if (layoutForMut && layoutForMut.slots.length > 0) {
       const cursorNow = detectCursorWithExpectation(payload.obs, layoutForMut, null);
       type Fp = { meanR: number; meanG: number; meanB: number; stddev: number };
@@ -1516,8 +1527,43 @@ export async function runClosedLoopStep(
             // this, Known never updates from a place success and the
             // probe re-emits the same place every iteration.
             if ((pc.actionKind === "place_one" || pc.actionKind === "place_all") && pc.placedItemName) {
-              plan.slotMemory.record(slotCenter.cx, slotCenter.cy, pc.placedItemName, plan.iteration);
-              console.log(`[agentbeats] slotMemory write on place verify: slot=${pc.rasterIndex}(${pc.slotName ?? "?"}) item=${pc.placedItemName}`);
+              // Capture destination fp+hash NOW so the resolver tracks
+              // this placement on subsequent frames.
+              const dstFp = samplePatchFingerprint(payload.obs, slotCenter.cx, slotCenter.cy, 6) ?? undefined;
+              const dstHash = samplePatchDHash(payload.obs, slotCenter.cx, slotCenter.cy, 16) ?? undefined;
+              // Similarity gate: if any existing slotMemory entry for
+              // placedItemName carries a baseline fp/hash (typically
+              // the source slot, which still holds the same item
+              // since most picks are place_one from a stack), compare
+              // it to what we just sampled at the destination. If the
+              // hash is far OR the fp is wildly different, the place
+              // didn't deposit what we thought (item swap, wrong slot,
+              // overwrote a different item) — log a warning and skip
+              // the slotMemory write so we don't poison Known with a
+              // wrong identity. If no source baseline exists, trust
+              // the click verifier and write unconditionally.
+              const HAMMING_OK = 24;
+              const FP_OK = 30;
+              let acceptWrite = true;
+              const sources = plan.slotMemory.snapshot()
+                .filter((e) => e.item === pc.placedItemName && (e.hash !== undefined || e.fingerprint));
+              if (sources.length > 0 && dstFp && dstHash !== undefined) {
+                const hasMatch = sources.some((src) => {
+                  const ham = src.hash !== undefined ? dHashDistance(src.hash, dstHash) : 999;
+                  const fd = src.fingerprint
+                    ? Math.hypot(dstFp.meanR - src.fingerprint.meanR, dstFp.meanG - src.fingerprint.meanG, dstFp.meanB - src.fingerprint.meanB)
+                    : 999;
+                  return ham <= HAMMING_OK || fd < FP_OK;
+                });
+                acceptWrite = hasMatch;
+                if (!hasMatch) {
+                  console.warn(`[agentbeats] place verify similarity FAIL: placed='${pc.placedItemName}' but dst pattern doesn't match any tracked baseline; skipping slotMemory write`);
+                }
+              }
+              if (acceptWrite) {
+                plan.slotMemory.record(slotCenter.cx, slotCenter.cy, pc.placedItemName, plan.iteration, dstFp, dstHash);
+                console.log(`[agentbeats] slotMemory write on place verify: slot=${pc.rasterIndex}(${pc.slotName ?? "?"}) item=${pc.placedItemName}${dstHash !== undefined ? ` hash=${dstHash.toString(16).slice(0, 8)}` : ""}`);
+              }
             }
             // Record / clear cursorItemSignature based on this click:
             //   pickup OK  -> cursor now carries the item from the source slot.
