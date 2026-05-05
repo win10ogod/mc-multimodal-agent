@@ -124,7 +124,10 @@ export async function runPlanner(deps: PlannerDeps, input: PlannerInput): Promis
       const promptText = `[fastui-planner ${seq}]\nSYSTEM:\n${SYS}\n\nUSER (JSON):\n${JSON.stringify(userPayload, null, 2)}\n`;
       fs.writeFileSync(pathMod.join(debugDir, `fastui_planner_${seq}_prompt.txt`), promptText);
       if (input.obsBase64) {
-        fs.writeFileSync(pathMod.join(debugDir, `fastui_planner_${seq}_input.jpg`), Buffer.from(input.obsBase64, "base64"));
+        const m = input.obsBase64.match(/^data:image\/([a-z]+);base64,(.+)$/);
+        const ext = m ? m[1] : "jpg";
+        const raw = m ? m[2] : input.obsBase64;
+        fs.writeFileSync(pathMod.join(debugDir, `fastui_planner_${seq}_input.${ext}`), Buffer.from(raw, "base64"));
       }
     } catch (e) {
       console.warn(`[fastui-planner ${seq}] debug dump failed: ${e instanceof Error ? e.message : String(e)}`);

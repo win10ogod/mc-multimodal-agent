@@ -107,6 +107,12 @@ export async function runClosedLoopStep(
       const knownItemsForPlanner = Array.from(new Set(cp.slotMemory.snapshot().map((e) => e.item).filter(i => i && i !== "empty")));
       const cursorHoldingItem = cp.cursorItemSignature ? "(unknown item)" : null;
       const { runPlanner } = await import("./subagents/fastUi/Planner");
+      const { markInventoryFrame } = await import("../tools/SlotMarker");
+      let markedObs = payload.obs;
+      try {
+        const marked = markInventoryFrame(payload.obs, cp.sessionLayout as any);
+        markedObs = `data:image/png;base64,${marked.pngBase64}`;
+      } catch { /* fall back to raw */ }
       const rj = await runPlanner({ client: deps.client, model: deps.model, recordDebug: deps.recordDebug }, {
         taskText: state.taskText,
         recipeInfo: cp.recipeOverride,
@@ -115,7 +121,7 @@ export async function runClosedLoopStep(
         currentChecklist: cp.checklist,
         trigger: "post_action",
         recentHistory: state.closedLoopHistory.slice(0, 3),
-        obsBase64: payload.obs,
+        obsBase64: markedObs,
       });
       cp.checklist = rj.checklist;
       if (rj.kind === "all_done") {
@@ -476,6 +482,7 @@ export async function runClosedLoopStep(
           let probed: import("../tools/InventoryProbe").CraftAction | null;
           if (useActionAgent) {
             const { runAction } = await import("./subagents/fastUi/Action");
+            const { markInventoryFrame } = await import("../tools/SlotMarker");
             // Cross-ref slotMemory entries (keyed by pixel pos) with the
             // current layout to surface concrete slot indices to Action.
             const knownForAction = plan.slotMemory.snapshot().map((e) => {
@@ -494,13 +501,22 @@ export async function runClosedLoopStep(
             const cursorHoldingItem = plan.cursorItemSignature ? "(unknown item)" : null;
             const activeItem = plan.checklist[plan.activeChecklistIdx];
             activeItem.attempts = (activeItem.attempts ?? 0) + 1;
+            // Apply Set-of-Mark labels so Action sees the YELLOW BADGES
+            // its prompt instructs it to read.
+            let markedObs = payload.obs ?? "";
+            try {
+              const marked = markInventoryFrame(payload.obs ?? "", plan.sessionLayout as any);
+              markedObs = `data:image/png;base64,${marked.pngBase64}`;
+            } catch (e) {
+              console.warn(`[fastui-action] SoM render failed: ${e instanceof Error ? e.message : String(e)}; using raw frame`);
+            }
             probed = await runAction({ client: deps.client, model: deps.model, recordDebug: deps.recordDebug }, {
               subtask: activeItem.task,
               knownSlots: knownForAction,
               layoutSlots: layoutForAction,
               recipeInfo: plan.recipeOverride,
               cursorHolding: cursorHoldingItem,
-              obsBase64: payload.obs ?? "",
+              obsBase64: markedObs,
             });
           } else {
             const result = await probeNextCraftAction({
@@ -605,6 +621,12 @@ export async function runClosedLoopStep(
                 const knownItemsForPlanner = Array.from(new Set(plan.slotMemory.snapshot().map((e) => e.item).filter(i => i && i !== "empty")));
                 const cursorHoldingItem = plan.cursorItemSignature ? "(unknown item)" : null;
                 const { runPlanner } = await import("./subagents/fastUi/Planner");
+                const { markInventoryFrame } = await import("../tools/SlotMarker");
+                let markedObs = payload.obs ?? "";
+                try {
+                  const marked = markInventoryFrame(payload.obs ?? "", plan.sessionLayout as any);
+                  markedObs = `data:image/png;base64,${marked.pngBase64}`;
+                } catch { /* fall back to raw */ }
                 const r0 = await runPlanner({ client: deps.client, model: deps.model, recordDebug: deps.recordDebug }, {
                   taskText: state.taskText,
                   recipeInfo: r,
@@ -613,7 +635,7 @@ export async function runClosedLoopStep(
                   currentChecklist: [],
                   trigger: "first",
                   recentHistory: state.closedLoopHistory.slice(0, 3),
-                  obsBase64: payload.obs ?? "",
+                  obsBase64: markedObs,
                 });
                 plan.checklist = r0.checklist;
                 plan.activeChecklistIdx = r0.kind === "continue" ? r0.nextIdx : -1;
