@@ -1346,26 +1346,27 @@ export async function runClosedLoopStep(
             state.closedLoopHistory.unshift(`${pc.actionKind ?? pc.kind ?? "click"} slot=${pc.rasterIndex}${pc.slotName ? `(${pc.slotName})` : ""} OK`);
             state.closedLoopHistory = state.closedLoopHistory.slice(0, 5);
             // On a matched place_* verify, write the placed item name
-            // into slotMemory at the destination so the next probe sees
-            // it under "Known slot contents" and the recipe Placement
-            // plan correctly marks the step [DONE -- skip]. Without
-            // this, Known never updates from a place success and the
-            // probe re-emits the same place every iteration.
-            // Baseline 6398f3f contract: click verify does NOT write
-            // slotMemory at the destination. The next probe's Pass B
-            // appearance scan finds the new occupant by fingerprint
-            // match against still-known item baselines, then records
-            // it. Writing here was problematic in two ways:
-            //   - same-item-different-cell-size hash divergence made
-            //     a similarity gate either reject legit placements
-            //     (HAMMING_OK=24) or accept misplacements (HAMMING_OK
-            //     too loose).
-            //   - bypassing Pass B meant invalidate→appear identity
-            //     linkage broke: the source slot's invalidation no
-            //     longer paired with the destination's fill, so the
-            //     appearance match never ran on subsequent frames.
-            // The cursorItemSignature update below carries cursor
-            // identity across the chain in the meantime.
+            // into slotMemory at the destination so the next probe
+            // sees it under "Known slot contents". Without this:
+            //   - take_result loops forever (the just-taken target
+            //     never appears in Known at the destination, so
+            //     Planner can't tick step6 done).
+            //   - Pass B's fingerprint-match on the next probe only
+            //     works when the placed item already has a captured
+            //     baseline; for newly-crafted output (diorite from
+            //     the result slot) there's no prior baseline to
+            //     match against, so the appearance scan misses it.
+            // Baseline 6398f3f had this write — over-zealous similarity
+            // gates I added later were the regression source, not the
+            // write itself. No similarity gate now: click verifier
+            // already CV-confirmed the slot got filled (post.stddev
+            // change matches expectAfter); placedItemName is taken
+            // from slotMemory at the source (or recipeOverride.target
+            // when source is the result slot — see chain build).
+            if ((pc.actionKind === "place_one" || pc.actionKind === "place_all") && pc.placedItemName) {
+              plan.slotMemory.record(slotCenter.cx, slotCenter.cy, pc.placedItemName, plan.iteration);
+              console.log(`[agentbeats] slotMemory write on place verify: slot=${pc.rasterIndex}(${pc.slotName ?? "?"}) item=${pc.placedItemName}`);
+            }
             // Record / clear cursorItemSignature based on this click:
             //   pickup OK  -> cursor now carries the item from the source slot.
             //                Capture the source's prePatch RGB as the signature.
