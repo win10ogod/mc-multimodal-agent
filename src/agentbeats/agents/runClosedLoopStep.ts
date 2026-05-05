@@ -101,14 +101,23 @@ export async function runClosedLoopStep(
 
   // Compute the SoM-labeled image ONCE per obs and share it between
   // the Planner re-judge and the Action dispatch — both see the same
-  // pixels with the same yellow badges since neither side mutates the
-  // frame, and the session-locked layout fixes badge positions for the
-  // lifetime of the GUI session.
+  // pixels with the same yellow badges. Layout is RE-DETECTED fresh
+  // every obs so dynamic panel changes (recipe-book opens, etc.) are
+  // immediately reflected in the slot list both LLMs see.
   let markedObsForLLMs: string | null = null;
-  if (state.closedLoopCraft && payload.obs && state.closedLoopCraft.sessionLayout) {
+  if (state.closedLoopCraft && payload.obs) {
     try {
       const { markInventoryFrame } = await import("../tools/SlotMarker");
-      const marked = markInventoryFrame(payload.obs, state.closedLoopCraft.sessionLayout as any);
+      const freshLayout = detectGuiLayout(payload.obs, state.closedLoopCraft.layoutHint ?? undefined);
+      if (freshLayout) {
+        // Refresh sessionLayout each obs so Planner + Action always see
+        // the current panel composition (including newly-revealed
+        // template anchors like recipe_book_button or recipe entries).
+        state.closedLoopCraft.sessionLayout = freshLayout;
+        state.closedLoopCraft.layoutHint = freshLayout.matchedLayoutId;
+      }
+      const layoutForMark = freshLayout ?? state.closedLoopCraft.sessionLayout;
+      const marked = markInventoryFrame(payload.obs, layoutForMark as any);
       markedObsForLLMs = `data:image/png;base64,${marked.pngBase64}`;
     } catch { /* fall back to raw */ }
   }

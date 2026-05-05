@@ -23,15 +23,12 @@ export type Subtask =
   | { kind: "take_result"; expectedItem: string }
   /** Wait for async output (smelting/brewing) to appear. */
   | { kind: "wait_for_output"; expectedItem: string }
-  /** Click a labelled UI button (anvil, enchant, trade). */
+  /** Click any labelled / role-tagged UI element. The Action agent
+   *  resolves buttonName to a concrete slot index — either by role
+   *  (e.g. "recipe_book_button" anchor surfaced via template match)
+   *  or by visual match within the current GUI panel. Used for the
+   *  recipe-book toggle, anvil rename button, recipe entries, etc. */
   | { kind: "click_button"; buttonName: string }
-  /** Toggle the player-inventory recipe book panel open. Action
-   *  resolves the click target via the recipe_book_button slot role
-   *  surfaced by the SlotDetector's template-anchor pass. */
-  | { kind: "open_recipe_book" }
-  /** Click a recipe entry inside the recipe-book panel. Action matches
-   *  the target item icon visually against panel cells. */
-  | { kind: "click_recipe_entry"; targetItem: string }
   /** Confirm-only step. Action emits done if condition holds in
    *  Known + frame. */
   | { kind: "verify_state"; condition: string };
