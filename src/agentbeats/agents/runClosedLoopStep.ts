@@ -187,12 +187,19 @@ export async function runClosedLoopStep(
       // of the cursor — hover highlight contaminates both signals.
       // Only sample dHash for slots that pass the chroma fill gate, so
       // the matcher never burns hash comparisons against empty slots.
+      // Bbox-size occupancy: items shrink the dark-grey slot interior
+      // bbox (the icon occludes most of it). Slots whose CV bbox is
+      // significantly smaller than the median neighbor are likely
+      // occupied — a pure-CV signal independent of color/chroma.
+      const allAreas = layoutForMut.slots.map((s) => s.w * s.h).filter((a) => a > 0).sort((a, b) => a - b);
+      const medianArea = allAreas.length > 0 ? allAreas[Math.floor(allAreas.length / 2)] : 0;
       const slotSigs: Array<{ index: number; cx: number; cy: number; fp: Fp; hash: bigint }> = [];
       for (const s of layoutForMut.slots) {
         if (cursorNow && Math.hypot(s.cx - cursorNow.x, s.cy - cursorNow.y) < 12) continue;
         const fp = samplePatchFingerprint(payload.obs, s.cx, s.cy, 6);
         if (!fp) continue;
-        if (!isFilled(fp)) continue;
+        const bboxOccluded = medianArea > 0 && s.w * s.h < medianArea * 0.7;
+        if (!isFilled(fp) && !bboxOccluded) continue;
         const hash = samplePatchDHash(payload.obs, s.cx, s.cy, 16);
         if (hash === null) continue;
         slotSigs.push({ index: s.index, cx: s.cx, cy: s.cy, fp, hash });
@@ -202,9 +209,11 @@ export async function runClosedLoopStep(
       // even when we haven't OCR'd the item name yet.
       cp.occupiedSlotIndices = slotSigs.map((s) => s.index);
       // Debug: dump the raw obs once per iteration so the resolver's
-      // input can be inspected offline. Marked frames are dumped by
-      // the Planner/Action call sites; this path captures the
-      // unmarked frame the resolver actually consumes.
+      // input can be inspected offline. MC's JPEG bytes come out of
+      // jpeg-js with R/B channels swapped (Alex hair reads blue),
+      // so a straight write of the JPEG bytes renders inverted colors
+      // in any viewer. Decode, swap BGR↔RGB, re-encode as PNG so the
+      // dumped image looks like what a human eye would see in-game.
       const debugDir = process.env.AGENTBEATS_DEBUG_DIR;
       if (debugDir) {
         try {
@@ -212,11 +221,20 @@ export async function runClosedLoopStep(
           const fs = require("node:fs") as typeof import("node:fs");
           // eslint-disable-next-line @typescript-eslint/no-require-imports
           const pathMod = require("node:path") as typeof import("node:path");
-          const m = payload.obs.match(/^data:image\/([a-z]+);base64,(.+)$/);
-          const ext = m ? m[1] : "jpg";
-          const raw = m ? m[2] : payload.obs;
+          // eslint-disable-next-line @typescript-eslint/no-require-imports
+          const jpeg = require("jpeg-js") as typeof import("jpeg-js");
+          // eslint-disable-next-line @typescript-eslint/no-require-imports
+          const { PNG } = require("pngjs") as typeof import("pngjs");
+          const cleaned = payload.obs.replace(/^data:image\/[a-z]+;base64,/, "");
+          const decoded = jpeg.decode(Buffer.from(cleaned, "base64"), { useTArray: true, formatAsRGBA: true });
+          const px = Buffer.from(decoded.data.buffer, decoded.data.byteOffset, decoded.data.byteLength);
+          for (let i = 0; i < px.length; i += 4) {
+            const r = px[i]; px[i] = px[i + 2]; px[i + 2] = r;
+          }
+          const png = new PNG({ width: decoded.width, height: decoded.height });
+          png.data.set(px);
           const seq = String(cp.iteration).padStart(5, "0");
-          fs.writeFileSync(pathMod.join(debugDir, `resolver_${seq}_raw.${ext}`), Buffer.from(raw, "base64"));
+          fs.writeFileSync(pathMod.join(debugDir, `resolver_${seq}_raw.png`), PNG.sync.write(png));
         } catch { /* swallow */ }
       }
       // Match each tracked item by Hamming distance on dHash. The hash

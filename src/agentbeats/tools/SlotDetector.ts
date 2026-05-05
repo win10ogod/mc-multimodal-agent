@@ -946,21 +946,21 @@ function annotateWithLayout(
   //    covers slots with items in them (icon darkens slot interior past
   //    our threshold) -- we still have the layout's pixel center.
   const out: GuiSlot[] = [];
-  // Discovered + matched slots: keep CV centroid (anchored to actual
-  // rendered slot pixels — more accurate than the template's predicted
-  // position when window detection is even slightly off). Force the
-  // bbox to FULL slot side so the SoM mark covers the whole slot
-  // regardless of how much of the interior the connected component
-  // managed to capture (item icons occlude most of the dark-grey
-  // interior, shrinking the cv bbox).
+  // Discovered + matched slots: keep CV centroid AND CV bbox size.
+  // The bbox size carries an occupancy signal — slots with item icons
+  // have a smaller dark-grey interior than empty slots, so their
+  // connected-component bbox shrinks. Downstream isFilled() compares
+  // bbox area to the median to derive occupancy without needing
+  // chroma/stddev. Backfilled slots (no cv match at all) use the
+  // median slotPx since we have no per-slot bbox to inspect.
   const slotPx = Math.max(8, Math.round(disc.slotPx));
   for (const m of matched) {
     out.push({
       index: 0,
       cx: m.disc.cx,
       cy: m.disc.cy,
-      w: slotPx,
-      h: slotPx,
+      w: m.disc.w,
+      h: m.disc.h,
       name: layoutScreen[m.layoutIdx].name,
       role: layoutScreen[m.layoutIdx].role,
     });
@@ -981,7 +981,7 @@ function annotateWithLayout(
   // Unmatched discovered components (probably spurious or modded extras):
   // keep them anonymous so the agent can still see them.
   for (const u of unmatched) {
-    out.push({ index: 0, cx: u.cx, cy: u.cy, w: slotPx, h: slotPx });
+    out.push({ index: 0, cx: u.cx, cy: u.cy, w: u.w, h: u.h });
   }
   // Unmatched discovered components (probably spurious or modded extras):
   // keep them anonymous so the agent can still see them.
