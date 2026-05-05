@@ -895,9 +895,17 @@ export async function runClosedLoopStep(
                   destPatch.meanB - plan.cursorItemSignature.meanB,
                 )
               : null;
-            const destKnownDifferent = toMem && toMem.item !== "empty" && toMem.item !== "unknown" && cursorItemName && toMem.item !== cursorItemName;
+            const destKnownDifferent = !!(toMem && toMem.item !== "empty" && toMem.item !== "unknown" && cursorItemName && toMem.item !== cursorItemName);
+            // CV fallback fires only when slotMemory has NO entry at
+            // the destination AND we have an active cursor signature
+            // to compare against. Without a cursor signature the
+            // stddev test alone has way too many false positives
+            // (shadow borders between craft cells read as filled).
+            // If neither slotMemory nor cursor signature gives a
+            // definitive signal, PROCEED — the click verifier will
+            // catch any real post-place mismatch.
             const destPatchSameItem = sigDist !== null && sigDist < 30;
-            const destPatchFilledDifferent = !!destPatch && destPatch.stddev > 35 && !destPatchSameItem;
+            const destPatchFilledDifferent = !!destPatch && destPatch.stddev > 35 && plan.cursorItemSignature !== null && !destPatchSameItem;
             const destLooksFilled = destKnownDifferent || (!toMem && destPatchFilledDifferent);
             if (deps.debugDir && destPatch && toSlot) {
               void deps.recordDebug("pre_check_move", {
@@ -916,9 +924,21 @@ export async function runClosedLoopStep(
             if (!fromSlot || !toSlot) {
               console.warn(`[agentbeats] move from=${probed.from} to=${probed.to}: slot(s) not in layout (have ${layoutForProbe.slots.length}); skipping`);
             } else if (destLooksFilled) {
-              console.warn(`[agentbeats] move to=${probed.to}(${toSlot.name ?? "?"}) refused: destination looks FILLED (stddev=${destPatch!.stddev.toFixed(1)} > 35); place_all here would trigger an item swap. Reprobe`);
-              state.closedLoopHistory.unshift(`refused move to=${probed.to}(${toSlot.name ?? "?"}) (destination already has an item; pick a visually empty slot)`);
+              const reason = destKnownDifferent
+                ? `slotMemory says toSlot has ${toMem!.item} (cursor would deposit ${cursorItemName})`
+                : `CV says destination filled (stddev=${destPatch!.stddev.toFixed(1)})`;
+              console.warn(`[agentbeats] move to=${probed.to}(${toSlot.name ?? "?"}) refused: ${reason}; would trigger item swap. Re-judging.`);
+              state.closedLoopHistory.unshift(`refused move to=${probed.to}(${toSlot.name ?? "?"}) (${reason}; pick a visually empty slot)`);
               state.closedLoopHistory = state.closedLoopHistory.slice(0, 5);
+              // Mark active subtask attempts++ and arm Planner re-
+              // judge so the next iter dispatches a different target
+              // slot. Returning a noop frame keeps the inventory
+              // open — falling through to the parent VLM here would
+              // press 'inventory' and close the GUI mid-craft.
+              const activeItem = plan.checklist[plan.activeChecklistIdx];
+              if (activeItem) activeItem.attempts = (activeItem.attempts ?? 0) + 1;
+              plan.judgeAfterChain = true;
+              return { kind: "act", action: defaultMcuAction(), holdSteps: 1 };
             } else if (
               plan.pickupSourceSlot
               && plan.pickupSourceSlot.name
@@ -1504,8 +1524,15 @@ export async function runClosedLoopStep(
               // the slotMemory write so we don't poison Known with a
               // wrong identity. If no source baseline exists, trust
               // the click verifier and write unconditionally.
-              const HAMMING_OK = 24;
-              const FP_OK = 30;
+              // Loose thresholds — same item rendered in different
+              // cell sizes (hotbar vs craft cell) diverges to ham ~30
+              // even though it's clearly the same block. Tighter
+              // thresholds were rejecting legitimate cob/quartz
+              // placements and leaving slotMemory empty at the
+              // destination, which then poisoned downstream prompts
+              // with "unknown item" for the just-placed ingredient.
+              const HAMMING_OK = 36;
+              const FP_OK = 50;
               let acceptWrite = true;
               const sources = plan.slotMemory.snapshot()
                 .filter((e) => e.item === pc.placedItemName && (e.hash !== undefined || e.fingerprint));
