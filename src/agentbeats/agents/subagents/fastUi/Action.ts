@@ -41,7 +41,7 @@ const SYS = `You execute ONE symbolic subtask in a Minecraft GUI. You receive th
 
 Subtask → action mapping:
 - verify_items_visible { items }: emit verify_slots on up to 3 hotbar/main_inv slots that VISUALLY look like one of the listed items. Do NOT verify slots already named in tracked_items. If you cannot pick a confident candidate visually, emit fallback_manual.
-- place_in_craft_grid { item }: (1) pick a craft cell (role starts "craft_2x2_" or "craft_3x3_") matching this item's recipe position. (2) Find the source slot in tracked_items where the named item is recorded. If the item isn't in tracked_items, emit verify_slots on up to 3 unlisted hotbar slots that visually match. Once tracked_items names the item, emit move from=source to=craftCell count="one".
+- place_in_craft_grid { item }: When a "Placement plan" block is present (recipe known), pick the LOWEST-numbered plan step whose destination slot is NOT yet shown in Known holding the requested ingredient — that step's slot is the destination. When no Placement plan is present (no recipe yet, or shapeless / unmapped GUI), pick any visually-empty cell with role craft_2x2_/craft_3x3_ in raster order. Resolve the source from Known slot contents (item matches the requested ingredient; handle naming variants like "quartz" ↔ "nether_quartz"). If the source isn't in Known, emit verify_slots on up to 3 unlisted hotbar slots that visually match. Once source and dest are resolved, emit move from=source to=destSlot count="one".
 - take_result { expectedItem }: from = slot with role==="result"; to = free slot in known_slots; emit move count="all".
 - wait_for_output { expectedItem }: emit wait with holdSteps proportional to expected sim ticks (cap 60).
 - verify_state { condition }: if condition holds in frame+known, emit done; else fallback_manual.
@@ -101,8 +101,61 @@ function buildActionUserText(input: ActionInput): string {
       case "verify_state":         return `verify_state condition=${subtask.condition}`;
     }
   })();
+  // Build the explicit Placement plan block that baseline 6398f3f's
+  // probe surfaced inline. For shaped recipes, walk inShape and map
+  // (row, col) → raster slot index using the live layout's craft
+  // cells in raster order. For shapeless, round-robin ingredients.
+  // This is the single most load-bearing block for placement
+  // correctness — without it, Action has to derive slot indices from
+  // recipe.inShape geometry alone and routinely picks the wrong cell.
+  const craftCells = input.layoutSlots
+    .filter((s) => s.role === "craft_2x2" || s.role === "craft_3x3")
+    .sort((a, b) => a.index - b.index);
+  const gridSize = craftCells.length === 9 ? 3 : (craftCells.length === 4 ? 2 : 0);
+  let placementBlock = "";
+  if (input.recipeInfo && gridSize > 0) {
+    const gridLines: string[] = [`Craft grid: ${gridSize} rows x ${gridSize} cols. Cells are 1-indexed row-major (Row 1 Col 1 is top-left).`];
+    for (let r = 0; r < gridSize; r += 1) {
+      for (let c = 0; c < gridSize; c += 1) {
+        const cell = craftCells[r * gridSize + c];
+        if (cell) gridLines.push(`  Row ${r + 1} Col ${c + 1} = slot ${cell.index}${cell.name ? `(${cell.name})` : ""}`);
+      }
+    }
+    const planSteps: string[] = [];
+    if (input.recipeInfo.inShape) {
+      const rows = input.recipeInfo.inShape;
+      let i = 1;
+      for (let r = 0; r < rows.length; r += 1) {
+        for (let c = 0; c < rows[r].length; c += 1) {
+          const ing = rows[r][c];
+          if (!ing) continue;
+          const cell = craftCells[r * gridSize + c];
+          if (cell) planSteps.push(`  ${i}. place ${ing} at slot ${cell.index}${cell.name ? `(${cell.name})` : ""} (Row ${r + 1} Col ${c + 1})`);
+          i += 1;
+        }
+      }
+    } else {
+      const queues = input.recipeInfo.ingredients.map((it) => ({ ingredient: it.name, remaining: it.count }));
+      let cellIdx = 0, i = 1, qi = 0;
+      while (queues.some((q) => q.remaining > 0) && cellIdx < gridSize * gridSize) {
+        const q = queues[qi % queues.length];
+        if (q.remaining > 0) {
+          const cell = craftCells[cellIdx];
+          if (cell) {
+            const r = Math.floor(cellIdx / gridSize) + 1, c = (cellIdx % gridSize) + 1;
+            planSteps.push(`  ${i}. place ${q.ingredient} at slot ${cell.index}${cell.name ? `(${cell.name})` : ""} (Row ${r} Col ${c})`);
+            i += 1;
+          }
+          q.remaining -= 1;
+          cellIdx += 1;
+        }
+        qi += 1;
+      }
+    }
+    placementBlock = `${gridLines.join("\n")}\nPlacement plan:\n${planSteps.join("\n")}\n`;
+  }
   const recipeBlock = input.recipeInfo
-    ? `Recipe: ${input.recipeInfo.target}\n  ingredients: ${input.recipeInfo.ingredients.map((it) => `${it.count}x ${it.name}`).join(" + ")}\n  inShape: ${JSON.stringify(input.recipeInfo.inShape)}`
+    ? `Recipe: ${input.recipeInfo.target}\n  ingredients: ${input.recipeInfo.ingredients.map((it) => `${it.count}x ${it.name}`).join(" + ")}`
     : "Recipe: (none)";
   return `Subtask: ${subtaskLine}
 
@@ -113,7 +166,8 @@ Cursor: ${cursorBlock}
 Slots by role:
 ${roleLines.join("\n")}
 
-${recipeBlock}`;
+${recipeBlock}
+${placementBlock}`;
 }
 
 export async function runAction(deps: ActionDeps, input: ActionInput): Promise<CraftAction> {
