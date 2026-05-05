@@ -51,8 +51,23 @@ export type ProbeRequest = {
 // K_pitch=5.0 with deadzone=4 and converged stably at "stuck err ~5-8 px".
 // Earlier this session I tried K_yaw=3.5, K_pitch=6.5 hoping to fix the
 // stall but it didn't help (same floor) and regressed elsewhere. Reverting.
-const PX_PER_CAM_YAW = 8.5;
-const PX_PER_CAM_PITCH = 5.0;
+// Empirical sim response measured from servo_trajectory.jsonl
+// (servo-test eval biqlibgm9, May 2026). Earlier hard-coded values
+// of 8.5/5.0 were wildly off — yaw was 4× too high, which made the
+// servo's deadzone gate suppress legit corrections at err=12 px and
+// the cursor got stuck.
+//
+// Yaw  (cam=2°  → +4 px observed)        ⇒  2.0 px/deg
+// Pitch -10°    → -67 px observed         ⇒  6.7 px/deg (down)
+// Pitch +4°     → +11 px observed         ⇒  2.75 px/deg (small +ve)
+//
+// Pitch is asymmetric / magnitude-dependent — using the small-step
+// (precision phase) value 2.75 makes the controller's predicted
+// displacement match actual landing within ±1 px for the final
+// approach. Large-pitch frames overshoot the prediction but that's
+// fine for the rapid-approach phase.
+const PX_PER_CAM_YAW = 2.0;
+const PX_PER_CAM_PITCH = 2.75;
 const PITCH_DEADZONE_MIN = 4;        // smallest pitch cmd that still produces visible cursor motion in the sim
 // Camera bin granularity. The MC env appears to have a yaw deadzone
 // around ~2 deg — sub-2-deg cam values produce inconsistent or zero
