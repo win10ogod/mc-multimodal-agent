@@ -5,7 +5,7 @@ import type {
   SubAgentKind,
   SubAgentStep,
 } from "./SubAgent";
-import { planGoals } from "./GoalPlanner";
+import { runPlannerLoop } from "./PlannerLoop";
 import { detectGuiSlots } from "../tools/SlotDetector";
 import type { McuEnvAction } from "../McuPrompt";
 import { defaultMcuAction } from "../McuPrompt";
@@ -40,11 +40,18 @@ export async function dispatchObservation(
   if (state.earlyStop) return NOOP_DONE;
   state.iteration += 1;
 
-  if (state.subgoals.length === 0) {
-    const out = await planGoals({ client: deps.client, model: deps.plannerModel }, state.taskText, state.completedSummaries);
-    if (out.overall_done) { state.earlyStop = true; return NOOP_DONE; }
-    state.subgoals = out.subgoals;
-    // singleTask dropped in planner-first refactor — every task goes through planner loop
+  if (state.subgoals.length === 0 || state.idx >= state.subgoals.length) {
+    state.subgoals = []; state.idx = 0;
+    const r = await runPlannerLoop(
+      { client: deps.client, model: deps.plannerModel },
+      state, obs.imageBase64, obs.contextId,
+    );
+    if (r.kind === "done") { state.earlyStop = true; return NOOP_DONE; }
+    if (r.kind === "error") {
+      console.warn(`[dispatcher] planner error: ${r.reason}`);
+      state.earlyStop = true; return NOOP_DONE;
+    }
+    state.subgoals = [r.subgoal];
   }
 
   const current = state.subgoals[state.idx];
@@ -79,25 +86,17 @@ export async function dispatchObservation(
   }
 
   if (step.kind === "subgoal_done") {
-    state.pendingReflection = { subgoal: current, outcome: "done", summary: step.summary };
     state.completedSummaries.push(step.summary);
     state.history.push(`done: ${current.description} -> ${step.summary}`);
-    state.idx += 1;
-    if (state.idx >= state.subgoals.length) {
-      const out = await planGoals({ client: deps.client, model: deps.plannerModel }, state.taskText, state.completedSummaries);
-      if (out.overall_done || out.subgoals.length === 0) { state.earlyStop = true; return NOOP_DONE; }
-      state.subgoals = out.subgoals;
-      state.idx = 0;
-    }
+    state.pendingReflection = { subgoal: current, outcome: "done", summary: step.summary };
+    state.subgoals = []; state.idx = 0;  // force planner re-call next obs (which will see pendingReflection)
     return NOOP_ONE;
   }
 
   // subgoal_failed
-  state.pendingReflection = { subgoal: current, outcome: "failed", summary: step.reason };
+  state.completedSummaries.push(`SUBGOAL_FAILED: ${step.reason}`);
   state.history.push(`failed: ${current.description} -> ${step.reason}`);
-  const out = await planGoals({ client: deps.client, model: deps.plannerModel }, state.taskText, [...state.completedSummaries, `FAILED: ${step.reason}`]);
-  if (out.overall_done || out.subgoals.length === 0) { state.earlyStop = true; return NOOP_DONE; }
-  state.subgoals = out.subgoals;
-  state.idx = 0;
+  state.pendingReflection = { subgoal: current, outcome: "failed", summary: step.reason };
+  state.subgoals = []; state.idx = 0;
   return NOOP_ONE;
 }
