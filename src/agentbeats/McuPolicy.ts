@@ -724,13 +724,35 @@ export class McuVisualPolicy {
         const cursor = detectCursorWithExpectation(payload.obs, layout, null);
         plan.cursor = cursor ?? plan.cursor;
 
-        // No park step. After moveAway from the previous click the
-        // cursor is already at a window-corner safeSpot which is clear
-        // of slot grids, so re-SOM and VLM probe both work fine from
-        // there. Parking added a long detour (cursor: corner -> left
-        // -> next slot) that often got stuck mid-way and shaved no
-        // benefit on detection.
+        // Park the cursor in a clear left-side spot before each new
+        // probe. This is REQUIRED so the VLM can clearly see whether
+        // the cursor is carrying an item (held-item icon overlays the
+        // cursor sprite). With the cursor anywhere over a slot, the
+        // VLM cannot tell holding vs not-holding from the image alone.
         if (plan.pendingClick === null) {
+          const PARK_STEP_CAP = 6;
+          const parkSpot = {
+            x: layout.windowX + 8,
+            y: Math.round(layout.windowY + layout.windowH / 2),
+          };
+          const distFromPark = cursor ? Math.hypot(cursor.x - parkSpot.x, cursor.y - parkSpot.y) : Infinity;
+          if (distFromPark > 12 && plan.parkSteps < PARK_STEP_CAP) {
+            const stepResult = servoCursorStep({
+              cursor,
+              target: parkSpot,
+              button: "attack",
+              hitThresholdPx: 8,
+            });
+            if (stepResult && !stepResult.click) {
+              plan.parkSteps += 1;
+              console.log(`[agentbeats] park step=${plan.parkSteps}/${PARK_STEP_CAP}: cursor=(${cursor?.x},${cursor?.y}) -> (${parkSpot.x},${parkSpot.y}) ${stepResult.reason}`);
+              return { ...ACTION_PAYLOAD_PREFIX, action: stepResult.action, hold_steps: 1 };
+            }
+          }
+          if (plan.parkSteps >= PARK_STEP_CAP) {
+            console.warn(`[agentbeats] park step cap reached (${plan.parkSteps}); proceeding to probe with cursor at (${cursor?.x},${cursor?.y})`);
+          }
+          plan.parkSteps = 0;
           // Re-SOM only NOW, just before calling the VLM. Within an
           // in-flight click sequence the layout stays stable (we keep
           // using the locked session); fresh detection only matters at
@@ -796,6 +818,21 @@ export class McuVisualPolicy {
               const toSlot = layoutForProbe.slots[probed.to];
               if (!fromSlot || !toSlot) {
                 console.warn(`[agentbeats] move from=${probed.from} to=${probed.to}: slot(s) not in layout (have ${layoutForProbe.slots.length}); skipping`);
+              } else if (
+                plan.pickupSourceSlot
+                && plan.pickupSourceSlot.name
+                && toSlot.name === plan.pickupSourceSlot.name
+                && fromSlot.name !== plan.pickupSourceSlot.name
+              ) {
+                // Hard guard: VLM is asking to dump cursor contents into
+                // the slot we just refilled with the original ingredient
+                // via auto-return. This always triggers an item swap
+                // (e.g. crafted planks <-> log stack). Refuse and force
+                // the VLM to pick a different empty slot. Exception:
+                // a self-move (from==to) is the legit auto-return itself.
+                console.warn(`[agentbeats] move to=${probed.to}(${toSlot.name}) refused: that's the recorded pickup source slot which still holds the original ingredient -- placing here would swap items. Reprobe`);
+                state.closedLoopHistory.unshift(`refused move to=${probed.to}(${toSlot.name}) (would swap with returned ingredient stack)`);
+                state.closedLoopHistory = state.closedLoopHistory.slice(0, 5);
               } else {
                 const mkClick = (s: { index: number; name?: string; role?: string; cx: number; cy: number }, button: "attack" | "use", expectAfter: "should_empty" | "should_fill", actionKind: "pickup" | "place_one" | "place_all" | "take", kind: "click" | "auto_return"): import("./UiFastControl").PendingClick => ({
                   rasterIndex: s.index, slotName: s.name, slotRole: s.role,
@@ -811,7 +848,17 @@ export class McuVisualPolicy {
                   chain.push(mkClick(toSlot, "use", "should_fill", "place_one", "click"));
                   chain.push(mkClick(fromSlot, "attack", "should_fill", "place_all", "auto_return"));
                 }
-                plan.pickupSourceSlot = { index: fromSlot.index, name: fromSlot.name };
+                // Only record pickupSourceSlot when picking from a real
+                // ingredient source (hotbar/main_inv). Moves whose source
+                // is the result slot or a craft grid slot must NOT
+                // overwrite the recorded source -- that source is the
+                // slot we need to AVOID dumping crafted output into.
+                const fromIsIngredientSource =
+                  fromSlot.role === "hotbar" || fromSlot.role === "main_inv";
+                if (fromIsIngredientSource) {
+                  plan.pickupSourceSlot = { index: fromSlot.index, name: fromSlot.name };
+                  console.log(`[agentbeats] recorded pickupSourceSlot=${fromSlot.index} (${fromSlot.name ?? "?"}) for move`);
+                }
                 plan.pendingClick = chain.shift()!;
                 plan.pendingChain = chain;
                 plan.servoSteps = 0;
@@ -856,9 +903,10 @@ export class McuVisualPolicy {
                 state.closedLoopHistory.unshift(`refused take slot=${probed.slot} (cursor not empty)`);
                 state.closedLoopHistory = state.closedLoopHistory.slice(0, 5);
               } else {
-                if (probed.action === "pickup") {
+                if (probed.action === "pickup"
+                    && (probedSlot.role === "hotbar" || probedSlot.role === "main_inv")) {
                   plan.pickupSourceSlot = { index: probed.slot, name: probedSlot.name };
-                  console.log(`[agentbeats] recorded pickupSourceSlot=${probed.slot} (${probedSlot.name ?? "?"})`);
+                  console.log(`[agentbeats] recorded pickupSourceSlot=${probed.slot} (${probedSlot.name ?? "?"}) for legacy pickup`);
                 }
                 // Pre-take auto-return: "take" requires an empty cursor
                 // (otherwise it does nothing in MC). If we have a

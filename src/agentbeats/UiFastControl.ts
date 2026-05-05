@@ -531,14 +531,24 @@ export function servoCursorStep(opts: {
   }
   if (Math.abs(pitchDeg) * PX_PER_CAM_PITCH < PITCH_DEADZONE_MIN / 2) dp = 0;
   if (dy === 0 && dp === 0) {
-    // Servo can't compute a meaningful next move. DON'T blindly click --
-    // the cursor is in the deadzone but may still be outside the slot's
-    // hit region. Return a noop and let the caller bump the iteration cap
-    // and either retry or give up.
+    // Sub-quantum stuck: cursor is within ~half a cam-bin of the
+    // target but neither axis can compute a non-zero correction.
+    // Force the smallest cam (2 deg = ~17 px) in the dominant
+    // error axis so the cursor at least moves to a different sub-
+    // pixel position before the click cap fires. This breaks the
+    // deterministic stuck-then-click-the-same-pixel loop where the
+    // click consistently lands at the slot edge and MC's effective
+    // hit region rejects it.
+    const action = defaultMcuAction();
+    if (Math.abs(ex) >= Math.abs(ey)) {
+      action.camera = [0, Math.sign(ex) * 2];
+    } else {
+      action.camera = [Math.sign(ey) * 2, 0];
+    }
     return {
-      action: defaultMcuAction(),
+      action,
       click: false,
-      reason: `noop stuck err=${errMag.toFixed(1)}px (caller should retry/abort)`,
+      reason: `kick err=${errMag.toFixed(1)}px cam=[${action.camera[0]},${action.camera[1]}] (sub-quantum stuck nudge)`,
     };
   }
   const action = defaultMcuAction();

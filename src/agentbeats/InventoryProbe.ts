@@ -118,7 +118,6 @@ function buildSlotDescription(layout: GuiLayout): string {
   } else {
     lines.push(`Detected GUI: unknown — slots numbered in raster order.`);
   }
-  // Group slots by role for compact listing.
   const byRole = new Map<string, number[]>();
   const anonymous: number[] = [];
   for (const s of layout.slots) {
@@ -211,7 +210,7 @@ export async function probeNextCraftAction(opts: {
       ? "CURSOR IS EMPTY (CV-detected)."
       : "CURSOR STATE UNKNOWN.";
   const sourceLine = opts.pickupSourceSlot
-    ? `Original pickup source slot: index ${opts.pickupSourceSlot.index}${opts.pickupSourceSlot.name ? ` (${opts.pickupSourceSlot.name})` : ""}. Return leftover ingredients to THIS slot.`
+    ? `Original ingredient source slot: index ${opts.pickupSourceSlot.index}${opts.pickupSourceSlot.name ? ` (${opts.pickupSourceSlot.name})` : ""}. The tool already returns leftover ingredient back to this slot automatically -- do NOT use it as a destination for the crafted result; pick a DIFFERENT empty slot (look for a "." mark in the slot listing) for the result.`
     : "No pickup source recorded yet.";
 
   const promptText = [
@@ -237,13 +236,11 @@ export async function probeNextCraftAction(opts: {
     "",
     "Do NOT return a 'done' action -- task completion is decided by a different controller, not by you. Always emit the next move or put step that advances the task; if everything is already placed and the result is sitting in role=result, your next step is to move it out into a role=hotbar or role=main_inv slot.",
     "",
-    `Strategy:`,
-    `  Prefer the high-level "move" and "put" actions. The tool handles cursor state, swaps, and remainder-return automatically -- you only describe the intent one step at a time and we execute it. After each step the tool re-shows you the marked image so you can plan the next step.`,
+    `Rule: when the cursor is carrying an item, "to" must be a visually empty slot. Placing onto a filled slot triggers a swap. If you must deposit into an occupied slot S, use this 3-step sequence (cursor empty between pickups): (1) "put" current held item into an empty side slot to park it; (2) next probe: "move" the item from S to another empty slot; (3) next probe: "move" the parked item from the side slot to S.`,
     "",
-    `Required flow for ${opts.taskTarget}:`,
-    `  1. "move" one ${opts.ingredient} from a hotbar/main_inv slot (role=hotbar or main_inv) into a craft grid slot (role=craft_2x2 or craft_3x3) with count="one".`,
-    `  2. "move" the result (role=result, after recipe completes) into any EMPTY main_inv or hotbar slot with count="all".`,
-    `  3. Return "done" when ${opts.taskTarget} is visible in inventory.`,
+    `Flow for ${opts.taskTarget}:`,
+    `  1. move one ${opts.ingredient} from a hotbar/main_inv slot into a craft slot (count=one).`,
+    `  2. move the result (role=result) into an empty main_inv or hotbar slot (count=all).`,
     "",
     `This is iteration ${opts.iteration}. Return ONLY the JSON action.`,
   ].join("\n");
