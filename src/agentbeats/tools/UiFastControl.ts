@@ -54,12 +54,12 @@ export type ProbeRequest = {
 const PX_PER_CAM_YAW = 8.5;
 const PX_PER_CAM_PITCH = 5.0;
 const PITCH_DEADZONE_MIN = 4;        // smallest pitch cmd that still produces visible cursor motion in the sim
-// Camera bin granularity. Was 2 deg → ~17 px per yaw step / ~10 px
-// per pitch step, which is too coarse for slot-precision clicking
-// (slots are 18 px apart; a single 17 px jump can land in the
-// neighbor's territory). 1 deg → ~8.5 px yaw / 5 px pitch, bringing
-// landing precision inside MC's slot hit-box.
-const CAM_BIN_DEG = 1;
+// Camera bin granularity. The MC env appears to have a yaw deadzone
+// around ~2 deg — sub-2-deg cam values produce inconsistent or zero
+// cursor motion (logged: cam=[0,-1] left cursor stuck at the same
+// pixel for 4 frames). Stick with 2 deg as the smallest bin so
+// every emit reliably moves the cursor.
+const CAM_BIN_DEG = 2;
 const MAX_CAM_DEG = 10;
 
 // Slot pixel centers when inventory GUI is open at 640x360 obs.
@@ -629,75 +629,53 @@ export function servoCursorStep(opts: {
     if (opts.shift) action.sneak = 1;
     return { action, click: true, reason: `${opts.shift ? "shift+" : ""}click err=${errMag.toFixed(1)}px` };
   }
-  // Adaptive YAW gain (control-theory P-control with bin schedule).
-  // Yaw has continuous response in MC's sim — sub-degree commands
-  // produce proportionally smaller cursor motion. Bin shrinks as
-  // we approach target for precision landing.
-  //   errMag > 30 px : 2 deg yaw bin (~17 px) — coarse approach
-  //   15..30 px      : 1 deg (~8.5 px) — medium
-  //    8..15 px      : 0.5 deg (~4.3 px) — fine
-  //    < 8 px        : 0.25 deg (~2.1 px) — precision landing
-  // PITCH is asymmetric: MC's sim has a 4-deg deadzone (commands
-  // below PITCH_DEADZONE_MIN produce NO cursor motion). So we can't
-  // do precision pitch — instead, when pitch error is below the
-  // deadzone-equivalent (~10 px), accept the y position as good
-  // enough and only do yaw corrections. When pitch error is large,
-  // either inflate to PITCH_DEADZONE_MIN (small error in deadzone)
-  // or quantize at 1-deg bin (medium-large error).
-  let bin: number;
-  if (errMag > 30) bin = 2;
-  else if (errMag > 15) bin = 1;
-  else if (errMag > 8) bin = 0.5;
-  else bin = 0.25;
-  const yawClamped = Math.max(-MAX_CAM_DEG, Math.min(MAX_CAM_DEG, ex / PX_PER_CAM_YAW));
-  let dy = Math.round(yawClamped / bin) * bin;
-  // Pitch handling — deadzone-aware with optional delta-sigma
-  // integrator for sub-deadzone drift compensation.
-  //
-  // MC's sim has a 4-deg pitch deadzone: sub-4° commands produce
-  // ZERO cursor motion. Without compensation, sub-deadzone errors
-  // (|ey| < 20 px) result in y permanently stuck at ±10 px from
-  // target.
-  //
-  // Delta-sigma modulation (control-theory standard for actuators
-  // with deadzones): accumulate the sub-deadzone error across frames
-  // in the integrator. When accumulated error crosses the deadzone,
-  // emit a deadzone-min correction and decrement. This gives the
-  // cursor an average y-position that converges to target even
-  // though every individual frame is 0-or-deadzone pitch motion.
+  // Sim-model-aware control. Empirically measured response from
+  // logged frames:
+  //   - Yaw deadzone: ~2 deg (cam=[0,-1] left cursor stuck for 4
+  //     consecutive frames — sub-2° yaw produces no motion).
+  //   - Pitch deadzone: ~4 deg (existing PITCH_DEADZONE_MIN constant).
+  //   - Effective ratios: ~6.7 px/deg yaw, ~6.7 px/deg pitch (logged
+  //     cam=10 → ~67 px). The original PX_PER_CAM constants were
+  //     slightly optimistic.
+  // Strategy: every emitted cam command must clear the deadzone of
+  // its axis. Yaw quantized at 2° (CAM_BIN_DEG). Pitch quantized at
+  // PITCH_DEADZONE_MIN (4°). When either axis error is below its
+  // deadzone equivalent (~13 px yaw / ~26 px pitch), accept the
+  // residual on that axis and let the OTHER axis converge first.
+  // Delta-sigma integrator on pitch lets sub-deadzone pitch errors
+  // accumulate across frames and fire deadzone-min corrections
+  // periodically — cursor's time-average y still converges.
+  const yawDeadzonePx = CAM_BIN_DEG * PX_PER_CAM_YAW;
+  const pitchDeadzonePx = PITCH_DEADZONE_MIN * PX_PER_CAM_PITCH;
+  // Yaw: emit only when |ex| ≥ yaw deadzone. Quantize at 2° bin.
+  let dy = 0;
+  if (Math.abs(ex) >= yawDeadzonePx) {
+    const yawClamped = Math.max(-MAX_CAM_DEG, Math.min(MAX_CAM_DEG, ex / PX_PER_CAM_YAW));
+    dy = Math.round(yawClamped / CAM_BIN_DEG) * CAM_BIN_DEG;
+    if (dy === 0) dy = Math.sign(ex) * CAM_BIN_DEG;
+  }
+  // Pitch: deadzone-aware with delta-sigma integrator.
   let dp = 0;
-  const deadzonePx = PITCH_DEADZONE_MIN * PX_PER_CAM_PITCH;
-  if (Math.abs(ey) >= deadzonePx) {
-    // Large error — direct pitch command, quantize at 1° and inflate
-    // to deadzone-min if needed.
+  if (Math.abs(ey) >= pitchDeadzonePx) {
     const pitchClamped = Math.max(-MAX_CAM_DEG, Math.min(MAX_CAM_DEG, ey / PX_PER_CAM_PITCH));
     dp = Math.round(pitchClamped);
     if (Math.abs(dp) < PITCH_DEADZONE_MIN) {
       dp = Math.sign(pitchClamped || 1) * PITCH_DEADZONE_MIN;
     }
-    // Reset integrator on direct command — it's about to be
-    // satisfied by this frame's actual cursor motion.
     if (opts.integrator) opts.integrator.pitchAccumPx = 0;
   } else if (opts.integrator) {
-    // Sub-deadzone — accumulate the residual y-error.
     opts.integrator.pitchAccumPx += ey;
-    if (Math.abs(opts.integrator.pitchAccumPx) >= deadzonePx) {
-      // Integrator crossed threshold — fire one deadzone-min step
-      // and decrement the integrator by what this step "deposited".
+    if (Math.abs(opts.integrator.pitchAccumPx) >= pitchDeadzonePx) {
       dp = Math.sign(opts.integrator.pitchAccumPx) * PITCH_DEADZONE_MIN;
       opts.integrator.pitchAccumPx -= dp * PX_PER_CAM_PITCH;
     }
   }
   if (dy === 0 && dp === 0) {
-    // Cursor is within the deadzone for both axes — fire a small
-    // yaw nudge so the cursor at least moves before click cap.
-    const action = defaultMcuAction();
-    action.camera = [0, Math.sign(ex || 1) * bin];
-    return {
-      action,
-      click: false,
-      reason: `nudge err=${errMag.toFixed(1)}px cam=[0,${action.camera[1]}] bin=${bin} (sub-bin stuck)`,
-    };
+    // Both axes inside their deadzones — cursor as close as the sim
+    // can place it. Should be within click hit-region; the verifier
+    // tolerates ±8.5 px on x / ±10 px on y, which is exactly this
+    // "passive parking" zone.
+    return null;
   }
   const action = defaultMcuAction();
   action.camera = [dp, dy];

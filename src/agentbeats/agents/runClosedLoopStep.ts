@@ -1171,21 +1171,18 @@ export async function runClosedLoopStep(
             }
             return emit(defaultMcuAction());
           }
-          // Click only when the cursor is actually INSIDE the slot's
-          // INNER hit-box. The previous +2 px buffer (slotHalfW =
-          // round(w/2) + 2) allowed cursor to land at the slot edge
-          // — which MC's internal hit-test sometimes assigned to the
-          // NEIGHBORING slot. The cursor "tip" pixel (at the cursor
-          // sprite's top-left from template detection) at slot edge
-          // crosses into neighbor territory because slots are 18 px
-          // apart with only 16 px of visible interior. Tighten to
-          // round(w/2) - 2 (≈6 px for a 16 px slot) so cursor must
-          // be CLEARLY inside before firing — eliminates the
-          // accidental swap with neighbor and the place_one click
-          // missing the destination.
+          // Click hit-region. The sim's deadzones limit the cursor's
+          // best-case landing precision to ±yawDeadzone/2 (~8.5 px
+          // x) / ±pitchDeadzone/2 (~10 px y). Tightening below that
+          // leaves the cursor permanently outside the click region.
+          // Use round(w/2) + 2 (~10 px for a 16 px slot) which
+          // matches the deadzone-imposed precision. Slots are 18 px
+          // apart so this still keeps clicks inside the intended
+          // slot (cursor at +10 px from center is at the slot's
+          // edge, not the neighbor's interior).
           const slotForBox = layout!.slots[pc.rasterIndex];
-          const slotHalfW = Math.max(5, Math.round((slotForBox?.w ?? 16) / 2) - 2);
-          const slotHalfH = Math.max(5, Math.round((slotForBox?.h ?? 16) / 2) - 2);
+          const slotHalfW = Math.max(8, Math.round((slotForBox?.w ?? 16) / 2) + 2);
+          const slotHalfH = Math.max(8, Math.round((slotForBox?.h ?? 16) / 2) + 2);
           const cursorInsideSlot = !!cursor
             && Math.abs(cursor.x - slotCenter.cx) <= slotHalfW
             && Math.abs(cursor.y - slotCenter.cy) <= slotHalfH;
