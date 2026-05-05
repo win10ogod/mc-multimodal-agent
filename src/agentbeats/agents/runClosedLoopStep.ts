@@ -12,7 +12,7 @@ import {
   makeServoIntegrator,
 } from "../tools/UiFastControl";
 import { probeNextCraftAction, vlmVerifySlotState } from "../tools/InventoryProbe";
-import { detectCursorWithExpectation, detectGuiLayout, samplePatchFingerprint } from "../tools/SlotDetector";
+import { detectCursorWithExpectation, detectGuiLayout, samplePatchFingerprint, samplePatchPixels, patchSimilarity } from "../tools/SlotDetector";
 import { repairDecisionForTask, shouldUseModelOnStep } from "../McuPolicyUtils";
 import type { UiFastControlFrame } from "../tools/UiFastControl";
 
@@ -462,10 +462,14 @@ export async function runClosedLoopStep(
               knownSlots.push({ index: s.index, name: s.name, item: mem.item, ageIters: plan.iteration - mem.step });
               continue;
             }
-            if (!mem.fingerprint) {
+            if (!mem.fingerprint || !mem.patch) {
               // Lazy baseline capture from the probe frame (no hover).
-              plan.slotMemory.record(s.cx, s.cy, mem.item, mem.step, live);
-              console.log(`[agentbeats] fp baseline captured for slot ${s.index}(${s.name ?? "?"}) item='${mem.item}' meanRGB=(${live.meanR.toFixed(0)},${live.meanG.toFixed(0)},${live.meanB.toFixed(0)}) stddev=${live.stddev.toFixed(1)}`);
+              // Also capture pixel-level patch with BG masked — used
+              // as the authoritative tie-breaker when fp/stddev alone
+              // can't separate two items with similar mean RGB.
+              const patch = samplePatchPixels(payload.obs, s.cx, s.cy, 14) ?? undefined;
+              plan.slotMemory.record(s.cx, s.cy, mem.item, mem.step, mem.fingerprint ?? live, mem.patch ?? patch);
+              console.log(`[agentbeats] baseline captured slot ${s.index}(${s.name ?? "?"}) item='${mem.item}' fp=(${live.meanR.toFixed(0)},${live.meanG.toFixed(0)},${live.meanB.toFixed(0)}) stddev=${live.stddev.toFixed(1)} patch=${patch ? `${patch.w}x${patch.h}` : "no"}`);
               knownSlots.push({ index: s.index, name: s.name, item: mem.item, ageIters: plan.iteration - mem.step });
               continue;
             }
@@ -475,6 +479,12 @@ export async function runClosedLoopStep(
             const distFromBaseline = Math.sqrt(dr * dr + dg * dg + db * db);
             const liveLum = (live.meanR + live.meanG + live.meanB) / 3;
             const liveLooksEmpty = live.stddev < 20 && liveLum > 120 && liveLum < 160;
+            // Authoritative tie-breaker: pixel-level patch similarity.
+            // When fp/stddev says "maybe drifted" but patch says "same
+            // pixels", trust the patch — it's the only signal that
+            // can discriminate items with near-identical mean RGB.
+            const livePatch = samplePatchPixels(payload.obs, s.cx, s.cy, 14);
+            const patchSim = livePatch && mem.patch ? patchSimilarity(mem.patch, livePatch) : null;
             // Pass A: probe-time disappearance scan (baseline 6398f3f
             // contract). The slot's CV-live patch drifted FAR from
             // its OCR-time fingerprint AND visually looks like the
@@ -486,7 +496,14 @@ export async function runClosedLoopStep(
             // mid-chain. Disabling this scan was the regression vs
             // baseline: source slots stayed "filled" in slotMemory
             // long after the agent picked from them.
-            if (distFromBaseline > 40 && liveLooksEmpty) {
+            // Pixel-level patch authority: when patch similarity is
+            // HIGH (≥0.75), trust the slot still has the same item
+            // even if mean RGB drifted (e.g. hover highlight, stack
+            // count digits changed). When patch similarity is LOW
+            // (<0.45), confirm the item identity changed.
+            const patchSaysSame = patchSim !== null && patchSim >= 0.75;
+            const patchSaysDifferent = patchSim !== null && patchSim < 0.45;
+            if (distFromBaseline > 40 && liveLooksEmpty && !patchSaysSame) {
               disappearedItems.push(mem.item);
               if (mem.fingerprint) disappearedFps.push({ item: mem.item, fp: mem.fingerprint });
               plan.slotMemory.invalidate(s.cx, s.cy);
@@ -499,26 +516,18 @@ export async function runClosedLoopStep(
                 };
                 console.log(`[agentbeats] inferred cursor holding '${mem.item}' from disappearance at slot ${s.index}(${s.name ?? "?"})`);
               }
-              console.log(`[agentbeats] item disappeared: '${mem.item}' was at slot ${s.index}(${s.name ?? "?"}) -- dist=${distFromBaseline.toFixed(1)} liveLum=${liveLum.toFixed(1)} live.stddev=${live.stddev.toFixed(1)}`);
+              console.log(`[agentbeats] item disappeared: '${mem.item}' was at slot ${s.index}(${s.name ?? "?"}) -- dist=${distFromBaseline.toFixed(1)} patchSim=${patchSim?.toFixed(2) ?? "n/a"} liveLum=${liveLum.toFixed(1)} live.stddev=${live.stddev.toFixed(1)}`);
               continue;
             }
-            // SWAP DETECTION: slot still looks filled (not empty) but
-            // its fingerprint shifted SIGNIFICANTLY from baseline AND
-            // the cursor was holding something. MC's click semantics:
-            // clicking a filled slot with a non-empty cursor swaps
-            // contents — slot now has cursor's old item, cursor now
-            // has slot's old item. Detect this by comparing live fp
-            // to mem.fingerprint; large drift while still filled =
-            // swap signature. Exchange identities accordingly:
-            //   - slot's slotMemory entry is updated to the cursor's
-            //     prior item name (with a fresh fp baseline).
-            //   - cursor signature is updated to the slot's prior
-            //     item name (we KNOW what was there before).
-            // This is the user's request: "we can't prevent swap, but
-            // we can swap the context when slot HAS item and changes
-            // significantly".
+            // SWAP DETECTION: slot still looks filled but pixel patch
+            // says the contents are DIFFERENT (low patch similarity)
+            // AND cursor was holding a different item. MC's click
+            // semantics: clicking a filled slot with non-empty cursor
+            // swaps contents. Patch-similarity beats fp-drift here —
+            // mean RGB can drift for benign reasons (hover, stack
+            // count) but the actual icon pixels only change on swap.
             if (
-              distFromBaseline > 40
+              patchSaysDifferent
               && !liveLooksEmpty
               && live.stddev > 35
               && plan.cursorItemSignature
@@ -527,9 +536,11 @@ export async function runClosedLoopStep(
             ) {
               const cursorItem = plan.cursorItemSignature.item;
               const slotItem = mem.item;
-              // New slot identity = cursor's prior item; new fp = live.
+              // New slot identity = cursor's prior item; baselines
+              // (fp + patch) refreshed from current observation so
+              // future passes treat THIS as the new ground truth.
               plan.slotMemory.invalidate(s.cx, s.cy);
-              plan.slotMemory.record(s.cx, s.cy, cursorItem, plan.iteration, live);
+              plan.slotMemory.record(s.cx, s.cy, cursorItem, plan.iteration, live, livePatch ?? undefined);
               // New cursor identity = slot's prior item.
               if (mem.fingerprint) {
                 plan.cursorItemSignature = {

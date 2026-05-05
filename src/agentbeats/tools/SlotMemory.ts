@@ -19,11 +19,19 @@ export type SlotMemoryEntry = {
   item: string;
   step: number;
   /** RGB-mean+stddev fingerprint of the slot patch when the item was
-   *  last verified by OCR. Used by the cross-frame material-tracker
-   *  to decide whether the item is still at this anchor, has moved to
-   *  another slot, is on the cursor, or is missing -- without paying
-   *  another OCR call. */
+   *  last verified by OCR. Cheap first-pass identity check; same
+   *  mean+stddev across different items is common (grey blocks),
+   *  so falls back to `patch` for definitive comparison. */
   fingerprint?: { meanR: number; meanG: number; meanB: number; stddev: number };
+  /** Cropped icon pixels with the empty-slot grey background masked
+   *  out. Stored as a flat RGBA buffer + a foreground mask (1=icon
+   *  pixel, 0=BG). Captured from the RAW obs frame BEFORE the SoM
+   *  layout markers are drawn, so cursor-hover highlight + numbered
+   *  badges don't pollute the reference. Comparison uses SSD over
+   *  the foreground-mask intersection — discriminates two items with
+   *  near-identical mean RGB. Used as the authoritative tie-breaker
+   *  when fingerprint+stddev signals are ambiguous. */
+  patch?: { w: number; h: number; rgba: Uint8Array; mask: Uint8Array };
 };
 
 const MATCH_RADIUS_PX = 8;
@@ -33,13 +41,17 @@ export class SlotMemory {
   private entries: SlotMemoryEntry[] = [];
 
   /** Record (or update) what is at an absolute pixel position. */
-  record(x: number, y: number, item: string, step: number, fingerprint?: SlotMemoryEntry["fingerprint"]): void {
+  record(x: number, y: number, item: string, step: number, fingerprint?: SlotMemoryEntry["fingerprint"], patch?: SlotMemoryEntry["patch"]): void {
     const idx = this.findClosestIndex(x, y);
     if (idx >= 0) {
       const prev = this.entries[idx];
-      this.entries[idx] = { x, y, item, step, fingerprint: fingerprint ?? prev.fingerprint };
+      this.entries[idx] = {
+        x, y, item, step,
+        fingerprint: fingerprint ?? prev.fingerprint,
+        patch: patch ?? prev.patch,
+      };
     } else {
-      this.entries.push({ x, y, item, step, fingerprint });
+      this.entries.push({ x, y, item, step, fingerprint, patch });
     }
   }
 
