@@ -439,23 +439,43 @@ export async function runClosedLoopStep(
               }
             }
           }
-          const result = await probeNextCraftAction({
-            client: deps.client,
-            model: deps.model,
-            obsBase64: payload.obs,
-            taskText: plan.taskText,
-            iteration: plan.iteration,
-            sessionLayout: layoutForProbe, // freshly redetected for each probe
-            recentActions: state.closedLoopHistory,
-            cursorHolding,
-            pickupSourceSlot: plan.pickupSourceSlot ?? null,
-            disappearedItems,
-            slotUpdates,
-            recipeInfo: plan.recipeOverride,
-            knownSlots,
-          });
+          // Action agent path: when Planner has built a checklist and
+          // an active subtask is selected, dispatch ONE step via the
+          // slim Action agent. Otherwise fall back to legacy probe
+          // (e.g. before recipe_lookup fires).
+          const useActionAgent = plan.checklist.length > 0
+            && plan.activeChecklistIdx >= 0
+            && plan.activeChecklistIdx < plan.checklist.length
+            && !plan.checklist[plan.activeChecklistIdx].done;
+
+          let probed: import("../tools/InventoryProbe").CraftAction | null;
+          if (useActionAgent) {
+            const { runAction } = await import("./subagents/fastUi/Action");
+            const knownForAction = plan.slotMemory.snapshot().map((e) => ({ index: 0, item: e.item }));
+            probed = await runAction({ client: deps.client, model: deps.model }, {
+              subtask: plan.checklist[plan.activeChecklistIdx].task,
+              knownSlots: knownForAction,
+              obsBase64: payload.obs ?? "",
+            });
+          } else {
+            const result = await probeNextCraftAction({
+              client: deps.client,
+              model: deps.model,
+              obsBase64: payload.obs,
+              taskText: plan.taskText,
+              iteration: plan.iteration,
+              sessionLayout: layoutForProbe, // freshly redetected for each probe
+              recentActions: state.closedLoopHistory,
+              cursorHolding,
+              pickupSourceSlot: plan.pickupSourceSlot ?? null,
+              disappearedItems,
+              slotUpdates,
+              recipeInfo: plan.recipeOverride,
+              knownSlots,
+            });
+            probed = result.action;
+          }
           plan.iteration += 1;
-          const probed = result.action;
           if (!probed) {
             // Probe failed to return an action — invalidate the SoM
             // session so the next frame redetects (some slots may have
