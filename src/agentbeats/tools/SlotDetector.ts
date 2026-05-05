@@ -942,27 +942,18 @@ function annotateWithLayout(
   // Confidence: at least 50% of layout slots accounted for.
   if (matched.length < layout.slots.length * 0.5) return null;
 
-  // 2. Backfill layout slots that no discovered component matched. This
-  //    covers slots with items in them (icon darkens slot interior past
-  //    our threshold) -- we still have the layout's pixel center.
+  // 2. Lock every layout slot to its LAYOUT-PREDICTED center, full
+  //    slot-side bbox. The CV-discovered centroid shifts when an item
+  //    occupies the slot (the icon's bbox pulls the centroid 2-5 px),
+  //    which puts the patch sample near the slot's shadow edge instead
+  //    of the icon body and drops chroma to baseline. Using the
+  //    template position guarantees consistent slot centers across
+  //    empty/filled states — fingerprinting becomes deterministic and
+  //    items in slots no longer read as empty-tinted background.
   const out: GuiSlot[] = [];
-  // Discovered + matched slots: keep original cv positions but tag with name/role
-  for (const m of matched) {
-    out.push({
-      index: 0,  // assigned after raster sort
-      cx: m.disc.cx,
-      cy: m.disc.cy,
-      w: m.disc.w,
-      h: m.disc.h,
-      name: layoutScreen[m.layoutIdx].name,
-      role: layoutScreen[m.layoutIdx].role,
-    });
-  }
-  // Backfilled layout slots: use layout's predicted pixel center, default size.
+  const slotPx = Math.max(8, Math.round(disc.slotPx));
   for (let i = 0; i < layoutScreen.length; i += 1) {
-    if (matchedLayout.has(i)) continue;
     const ls = layoutScreen[i];
-    const slotPx = Math.max(8, Math.round(disc.slotPx));
     out.push({
       index: 0,
       cx: ls.p.x,
@@ -1182,4 +1173,3 @@ export function detectGuiLayout(
     cursorOpenCenter: disc.cursorOpenCenter,
   };
 }
-

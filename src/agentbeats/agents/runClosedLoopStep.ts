@@ -139,17 +139,26 @@ export async function runClosedLoopStep(
       type Fp = { meanR: number; meanG: number; meanB: number; stddev: number };
       const fpDist = (a: Fp, b: Fp) => Math.hypot(a.meanR - b.meanR, a.meanG - b.meanG, a.meanB - b.meanB);
       const chroma = (fp: Fp) => Math.max(fp.meanR, fp.meanG, fp.meanB) - Math.min(fp.meanR, fp.meanG, fp.meanB);
-      // Two-path fill test:
-      //  (a) saturated item:        chroma > 12  (most blocks/items)
-      //  (b) grey item w/ texture:  luminance far from empty-slot
+      // Three-path fill test (each path catches a class of items the
+      // others miss; together they exclude every confirmed false-
+      // positive class):
+      //  (a) saturated item: chroma > 25 (quartz, crafting table,
+      //      most colored blocks).
+      //  (b) low-chroma textured item: chroma > 12 AND stddev > 60.
+      //      Catches cobblestone in hotbar (chroma~17 stddev~80) but
+      //      excludes the false-positive plateau (empty slots whose
+      //      yellowish background tint reads chroma~17 stddev~50).
+      //  (c) pure-grey textured item: luminance far from empty-slot
       //      baseline (~139) AND stddev in the "block texture" band.
-      //      Catches cobblestone, iron, stone, snow — pure-grey items
-      //      whose chroma is ~0. Excludes:
+      //      Catches cob/iron/stone in craft cells (chroma 0,
+      //      stddev 25-50). Excludes:
       //        - empty slots (low stddev, lum near 139)
       //        - SoM/UI text overlays (modest stddev, lum near 139)
-      //        - player-avatar bleed in armor slots (stddev > 60)
+      //        - player-avatar bleed in armor slots (stddev > 60).
       const isFilled = (fp: Fp) => {
-        if (chroma(fp) > 12) return true;
+        const c = chroma(fp);
+        if (c > 25) return true;
+        if (c > 12 && fp.stddev > 60) return true;
         const lum = (fp.meanR + fp.meanG + fp.meanB) / 3;
         if (Math.abs(lum - 139) > 30 && fp.stddev > 18 && fp.stddev < 60) return true;
         return false;
