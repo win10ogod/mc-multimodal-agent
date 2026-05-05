@@ -92,7 +92,9 @@ Subtask kinds (no numbers, no slot indices):
 - wait_for_output { expectedItem }
 - verify_state { condition }
 
-On the FIRST call for a crafting task: emit one place_in_craft_grid per ingredient unit (one slot is one item) → take_result { expectedItem }. Use verify_items_visible first only if the tracked status doesn't already cover the recipe ingredients.
+The "Slot state" block lists every slot that visibly has SOMETHING in it. Each line is either "id N -> <item>" (OCR-confirmed) or "id N -> unknown item" (CV-detected but unidentified). Any slot index NOT listed is empty.
+
+On the FIRST call for a crafting task: emit one place_in_craft_grid per ingredient unit (one slot is one item) → take_result { expectedItem }. Use verify_items_visible first only if the recipe ingredients aren't already named in slot_state.
 
 On post_action calls: VERIFY the Action's last report against the actual frame + tracked status before ticking done. Action sometimes falsely reports success — never trust its OK at face value. Confirm visually that the expected effect occurred. If the report says success but the frame disagrees, leave the item undone. Preserve item ids and order. Keep activeIdx for one more attempt only if observation shows partial progress; otherwise advance / replace / mark done. Never return same activeIdx with attempts >= 3 unchanged.
 
@@ -101,18 +103,22 @@ Output strict JSON:
 Each item: { id, text, task, done, attempts }. PRESERVE attempts.`;
 
 function buildUserText(input: PlannerInput, userPayload: Record<string, unknown>): string {
-  const knownLines = input.knownSlots.length > 0
-    ? input.knownSlots.map((s) => `  ${s.index} -> ${s.item}`).join("\n")
-    : "  (none yet)";
-  const knownIdxSet = new Set(input.knownSlots.map((s) => s.index));
-  const unknownOccupied = input.occupiedSlotIndices.filter((i) => !knownIdxSet.has(i));
-  const occupiedLine = unknownOccupied.length > 0
-    ? unknownOccupied.join(", ")
-    : "(none)";
+  // Unified slot-state listing: every slot with SOMETHING in it is
+  // listed once, either by OCR-confirmed item name or as "unknown
+  // item". Slots not listed are empty (CV-confirmed). This avoids
+  // ambiguity over "did the agent forget about it" vs "it's empty".
+  const knownByIdx = new Map(input.knownSlots.map((s) => [s.index, s.item]));
+  const allOccupied = new Set<number>([
+    ...input.knownSlots.map((s) => s.index),
+    ...input.occupiedSlotIndices,
+  ]);
+  const lines = [...allOccupied]
+    .sort((a, b) => a - b)
+    .map((i) => `  ${i} -> ${knownByIdx.get(i) ?? "unknown item"}`);
+  const slotBlock = lines.length > 0 ? lines.join("\n") : "  (all slots empty)";
   const cursorBlock = input.cursorHolding ?? "(empty)";
-  return `Tracked items (slot id -> item, OCR-confirmed):
-${knownLines}
-Other occupied slots (CV-detected, content unknown): ${occupiedLine}
+  return `Slot state (any id not listed is empty):
+${slotBlock}
 Cursor: ${cursorBlock}
 
 ${JSON.stringify(userPayload)}`;

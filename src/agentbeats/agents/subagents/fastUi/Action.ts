@@ -43,11 +43,11 @@ const SCHEMA = {
   },
 } as const;
 
-const SYS = `You execute ONE symbolic subtask in a Minecraft GUI. You receive the subtask plus layout_slots (slot index + role), known_slots (OCR'd contents), recipe (if any), cursor_holding, and the frame with YELLOW NUMBERED BADGES on every slot.
+const SYS = `You execute ONE symbolic subtask in a Minecraft GUI. You receive the subtask plus layout_slots (slot index + role), slot_state (every occupied slot, named or "unknown item"), recipe (if any), cursor_holding, and the frame with YELLOW NUMBERED BADGES on every slot. Any slot index NOT in slot_state is empty.
 
 Subtask → action mapping:
-- verify_items_visible { items }: emit verify_slots ONLY for slots you are visually CONFIDENT contain one of the listed items. Prefer indices listed in occupied_slot_indices_unknown_content — those are CV-confirmed non-empty. Do NOT include uncertain or off-target slots — empty/random slots fire wasted OCR. If you cannot identify any candidate confidently, emit fallback_manual.
-- place_in_craft_grid { item }: (1) pick a craft cell (role starts "craft_2x2_" or "craft_3x3_") matching this item's recipe position. (2) Find the source slot for this item in known_slots. If item is NOT in known_slots, emit verify_slots restricted to occupied_slot_indices_unknown_content (up to 3) that VISUALLY look like the item. Once known_slots contains the item, emit move from=source to=craftCell count="one".
+- verify_items_visible { items }: emit verify_slots ONLY for slot indices listed in slot_state — slots NOT in the list are CV-confirmed empty and OCR there is wasted. Among slot_state entries, prefer "unknown item" slots when looking for an unidentified ingredient. If you cannot pick a confident candidate, emit fallback_manual.
+- place_in_craft_grid { item }: (1) pick a craft cell (role starts "craft_2x2_" or "craft_3x3_") matching this item's recipe position. (2) Find the source slot in slot_state where the named item is recorded. If the item is only present as "unknown item" entries, emit verify_slots on up to 3 of those candidates that VISUALLY look like the item. Once slot_state names the item, emit move from=source to=craftCell count="one".
 - take_result { expectedItem }: from = slot with role==="result"; to = free slot in known_slots; emit move count="all".
 - wait_for_output { expectedItem }: emit wait with holdSteps proportional to expected sim ticks (cap 60).
 - verify_state { condition }: if condition holds in frame+known, emit done; else fallback_manual.
@@ -67,9 +67,22 @@ Output strict JSON, one action only:
 let ACTION_CALL_SEQ = 0;
 
 export async function runAction(deps: ActionDeps, input: ActionInput): Promise<CraftAction> {
+  // Unified slot state: every occupied slot listed once, either by
+  // OCR-confirmed item or as "unknown item". Slots not listed are
+  // empty (CV-confirmed). Avoids the ambiguity of separate
+  // known_slots + occupied lists.
+  const knownByIdx = new Map(input.knownSlots.map((s) => [s.index, s.item]));
+  const allOccupied = new Set<number>([
+    ...input.knownSlots.map((s) => s.index),
+    ...input.occupiedSlotIndices,
+  ]);
+  const slotState = [...allOccupied]
+    .sort((a, b) => a - b)
+    .map((i) => ({ index: i, item: knownByIdx.get(i) ?? "unknown item" }));
   const userPayload = {
     subtask: input.subtask,
-    known_slots: input.knownSlots,
+    slot_state: slotState,
+    slot_state_note: "any slot index not listed is empty",
     layout_slots: input.layoutSlots,
     recipe: input.recipeInfo
       ? {
@@ -79,7 +92,6 @@ export async function runAction(deps: ActionDeps, input: ActionInput): Promise<C
         }
       : null,
     cursor_holding: input.cursorHolding,
-    occupied_slot_indices_unknown_content: input.occupiedSlotIndices.filter((i) => !input.knownSlots.some((k) => k.index === i)),
   };
 
   const seq = String(++ACTION_CALL_SEQ).padStart(5, "0");
