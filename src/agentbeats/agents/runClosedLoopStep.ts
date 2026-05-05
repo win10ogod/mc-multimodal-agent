@@ -535,56 +535,76 @@ export async function runClosedLoopStep(
             return false;
           }
           const bl = plan.parkEmptyBaseline;
+          // Pixel-DIFF gate (authoritative): compare the live cursor
+          // patch to parkEmptyCursorPatch pixel-by-pixel; count pixels
+          // that changed by > 24 RGB-distance. This bypasses the
+          // mean-RGB fingerprint dist (which fails when held item is
+          // grey-ish, similar to the cursor sprite + GUI background
+          // mean). Many diff pixels = held; few = empty.
+          let pixelDiffFg = 0;
+          let livePatch: ReturnType<typeof samplePatchPixels> = null;
+          if (plan.parkEmptyCursorPatch) {
+            livePatch = samplePatchPixels(payload.obs, PARK_X + HELD_OFF_X, PARK_Y + HELD_OFF_Y, 14);
+            if (livePatch && livePatch.w === plan.parkEmptyCursorPatch.w && livePatch.h === plan.parkEmptyCursorPatch.h) {
+              const n = livePatch.w * livePatch.h;
+              for (let i = 0; i < n; i += 1) {
+                const off = i * 4;
+                const dr2 = livePatch.rgba[off] - plan.parkEmptyCursorPatch.rgba[off];
+                const dg2 = livePatch.rgba[off + 1] - plan.parkEmptyCursorPatch.rgba[off + 1];
+                const db2 = livePatch.rgba[off + 2] - plan.parkEmptyCursorPatch.rgba[off + 2];
+                const pxDist = Math.sqrt(dr2 * dr2 + dg2 * dg2 + db2 * db2);
+                if (pxDist > 24) pixelDiffFg += 1;
+              }
+            }
+          }
+          // Mean-RGB fp dist as a fallback signal when patch isn't
+          // captured yet.
           const dr = live.meanR - bl.meanR, dg = live.meanG - bl.meanG, db = live.meanB - bl.meanB;
-          const dist = Math.sqrt(dr * dr + dg * dg + db * db);
-          // CV says cursor is holding something. Try to identify
-          // WHAT, by diffing the live cursor patch against the
-          // empty-cursor baseline patch — pixels that changed > a
-          // threshold are the held-item icon in isolation. Match
-          // that diff-mask against every known-item patch via
-          // patchSimilarity. Only refines an existing signature;
-          // never creates one from scratch (avoids park-area random
-          // pixel false positives).
-          if (dist > 15) {
-            console.log(`[agentbeats] cursorHolding=true (park dist=${dist.toFixed(1)})`);
-            if (plan.parkEmptyCursorPatch && plan.cursorItemSignature) {
-              const livePatch = samplePatchPixels(payload.obs, PARK_X + HELD_OFF_X, PARK_Y + HELD_OFF_Y, 14);
-              if (livePatch && livePatch.w === plan.parkEmptyCursorPatch.w && livePatch.h === plan.parkEmptyCursorPatch.h) {
-                // Diff-mask: pixel changed from empty-baseline by >24
-                // RGB-distance ⇒ held-item pixel. Build a synthetic
-                // patch with diff-mask as foreground.
-                const w = livePatch.w, h = livePatch.h, n = w * h;
-                const diffMask = new Uint8Array(n);
-                let fgCount = 0;
-                for (let i = 0; i < n; i += 1) {
-                  const off = i * 4;
-                  const dr2 = livePatch.rgba[off] - plan.parkEmptyCursorPatch.rgba[off];
-                  const dg2 = livePatch.rgba[off + 1] - plan.parkEmptyCursorPatch.rgba[off + 1];
-                  const db2 = livePatch.rgba[off + 2] - plan.parkEmptyCursorPatch.rgba[off + 2];
-                  const pxDist = Math.sqrt(dr2 * dr2 + dg2 * dg2 + db2 * db2);
-                  if (pxDist > 24) { diffMask[i] = 1; fgCount += 1; }
-                }
-                if (fgCount > 30) {
-                  const heldPatch = { w, h, rgba: livePatch.rgba, mask: diffMask };
-                  let bestItem: string | null = null;
-                  let bestSim = 0.65; // refine only on strong match
-                  for (const e of plan.slotMemory.snapshot()) {
-                    if (!e.patch || e.item === "empty" || e.item === "unknown") continue;
-                    const sim = patchSimilarity(e.patch, heldPatch);
-                    if (sim > bestSim) { bestSim = sim; bestItem = e.item; }
-                  }
-                  if (bestItem && plan.cursorItemSignature.item !== bestItem) {
-                    console.warn(`[agentbeats] cursor-diff-id: cursor holds '${bestItem}' (sim=${bestSim.toFixed(2)} fg=${fgCount}); prior was '${plan.cursorItemSignature.item ?? "?"}' — updating`);
-                    plan.cursorItemSignature.item = bestItem;
-                  } else if (bestItem) {
-                    console.log(`[agentbeats] cursor-diff-id: confirmed '${bestItem}' (sim=${bestSim.toFixed(2)} fg=${fgCount})`);
-                  }
-                }
+          const meanDist = Math.sqrt(dr * dr + dg * dg + db * db);
+          // Holding decision: many pixel-diffs OR (no patch + big
+          // mean shift). Empty: few pixel-diffs OR small mean shift.
+          const holdingByPixel = pixelDiffFg > 30;
+          const holdingByMean = meanDist > 15;
+          const emptyByPixel = plan.parkEmptyCursorPatch !== null && pixelDiffFg < 8;
+          if (holdingByPixel || (!plan.parkEmptyCursorPatch && holdingByMean)) {
+            console.log(`[agentbeats] cursorHolding=true (pixelDiffFg=${pixelDiffFg} meanDist=${meanDist.toFixed(1)})`);
+            // Identify the held item via diff-extraction: pixels that
+            // changed from empty-baseline are the held-icon pixels;
+            // match that synthetic patch against every known-item
+            // slot.patch via patchSimilarity. Refines an existing
+            // cursorItemSignature (set by pickup verify or Pass A
+            // disappearance inference); does not create from scratch.
+            if (livePatch && plan.parkEmptyCursorPatch && plan.cursorItemSignature) {
+              const w = livePatch.w, h = livePatch.h, n = w * h;
+              const diffMask = new Uint8Array(n);
+              for (let i = 0; i < n; i += 1) {
+                const off = i * 4;
+                const dr2 = livePatch.rgba[off] - plan.parkEmptyCursorPatch.rgba[off];
+                const dg2 = livePatch.rgba[off + 1] - plan.parkEmptyCursorPatch.rgba[off + 1];
+                const db2 = livePatch.rgba[off + 2] - plan.parkEmptyCursorPatch.rgba[off + 2];
+                const pxDist = Math.sqrt(dr2 * dr2 + dg2 * dg2 + db2 * db2);
+                if (pxDist > 24) diffMask[i] = 1;
+              }
+              const heldPatch = { w, h, rgba: livePatch.rgba, mask: diffMask };
+              let bestItem: string | null = null;
+              let bestSim = 0.65;
+              for (const e of plan.slotMemory.snapshot()) {
+                if (!e.patch || e.item === "empty" || e.item === "unknown") continue;
+                const sim = patchSimilarity(e.patch, heldPatch);
+                if (sim > bestSim) { bestSim = sim; bestItem = e.item; }
+              }
+              if (bestItem && plan.cursorItemSignature.item !== bestItem) {
+                console.warn(`[agentbeats] cursor-diff-id: cursor holds '${bestItem}' (sim=${bestSim.toFixed(2)} fg=${pixelDiffFg}); prior was '${plan.cursorItemSignature.item ?? "?"}' — updating`);
+                plan.cursorItemSignature.item = bestItem;
+              } else if (bestItem) {
+                console.log(`[agentbeats] cursor-diff-id: confirmed '${bestItem}' (sim=${bestSim.toFixed(2)} fg=${pixelDiffFg})`);
+              } else {
+                console.log(`[agentbeats] cursor-diff-id: holding but no known-item patch matched (fg=${pixelDiffFg}); keeping prior '${plan.cursorItemSignature.item ?? "?"}'`);
               }
             }
             return true;
           }
-          if (dist < 8) return false;
+          if (emptyByPixel || (!plan.parkEmptyCursorPatch && meanDist < 8)) return false;
           return null;
         })();
         try {
