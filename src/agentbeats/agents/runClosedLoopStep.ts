@@ -12,7 +12,6 @@ import {
 } from "../tools/UiFastControl";
 import { probeNextCraftAction, vlmVerifySlotState } from "../tools/InventoryProbe";
 import { detectCursorWithExpectation, detectGuiLayout, samplePatchFingerprint } from "../tools/SlotDetector";
-import { getDebugRecorder } from "../tools/DebugRecorder";
 import { repairDecisionForTask, shouldUseModelOnStep } from "../McuPolicy";
 import type { UiFastControlFrame } from "../tools/UiFastControl";
 
@@ -23,23 +22,20 @@ export type ClosedLoopDeps = {
   maxHoldSteps: number;
   defaultHoldSteps: number;
   modelEveryNSteps: number;
+  debugDir: string | null;
+  recordDebug: (kind: string, payload: unknown) => Promise<void>;
   modelDecision: (context: McuContextState, step: number) => Promise<McuPolicyDecision>;
 };
 
 export type ClosedLoopInput = {
   /** Legacy context state — passed because the closed-loop body uses many of its fields */
   context: McuContextState;
-  episode: EpisodeState | null;
+  episode: EpisodeState;
   obsBase64: string;
   contextId: string;
   payload: McuObservationPayload;
   step: number;
 };
-
-const ACTION_PAYLOAD_PREFIX = {
-  type: "action",
-  action_type: "env",
-} as const;
 
 export async function runClosedLoopStep(
   deps: ClosedLoopDeps,
@@ -459,7 +455,8 @@ export async function runClosedLoopStep(
               state.closedLoopHistory = state.closedLoopHistory.slice(0, 5);
             }
           } else if (probed.action === "fallback_manual") {
-            console.log(`[agentbeats] closed-loop probe says fallback_manual reason=${probed.reason ?? ""} -- escalating to GoalPlanner`);
+            const blockedReason = probed.reason ?? "fallback_manual";
+            console.log(`[agentbeats] closed-loop probe says fallback_manual reason=${blockedReason} -- escalating to GoalPlanner`);
             plan.done = true;
             // GoalPlanner escalation: when MCU_USE_PLANNER is on,
             // re-plan immediately using the structured BLOCKED reason
@@ -469,29 +466,27 @@ export async function runClosedLoopStep(
             // the original task at the tail.
             if (process.env.MCU_USE_PLANNER === "1") {
               const ep = input.episode;
-              if (ep) {
-                const failReason = probed.reason ?? "closed-loop sub-agent emitted fallback_manual";
-                ep.completedSummaries.push(`SUBGOAL_FAILED: ${failReason}`);
-                try {
-                  const { planGoals } = await import("./GoalPlanner");
-                  const out = await planGoals(
-                    { client: deps.client, model: deps.model },
-                    ep.taskText,
-                    ep.completedSummaries,
-                  );
-                  if (!out.overall_done && out.subgoals.length > 0) {
-                    ep.subgoals = out.subgoals;
-                    ep.idx = 0;
-                    ep.singleTask = false;  // multi-step now
-                    console.log(`[agentbeats] GoalPlanner re-plan after fallback_manual: ${out.subgoals.length} subgoals -> ${out.subgoals.map((s) => `${s.kind}:${s.description}`).join(" | ")}`);
-                  } else {
-                    console.warn(`[agentbeats] GoalPlanner re-plan returned empty/overall_done=true; giving up`);
-                  }
-                } catch (e) {
-                  console.warn(`[agentbeats] GoalPlanner re-plan failed: ${e instanceof Error ? e.message : String(e)}`);
+              ep.completedSummaries.push(`SUBGOAL_FAILED: ${blockedReason}`);
+              try {
+                const { planGoals } = await import("./GoalPlanner");
+                const out = await planGoals(
+                  { client: deps.client, model: deps.model },
+                  ep.taskText,
+                  ep.completedSummaries,
+                );
+                if (!out.overall_done && out.subgoals.length > 0) {
+                  ep.subgoals = out.subgoals;
+                  ep.idx = 0;
+                  ep.singleTask = false;  // multi-step now
+                  console.log(`[agentbeats] GoalPlanner re-plan after fallback_manual: ${out.subgoals.length} subgoals -> ${out.subgoals.map((s) => `${s.kind}:${s.description}`).join(" | ")}`);
+                } else {
+                  console.warn(`[agentbeats] GoalPlanner re-plan returned empty/overall_done=true; giving up`);
                 }
+              } catch (e) {
+                console.warn(`[agentbeats] GoalPlanner re-plan failed: ${e instanceof Error ? e.message : String(e)}`);
               }
             }
+            return { kind: "subgoal_failed", reason: `BLOCKED: ${blockedReason}` };
           } else if (probed.action === "recipe_lookup") {
             // Sub-agent recipe query: look up via minecraft-data,
             // store on the plan for use in subsequent probes' RECIPE
@@ -540,9 +535,8 @@ export async function runClosedLoopStep(
               : null;
             const destSameItem = sigDist !== null && sigDist < 30;
             const destLooksFilled = !!destPatch && destPatch.stddev > 35 && !destSameItem;
-            const dbgPre = getDebugRecorder();
-            if (dbgPre.isEnabled() && destPatch && toSlot) {
-              dbgPre.record({
+            if (deps.debugDir && destPatch && toSlot) {
+              void deps.recordDebug("pre_check_move", {
                 type: "pre_check_move",
                 iteration: plan.iteration,
                 step,
@@ -553,7 +547,7 @@ export async function runClosedLoopStep(
                   destPatch: { meanR: destPatch.meanR, meanG: destPatch.meanG, meanB: destPatch.meanB, stddev: destPatch.stddev },
                   decision: destLooksFilled ? "REFUSE_FILLED" : "PROCEED",
                 },
-              }, payload.obs, "jpg");
+              });
             }
             if (!fromSlot || !toSlot) {
               console.warn(`[agentbeats] move from=${probed.from} to=${probed.to}: slot(s) not in layout (have ${layoutForProbe.slots.length}); skipping`);
@@ -1068,9 +1062,8 @@ export async function runClosedLoopStep(
           console.log(
             `[agentbeats] verify ${pc.slotName ?? pc.rasterIndex}: post.stddev=${post.stddev.toFixed(1)} expect=${pc.expectAfter} -> ${matched ? "OK" : "MISMATCH"} (retry ${pc.retries}/${MAX_RETRIES})`,
           );
-          const dbgPolicy = getDebugRecorder();
-          if (dbgPolicy.isEnabled()) {
-            dbgPolicy.record({
+          if (deps.debugDir) {
+            void deps.recordDebug("verify", {
               type: "verify",
               step,
               data: {
@@ -1083,7 +1076,7 @@ export async function runClosedLoopStep(
                 cursor: plan.cursor,
                 actionKind: pc.actionKind, kind: pc.kind,
               },
-            }, payload.obs, "jpg");
+            });
           }
           if (matched) {
             state.closedLoopHistory.unshift(`${pc.actionKind ?? pc.kind ?? "click"} slot=${pc.rasterIndex}${pc.slotName ? `(${pc.slotName})` : ""} OK`);

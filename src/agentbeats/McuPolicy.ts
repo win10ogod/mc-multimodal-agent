@@ -25,6 +25,7 @@ import {
 } from "./tools/UiFastControl";
 import { dispatchObservation } from "./agents/Dispatcher";
 import { runClosedLoopStep } from "./agents/runClosedLoopStep";
+import { getDebugRecorder } from "./tools/DebugRecorder";
 import type { EpisodeState, SubAgent, SubAgentKind } from "./agents/SubAgent";
 import { makeEpisodeState } from "./agents/SubAgent";
 import { createWorldExplorer } from "./agents/subagents/WorldExplorer";
@@ -732,8 +733,13 @@ export class McuVisualPolicy {
     // ── end MCU_USE_PLANNER gated branch ──────────────────────────────────
 
     const step = Math.max(0, Number.isFinite(payload.step) ? Number(payload.step) : 0);
-    const episode = this.episodes.get(contextId) ?? null;
+    let episode = this.episodes.get(contextId);
+    if (!episode) {
+      episode = makeEpisodeState(state.taskText || ((payload as any)?.task ?? ""));
+      this.episodes.set(contextId, episode);
+    }
 
+    const recorder = getDebugRecorder();
     const closedLoopResult = await runClosedLoopStep(
       {
         client: this.client,
@@ -742,6 +748,8 @@ export class McuVisualPolicy {
         maxHoldSteps: this.config.agentbeats.maxHoldSteps,
         defaultHoldSteps: this.config.agentbeats.defaultHoldSteps,
         modelEveryNSteps: this.config.agentbeats.modelEveryNSteps,
+        debugDir: recorder.getDir(),
+        recordDebug: async (kind, payload) => { recorder.record({ type: kind, data: payload as Record<string, unknown> }); },
         modelDecision: (ctx, s) => this.modelDecision(ctx, s),
       },
       {

@@ -45,6 +45,10 @@ export class DebugRecorder {
     return this.enabled;
   }
 
+  getDir(): string | null {
+    return this.dir;
+  }
+
   /** Record one event. `imageBase64` is optional; if provided it's
    *  decoded and written as PNG/JPG next to the JSONL line. The MC sim
    *  outputs JPEGs whose YCbCr decodes to BGR-meaning data (tan looks
