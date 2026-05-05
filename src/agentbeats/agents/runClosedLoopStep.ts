@@ -198,6 +198,11 @@ export async function runClosedLoopStep(
               // Cursor just finished parking; batch complete.
               console.log(`[agentbeats] verify_slots batch complete (parked)`);
               plan.pendingOcrBatch = null;
+              // Arm Planner re-judge: a verify_slots subtask just
+              // finished and Known got fresh entries. Without this,
+              // Planner never re-evaluates and the Action agent keeps
+              // re-issuing verify_slots forever.
+              plan.judgeAfterChain = true;
               // Fall through to probe.
             } else {
               plan.pendingOcrBatch.idx += 1;
