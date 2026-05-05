@@ -711,12 +711,7 @@ export function discoverSlots(jpegBase64: string): DiscoveredLayout | null {
   // We auto-size the slot footprint from the window: vanilla 176-logical
   // window has 16-logical slot interior, so slot side ~ windowW * 16/176
   // (~9% of window width).
-  // CAP the expected side so a recipe-book open scenario (where the
-  // window bbox spans BOTH the recipe panel and the inventory, ~320 px
-  // wide) doesn't blow up the slot-size band and filter out the real
-  // 16-18 px inventory slots. Vanilla MC slot graphics top out around
-  // ~22 px on a 640-wide frame regardless of which panel is open.
-  const expectedSide = Math.min(22, bbox.w * (16 / 176));
+  const expectedSide = bbox.w * (16 / 176);
   const minSide = Math.max(8, Math.round(expectedSide * 0.6));
   const maxSide = Math.round(expectedSide * 1.6);
   const minArea = minSide * minSide * 0.5;
