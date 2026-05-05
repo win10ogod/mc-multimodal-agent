@@ -748,33 +748,12 @@ export async function runClosedLoopStep(
                 ...(placedItemName ? { placedItemName } : {}),
               });
               const chain: import("../tools/UiFastControl").PendingClick[] = [];
-              if (probed.from === probed.to) {
-                // Single-click UI toggle (recipe-book button, recipe entry,
-                // anvil rename, etc.) — NOT an item transfer. No pickup,
-                // no place, no auto_return. Just one click on the slot.
-                // IBVS pixel verify is meaningless for buttons whose own
-                // pixels don't change post-click; mark expectAfter as
-                // "should_fill" with a permissive verify (the post.stddev
-                // == pre.stddev case will MISMATCH but we don't care).
-                // Actually: skip the post-click pixel verify entirely by
-                // building a click whose actionKind is "take" — the
-                // matched-verify path's mismatch handling drops the
-                // chain on first attempt anyway, but for action-agent
-                // mode we already disabled retries, so a mismatch just
-                // ends the chain cleanly.
-                const single = mkClick(fromSlot, "attack", "should_fill", "take", "click");
-                // Override: tell the runtime this is a UI toggle that
-                // should not block on IBVS pixel verify success.
-                (single as any).uiToggle = true;
-                chain.push(single);
+              chain.push(mkClick(fromSlot, "attack", "should_empty", "pickup", "click"));
+              if (probed.count === "all") {
+                chain.push(mkClick(toSlot, "attack", "should_fill", "place_all", "click", placedItemName));
               } else {
-                chain.push(mkClick(fromSlot, "attack", "should_empty", "pickup", "click"));
-                if (probed.count === "all") {
-                  chain.push(mkClick(toSlot, "attack", "should_fill", "place_all", "click", placedItemName));
-                } else {
-                  chain.push(mkClick(toSlot, "use", "should_fill", "place_one", "click", placedItemName));
-                  chain.push(mkClick(fromSlot, "attack", "should_fill", "place_all", "auto_return"));
-                }
+                chain.push(mkClick(toSlot, "use", "should_fill", "place_one", "click", placedItemName));
+                chain.push(mkClick(fromSlot, "attack", "should_fill", "place_all", "auto_return"));
               }
               // Only record pickupSourceSlot when picking from a real
               // ingredient source (hotbar/main_inv). Moves whose source
@@ -1225,14 +1204,7 @@ export async function runClosedLoopStep(
           const isFilled = post.stddev > 35
             || !inEmptyBand
             || (pc.expectAfter === "should_fill" && meanShift > 20);
-          // UI-toggle clicks (recipe-book button, recipe entry, etc.)
-          // don't change the clicked slot's pixels — the side effect
-          // shows up elsewhere (panel opens, grid auto-fills). Bypass
-          // the IBVS pixel verify by force-matching.
-          const isUiToggle = (pc as any).uiToggle === true;
-          const matched = isUiToggle
-            ? true
-            : (pc.expectAfter === "should_empty" ? isEmpty : isFilled);
+          const matched = pc.expectAfter === "should_empty" ? isEmpty : isFilled;
           // A successful click mutated the slot's contents — the slot
           // memory entry (if any) for this absolute pos is now stale.
           // Forget it; the agent will re-discover via hover if needed.
