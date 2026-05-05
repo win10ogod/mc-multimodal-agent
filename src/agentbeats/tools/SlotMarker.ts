@@ -174,6 +174,16 @@ export function markInventoryFrame(jpegBase64: string, sessionLayout?: GuiLayout
   const h = decoded.height;
   const px = Buffer.from(decoded.data.buffer, decoded.data.byteOffset, decoded.data.byteLength);
 
+  // The MC sim's JPEGs come out of jpeg-js in BGRA byte order despite
+  // formatAsRGBA. Swap R<->B once HERE so subsequent mark drawing can
+  // use ordinary RGB color literals like [255,255,0] for yellow, and
+  // the PNG write at the end is a straight copy.
+  for (let i = 0; i < px.length; i += 4) {
+    const r = px[i];
+    px[i] = px[i + 2];
+    px[i + 2] = r;
+  }
+
   // Prefer the session-locked layout (stable marks across frames). Only
   // run fresh detection when the caller hasn't supplied one.
   const layout = sessionLayout ?? detectGuiLayout(cleaned);
@@ -186,10 +196,7 @@ export function markInventoryFrame(jpegBase64: string, sessionLayout?: GuiLayout
     }
   }
 
-  // Re-encode as PNG. jpeg-js with formatAsRGBA:true already returns
-  // real RGBA — copy through directly. (Earlier code did an R↔B swap
-  // that produced blue-tinted Alex hair under current jpeg-js;
-  // removed.)
+  // Re-encode as PNG. px is already RGBA (we swapped at decode time).
   const png = new PNG({ width: w, height: h });
   png.data.set(px);
   const pngBuf = PNG.sync.write(png);

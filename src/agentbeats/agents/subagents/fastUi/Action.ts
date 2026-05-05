@@ -45,6 +45,8 @@ Subtask → action mapping:
 - take_result { expectedItem }: from = slot with role==="result"; to = free slot in known_slots; emit move count="all".
 - wait_for_output { expectedItem }: emit wait with holdSteps proportional to expected sim ticks (cap 60).
 - click_button: emit fallback_manual (not supported).
+- open_recipe_book: locate the slot in layout_slots with role==="recipe_book_button" and emit a click on it. The "to" field for a single-click toggle uses the move action with from===to===<recipe_book_button slot index>, count="one". If no slot has that role, emit fallback_manual: "BLOCKED: recipe_book_button anchor not detected".
+- click_recipe_entry: locate the recipe-panel cell that visually matches targetItem inside the open recipe-book panel (look for the icon visually on the frame). Emit a click move on that slot's index. If you cannot find it, emit fallback_manual: "BLOCKED: recipe entry for <item> not visible".
 - verify_state { condition }: if condition holds in frame+known, emit done; else fallback_manual.
 
 Rules:

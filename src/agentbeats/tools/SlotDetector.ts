@@ -1105,13 +1105,16 @@ export function detectGuiLayout(
   // Append synthetic anchors for fixed UI elements that the colour /
   // grey-mass slot detector cannot pick up (recipe-book toggle, etc.).
   // Template matching against pre-saved icon crops in data/ui-templates/.
+  // After appending, re-sort the entire slots array into row-major
+  // raster order and reassign indices so the agent sees a consistent
+  // numbering scheme regardless of whether anchors were detected.
   try {
     // eslint-disable-next-line @typescript-eslint/no-require-imports
     const { matchTemplate } = require("./UiTemplateMatch") as typeof import("./UiTemplateMatch");
     const recipeBook = matchTemplate(jpegBase64, "recipe_book");
     if (recipeBook) {
       slots.push({
-        index: slots.length,
+        index: -1, // re-numbered after sort
         cx: recipeBook.cx,
         cy: recipeBook.cy,
         w: recipeBook.bbox.w,
@@ -1119,6 +1122,16 @@ export function detectGuiLayout(
         name: "recipe_book",
         role: "recipe_book_button",
       });
+      // Cluster by row band then sort by cx within each band, matching
+      // the raster ordering used elsewhere in this file.
+      const rowTol = Math.max(6, Math.round((slots[0]?.h ?? 18) * 0.6));
+      slots.sort((a, b) => {
+        const rowA = Math.round(a.cy / rowTol);
+        const rowB = Math.round(b.cy / rowTol);
+        if (rowA !== rowB) return rowA - rowB;
+        return a.cx - b.cx;
+      });
+      for (let i = 0; i < slots.length; i += 1) slots[i].index = i;
     }
   } catch (e) {
     if (process.env.SLOT_DEBUG === "1") {

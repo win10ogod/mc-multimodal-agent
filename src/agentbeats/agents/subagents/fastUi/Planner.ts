@@ -84,9 +84,11 @@ Subtask kinds (no numbers, no slot indices):
 - take_result { expectedItem }
 - wait_for_output { expectedItem }
 - click_button { buttonName }
+- open_recipe_book — toggle the recipe-book panel open. Always works in player_inventory crafting GUIs and bypasses manual ingredient placement.
+- click_recipe_entry { targetItem } — pick the recipe entry for targetItem inside the open recipe panel; the game auto-fills the craft grid. Always followed by take_result.
 - verify_state { condition }
 
-On the FIRST call: emit the shortest plan. For crafting, that's typically (skip verify if known_items already shows ingredients) → one place_in_craft_grid per ingredient unit → one take_result.
+On the FIRST call for crafting: PREFER the recipe-book path — it skips error-prone manual placements. Plan: open_recipe_book → click_recipe_entry { targetItem } → take_result { expectedItem }. Fall back to the manual path (place_in_craft_grid per ingredient + take_result) ONLY if a previous open_recipe_book attempt failed (BLOCKED reason or attempts exhausted).
 
 On post_action calls: VERIFY the Action's last report against the actual frame + known_items before ticking done. Action sometimes falsely reports success — never trust its OK at face value. Confirm visually that the expected effect occurred. If the report says success but the frame disagrees, leave the item undone. Preserve item ids and order. Keep activeIdx for one more attempt only if observation shows partial progress; otherwise advance / replace / mark done. Never return same activeIdx with attempts >= 3 unchanged.
 
