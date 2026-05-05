@@ -637,21 +637,27 @@ export function servoCursorStep(opts: {
   const yawClamped = Math.max(-MAX_CAM_DEG, Math.min(MAX_CAM_DEG, ex / PX_PER_CAM_YAW));
   let dy = Math.round(yawClamped / bin) * bin;
   // Pitch handling — deadzone-aware, NOT adaptive.
-  let dp = 0;
+  // MC's sim has a 4-deg pitch deadzone: sub-4° commands produce
+  // zero cursor motion. So the smallest effective pitch step is
+  // ±4° = ±20 px, giving y-precision of ±10 px (half the step).
+  //   - If |ey| ≤ 10 px : pitch stays 0 (cursor close enough on y).
+  //   - If |ey| > 10 px : issue a pitch command; small commands get
+  //     INFLATED to PITCH_DEADZONE_MIN so they actually produce
+  //     motion. Large errors quantize at 1-deg bins and clamp to
+  //     MAX_CAM_DEG.
+  // This restores the y-axis convergence behavior the original
+  // (pre-adaptive) servo had, while preserving the new yaw
+  // precision for x.
   const pitchDeg = ey / PX_PER_CAM_PITCH;
-  const pitchPxErr = Math.abs(ey);
-  if (pitchPxErr >= PITCH_DEADZONE_MIN * PX_PER_CAM_PITCH) {
-    // Error is large enough to need a real pitch move. Quantize at
-    // 1-deg bin and clamp to MAX_CAM_DEG.
+  let dp = 0;
+  const halfDeadzonePx = (PITCH_DEADZONE_MIN / 2) * PX_PER_CAM_PITCH;
+  if (Math.abs(ey) > halfDeadzonePx) {
     const pitchClamped = Math.max(-MAX_CAM_DEG, Math.min(MAX_CAM_DEG, pitchDeg));
     dp = Math.round(pitchClamped);
-    if (dp !== 0 && Math.abs(dp) < PITCH_DEADZONE_MIN) {
-      dp = Math.sign(dp) * PITCH_DEADZONE_MIN;
+    if (Math.abs(dp) < PITCH_DEADZONE_MIN) {
+      dp = Math.sign(pitchClamped || 1) * PITCH_DEADZONE_MIN;
     }
   }
-  // Below deadzone-equivalent (≈10 px), pitch stays 0 — accept the
-  // y-position as "good enough" and let yaw close the rest. This is
-  // what makes precision landing actually arrive.
   if (dy === 0 && dp === 0) {
     // Cursor is within the deadzone for both axes — fire a small
     // yaw nudge so the cursor at least moves before click cap.
