@@ -549,6 +549,10 @@ export type ClosedLoopCraftPlan = {
    *  diff: only when BOTH are true do we report cursorHolding=true.
    *  Cleared on the next matched place. */
   recentMatchedPickup: boolean;
+  /** Recipe metadata cached when the sub-agent queries via the
+   *  recipe_lookup action. Surfaced to the probe in subsequent
+   *  iterations as the RECIPE / Placement plan blocks. */
+  recipeOverride: RecipeInfo | null;
   /** When non-null, an OCR-on-settle is expected for the next obs frame
    *  (cursor was just hovered onto a slot; tooltip should be rendered). */
   pendingTooltipRead: { slotIndex: number; x: number; y: number; slotName?: string; retries?: number } | null;
@@ -671,6 +675,7 @@ export function planClosedLoopCraft(taskText: string): ClosedLoopCraftPlan {
     parkEmptyBaseline: null,
     recentMatchedPickup: false,
     initialSlotBaselines: new Map(),
+    recipeOverride: null,
   };
 }
 

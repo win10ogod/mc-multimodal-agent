@@ -21,6 +21,7 @@ import {
   parseTargetItem,
   planClosedLoopCraft,
   servoCursorStep,
+  lookupRecipe,
   type ClosedLoopCraftPlan,
   type UiFastControlFrame,
 } from "./tools/UiFastControl";
@@ -1116,6 +1117,7 @@ export class McuVisualPolicy {
               pickupSourceSlot: plan.pickupSourceSlot ?? null,
               disappearedItems,
               slotUpdates,
+              recipeInfo: plan.recipeOverride,
               knownSlots,
             });
             plan.iteration += 1;
@@ -1149,6 +1151,24 @@ export class McuVisualPolicy {
             } else if (probed.action === "fallback_manual") {
               console.log(`[agentbeats] closed-loop probe says fallback_manual reason=${probed.reason ?? ""} -- handing control to manual LLM cursor`);
               plan.done = true;
+            } else if (probed.action === "recipe_lookup") {
+              // Sub-agent recipe query: look up via minecraft-data,
+              // store on the plan for use in subsequent probes' RECIPE
+              // / Placement plan blocks. No clicks; just a state update
+              // and a noop frame so the agent re-probes with the new
+              // RECIPE context.
+              const r = lookupRecipe(probed.item);
+              if (r) {
+                plan.recipeOverride = r;
+                const ingStr = r.ingredients.map((it: { name: string; count: number }) => `${it.count}x ${it.name}`).join(" + ");
+                state.closedLoopHistory.unshift(`recipe_lookup '${probed.item}' -> ${r.target} (${ingStr})`);
+                state.closedLoopHistory = state.closedLoopHistory.slice(0, 5);
+                console.log(`[agentbeats] recipe_lookup '${probed.item}' resolved: ingredients=${ingStr} inShape=${r.inShape ? "yes" : "no"}`);
+              } else {
+                state.closedLoopHistory.unshift(`recipe_lookup '${probed.item}' -> NOT FOUND in minecraft-data`);
+                state.closedLoopHistory = state.closedLoopHistory.slice(0, 5);
+                console.warn(`[agentbeats] recipe_lookup '${probed.item}' not found; agent should retry with corrected id`);
+              }
             } else if (probed.action === "move") {
               // High-level atomic move: pickup `from` -> place at `to`
               // -> auto-return remainder to `from` (when count=one).

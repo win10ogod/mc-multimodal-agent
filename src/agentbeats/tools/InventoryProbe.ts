@@ -14,7 +14,6 @@ import type OpenAI from "openai";
 import { markInventoryFrame } from "./SlotMarker";
 import type { GuiLayout } from "./SlotDetector";
 import { getDebugRecorder } from "./DebugRecorder";
-import { lookupRecipe } from "./UiFastControl";
 
 // Hotbar slot pixel centers when the inventory GUI is open at 640x360 obs.
 // Mirrors the SLOT.hotbarX0/Dx/Y constants in UiFastControl.
@@ -189,6 +188,12 @@ export type CraftAction =
    *  full-probe round-trip per inspection, which dominated long-horizon
    *  cost. Always batch. */
   | { action: "verify_slots"; slots: number[]; reason?: string }
+  /** Sub-agent recipe query. Returns the recipe (ingredients +
+   *  inShape) for the given item id from minecraft-data and stores it
+   *  on the plan so subsequent probes show RECIPE/Placement plan
+   *  blocks based on this lookup. Use this ONCE at task start to
+   *  establish the target item, before placing anything. */
+  | { action: "recipe_lookup"; item: string; reason?: string }
   | { action: "done"; reason?: string }
   | { action: "fallback_manual"; reason?: string }
   // Low-level operations kept for backwards compatibility / fine-grained
@@ -242,6 +247,12 @@ export async function probeNextCraftAction(opts: {
    *  item appearing in a craft cell or the result slot) without
    *  needing to re-OCR. */
   slotUpdates?: string[];
+  /** Recipe (target item, ingredients, inShape) cached after the
+   *  sub-agent emitted recipe_lookup. When provided, the probe
+   *  prompt's RECIPE/Placement plan blocks are built from this; when
+   *  null, the prompt instructs the agent to emit recipe_lookup
+   *  first. No regex parsing of taskText. */
+  recipeInfo?: import("./UiFastControl").RecipeInfo | null;
 }): Promise<CraftProbeResult> {
   // Set-of-Mark: render the obs frame with numbered badges drawn at every
   // slot's pixel center so the VLM grounds slot indices visually instead of
@@ -287,16 +298,9 @@ export async function probeNextCraftAction(opts: {
 
   // Recipe-info hint (read-only, derived from minecraft-data). Helps the VLM
   // disambiguate multi-ingredient placement without surfacing live state.
-  const recipeInfo = (() => {
-    const tokens = opts.taskText.toLowerCase().match(/[a-z_]+/g) ?? [];
-    for (let i = tokens.length - 1; i >= 0; i -= 1) {
-      const tok = tokens[i];
-      if (tok === "craft" || tok === "make" || tok === "using" || tok === "and" || tok === "with" || tok === "the" || tok === "a") continue;
-      const r = lookupRecipe(tok);
-      if (r) return r;
-    }
-    return null;
-  })();
+  // Recipe is now provided by the caller (cached on plan when the
+  // sub-agent emitted recipe_lookup). No regex parsing of task text.
+  const recipeInfo = opts.recipeInfo ?? null;
 
   // Known slot contents from the slot-memory store. Each entry is the
   // result of a prior hover + tooltip OCR, expressed in the current
@@ -313,7 +317,12 @@ export async function probeNextCraftAction(opts: {
   // rule-based string matching is fragile (e.g. "quartz" vs
   // "nether_quartz" naming variants) and the LLM does this trivially.
   const recipeHint = (() => {
-    if (!recipeInfo) return null;
+    if (!recipeInfo) {
+      return [
+        "RECIPE: not yet queried for this task.",
+        "Emit a recipe_lookup action with the snake_case MC item id you intend to craft (extract it from the Task line above). The runtime will look up ingredients + grid layout via minecraft-data and surface the RECIPE/Placement plan in the next probe. If the first id is wrong, call recipe_lookup again with a corrected id. (This is the slot for future per-target recipe context; it can be re-queried when a sub-recipe is needed, e.g. craft sticks before pickaxe.)",
+      ].join("\n");
+    }
     const ing = recipeInfo.ingredients.map((it) => `${it.count}x ${it.name}`).join(" + ");
     const lines = [`RECIPE (from minecraft-data): produces ${recipeInfo.target}. Required ingredients: ${ing}. You MUST place EXACTLY this set into the craft grid -- placing extras of one ingredient and missing another yields nothing.`];
 
@@ -340,6 +349,14 @@ export async function probeNextCraftAction(opts: {
     const craftSlots = sortedCraft;
     const gridCols = craftSlots.length === 9 ? 3 : (craftSlots.length === 4 ? 2 : 0);
     const gridRows = craftSlots.length === 9 ? 3 : (craftSlots.length === 4 ? 2 : 0);
+    // Grid-size mismatch: recipe needs more cells than this GUI offers
+    // (e.g. iron_pickaxe needs 3x3 but player_inventory has 2x2).
+    // Tell the agent to open a crafting table.
+    const recipeNeedsRows = recipeInfo.inShape ? recipeInfo.inShape.length : 0;
+    const recipeNeedsCols = recipeInfo.inShape ? Math.max(...recipeInfo.inShape.map((r) => r.length)) : 0;
+    if (recipeNeedsRows > 0 && recipeNeedsCols > 0 && (recipeNeedsRows > gridRows || recipeNeedsCols > gridCols)) {
+      lines.push(`GRID TOO SMALL: this recipe needs a ${recipeNeedsRows}x${recipeNeedsCols} grid but the current GUI only offers ${gridRows}x${gridCols}. You must close the inventory (press 'inventory' button), place a crafting_table block in the world, look at it, and 'use' to open the 3x3 crafting interface BEFORE attempting placements. The crafting_table item is in your inventory; emit a fallback_manual action so the world-control sub-agent takes over until the 3x3 GUI is open.`);
+    }
     if (gridCols > 0) {
       lines.push(`Craft grid: ${gridRows} rows x ${gridCols} cols. Cells are 1-indexed row-major (Row 1 Col 1 is top-left).`);
       // Map Row/Col -> raster slot index so the LLM can resolve the
@@ -439,6 +456,7 @@ export async function probeNextCraftAction(opts: {
     `  {"action": "move", "from": A, "to": B, "count": "one"|"all", "reason": "...", "subTask": "..."} -- ATOMIC. Tool picks the stack from A, places into B (one item if count=one, whole stack if count=all), and automatically returns any remainder to A.`,
     `  {"action": "put",  "slot": N, "reason": "...", "subTask": "..."} -- dump whatever the cursor is currently holding into slot N as a whole stack. Use only when the cursor already holds something.`,
     `  {"action": "verify_slots", "slots": [N1, N2, ...], "reason": "..."} -- BATCH slot perception. The runtime hovers each listed slot and runs an OCR sub-agent on the rendered tooltip. Results go to "Known slot contents" and persist. CRITICAL: MC does NOT render slot tooltips while the cursor is HOLDING an item -- the cursor's held-item label is shown instead. If "CURSOR IS HOLDING" is in your State block, do NOT verify_slots; you must first place / put the held item back somewhere safe so the cursor is empty, then verify. Only include slots whose contents you cannot confidently identify; cap N <= 4. Do NOT inspect visually-empty slots or slots already in Known.`,
+    `  {"action": "recipe_lookup", "item": "<minecraft_item_id>", "reason": "..."} -- Query the recipe for a target item via minecraft-data. Use this ONCE at task start (when the prompt has no RECIPE block) to learn what to craft. Return the snake_case MC item id (e.g. "iron_pickaxe", "diorite", "oak_planks") extracted from the task text. The runtime caches the result and surfaces RECIPE/Placement plan in the next probe. If the first lookup is wrong (e.g. the agent's id doesn't match an MC recipe), call recipe_lookup again with a corrected id.`,
     `  {"action": "fallback_manual", "reason": "..."} -- SoM marks do NOT cover the slot you need; hand control back to the manual LLM controller.`,
     `  {"action": "done", "reason": "...", "subTask": "..."} -- ONLY when (a) any recipe result slot in view is empty AND (b) the requested target is visibly stored in a regular inventory slot. Tool may CV-verify before accepting.`,
     "",
@@ -554,6 +572,14 @@ export async function probeNextCraftAction(opts: {
   const maxSlot = (detectedLayout?.slots.length ?? 41) - 1;
   if (action === "done") return { action: { action: "done", reason }, layout: detectedLayout };
   if (action === "fallback_manual") return { action: { action: "fallback_manual", reason }, layout: detectedLayout };
+  if (action === "recipe_lookup") {
+    const itemRaw = (parsed as { item?: unknown }).item;
+    if (typeof itemRaw !== "string" || itemRaw.length === 0) {
+      console.warn(`[agentbeats] probe parse: recipe_lookup missing item field`);
+      return { action: null, layout: detectedLayout };
+    }
+    return { action: { action: "recipe_lookup", item: itemRaw.trim().toLowerCase().replace(/[^a-z0-9_]/g, ""), reason }, layout: detectedLayout };
+  }
   if (action === "move") {
     const fromRaw = parsed.from;
     const toRaw = parsed.to;
