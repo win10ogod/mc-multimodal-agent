@@ -46,7 +46,29 @@ const SCHEMA = {
           text: { type: "string" },
           done: { type: "boolean" },
           attempts: { type: "integer" },
-          task: { type: "object", additionalProperties: true },
+          task: {
+            type: "object",
+            required: ["kind"],
+            additionalProperties: true,
+            properties: {
+              kind: {
+                type: "string",
+                enum: [
+                  "verify_items_visible",
+                  "place_in_craft_grid",
+                  "take_result",
+                  "wait_for_output",
+                  "click_button",
+                  "verify_state",
+                ],
+              },
+              items: { type: "array", items: { type: "string" } },
+              item: { type: "string" },
+              expectedItem: { type: "string" },
+              buttonName: { type: "string" },
+              condition: { type: "string" },
+            },
+          },
         },
       },
     },
@@ -123,7 +145,7 @@ export async function runPlanner(deps: PlannerDeps, input: PlannerInput): Promis
     console.warn(`[fastui-planner] failed to parse JSON: ${text.slice(0, 200)}`);
     return { kind: "continue", checklist: input.currentChecklist, nextIdx: input.currentChecklist.findIndex((c) => !c.done) };
   }
-  console.log(`[fastui-planner] trigger=${input.trigger} all_done=${parsed.all_done} next_idx=${parsed.next_idx} checklist=[${parsed.checklist.map((c) => `${c.done ? "x" : " "}${c.id}`).join(",")}]`);
+  console.log(`[fastui-planner] trigger=${input.trigger} all_done=${parsed.all_done} next_idx=${parsed.next_idx} checklist=[${parsed.checklist.map((c) => `${c.done ? "x" : " "}${c.id} task.kind=${(c.task as any)?.kind ?? "MISSING"}`).join(", ")}]`);
   if (parsed.all_done) return { kind: "all_done", checklist: parsed.checklist };
   return { kind: "continue", checklist: parsed.checklist, nextIdx: parsed.next_idx };
 }
