@@ -476,6 +476,13 @@ export type PendingClick = {
    *  evidence the slot really got the item; the source-slot lookup
    *  supplies the identity. */
   placedItemName?: string;
+  /** Source slot's RGB fingerprint at chain-build time. Used at place
+   *  verify to CV-confirm the placement actually transferred the
+   *  intended item: compare destination's post-fill fp to this
+   *  sourceFp. If similar, record placedItemName at destination. If
+   *  dissimilar, the click missed/swapped — log + do NOT record (and
+   *  keep cursorItemSignature so the agent knows it still holds). */
+  sourceFp?: { meanR: number; meanG: number; meanB: number; stddev: number };
 };
 
 export type ClosedLoopCraftPlan = {

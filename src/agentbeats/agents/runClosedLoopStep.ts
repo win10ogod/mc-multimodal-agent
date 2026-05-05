@@ -858,20 +858,28 @@ export async function runClosedLoopStep(
               const placedItemName =
                 fromMem?.item
                 ?? (fromSlot.role === "result" && plan.recipeOverride ? plan.recipeOverride.target : undefined);
-              const mkClick = (s: { index: number; name?: string; role?: string; cx: number; cy: number }, button: "attack" | "use", expectAfter: "should_empty" | "should_fill", actionKind: "pickup" | "place_one" | "place_all" | "take", kind: "click" | "auto_return", placedItemName?: string): import("../tools/UiFastControl").PendingClick => ({
+              // Capture source's RGB fingerprint for CV-based placement
+              // tracking. Prefer slotMemory baseline (set at OCR-confirm
+              // time / first probe Pass A). Fallback to a fresh sample
+              // of the source slot at chain-build time. The destination
+              // verify will compare its post-fill fp against this.
+              const sourceFp = fromMem?.fingerprint
+                ?? samplePatchFingerprint(payload.obs, fromSlot.cx, fromSlot.cy, 6) ?? undefined;
+              const mkClick = (s: { index: number; name?: string; role?: string; cx: number; cy: number }, button: "attack" | "use", expectAfter: "should_empty" | "should_fill", actionKind: "pickup" | "place_one" | "place_all" | "take", kind: "click" | "auto_return", placedItemName?: string, sourceFp?: { meanR: number; meanG: number; meanB: number; stddev: number }): import("../tools/UiFastControl").PendingClick => ({
                 rasterIndex: s.index, slotName: s.name, slotRole: s.role,
                 frozenTarget: { x: s.cx, y: s.cy },
                 button, shift: false, expectAfter,
                 phase: "servo", retries: 0, kind, actionKind,
                 ...(placedItemName ? { placedItemName } : {}),
+                ...(sourceFp ? { sourceFp } : {}),
               });
               const chain: import("../tools/UiFastControl").PendingClick[] = [];
-              chain.push(mkClick(fromSlot, "attack", "should_empty", "pickup", "click"));
+              chain.push(mkClick(fromSlot, "attack", "should_empty", "pickup", "click", undefined, sourceFp));
               if (probed.count === "all") {
-                chain.push(mkClick(toSlot, "attack", "should_fill", "place_all", "click", placedItemName));
+                chain.push(mkClick(toSlot, "attack", "should_fill", "place_all", "click", placedItemName, sourceFp));
               } else {
-                chain.push(mkClick(toSlot, "use", "should_fill", "place_one", "click", placedItemName));
-                chain.push(mkClick(fromSlot, "attack", "should_fill", "place_all", "auto_return"));
+                chain.push(mkClick(toSlot, "use", "should_fill", "place_one", "click", placedItemName, sourceFp));
+                chain.push(mkClick(fromSlot, "attack", "should_fill", "place_all", "auto_return", undefined, sourceFp));
               }
               // Only record pickupSourceSlot when picking from a real
               // ingredient source (hotbar/main_inv). Moves whose source
@@ -1464,35 +1472,53 @@ export async function runClosedLoopStep(
           if (matched) {
             state.closedLoopHistory.unshift(`${pc.actionKind ?? pc.kind ?? "click"} slot=${pc.rasterIndex}${pc.slotName ? `(${pc.slotName})` : ""} OK`);
             state.closedLoopHistory = state.closedLoopHistory.slice(0, 5);
-            // On a matched place_* verify, write the placed item name
-            // into slotMemory at the destination so Planner sees it
-            // in Known. STRICT gate: write ONLY when the destination
-            // is HIGH-CONFIDENCE filled (post.stddev > 35), not just
-            // on the lenient matched-verify path. The matched check
-            // accepts (meanShift > 20) which can fire on a still-
-            // empty slot when the prePatch was unusual — that
-            // poisons Known with phantom items (e.g. "slot 11(main_
-            // inv_0) -> diorite" while MC actually has nothing
-            // there, leading Planner to mark take_result done with
-            // no diorite in the player's real inventory).
+            // CV-based placement tracking. The matched-verify check
+            // (post.stddev > 35) only confirms the slot LOOKS filled;
+            // it doesn't confirm the placed ITEM is what we wanted.
+            // Compare destination's post-fill RGB to the source's
+            // recorded fingerprint — only if they match within tight
+            // tolerance can we say the placement actually transferred
+            // the intended item. This catches:
+            //   - cursor empty when click fired (no actual placement)
+            //   - cursor swapped with neighbor's item before placing
+            //   - destination already had a different item (swap)
             if (
               (pc.actionKind === "place_one" || pc.actionKind === "place_all")
               && pc.placedItemName
               && post.stddev > 35
             ) {
-              plan.slotMemory.record(slotCenter.cx, slotCenter.cy, pc.placedItemName, plan.iteration);
-              console.log(`[agentbeats] slotMemory write on place verify: slot=${pc.rasterIndex}(${pc.slotName ?? "?"}) item=${pc.placedItemName} stddev=${post.stddev.toFixed(1)}`);
+              const dstFp = samplePatchFingerprint(payload.obs, slotCenter.cx, slotCenter.cy, 6);
+              const fpDist = (a: { meanR: number; meanG: number; meanB: number }, b: { meanR: number; meanG: number; meanB: number }) =>
+                Math.hypot(a.meanR - b.meanR, a.meanG - b.meanG, a.meanB - b.meanB);
+              const stddevRatio = pc.sourceFp && dstFp && pc.sourceFp.stddev > 0
+                ? Math.abs(dstFp.stddev - pc.sourceFp.stddev) / pc.sourceFp.stddev
+                : 1;
+              const cvConfirmed = !!(pc.sourceFp && dstFp && fpDist(dstFp, pc.sourceFp) < 35 && stddevRatio < 0.4);
+              if (cvConfirmed) {
+                plan.slotMemory.record(slotCenter.cx, slotCenter.cy, pc.placedItemName, plan.iteration, dstFp);
+                console.log(`[agentbeats] CV-confirmed placement: slot=${pc.rasterIndex}(${pc.slotName ?? "?"}) item=${pc.placedItemName} dst-fp matches source-fp`);
+              } else if (pc.sourceFp && dstFp) {
+                const fd = fpDist(dstFp, pc.sourceFp);
+                console.warn(`[agentbeats] PLACEMENT FP MISMATCH at slot=${pc.rasterIndex}(${pc.slotName ?? "?"}): expected '${pc.placedItemName}' (src.stddev=${pc.sourceFp.stddev.toFixed(1)}) but dst.stddev=${post.stddev.toFixed(1)} fp_dist=${fd.toFixed(1)}; click hit wrong slot or didn't transfer — NOT recording in slotMemory; cursor likely still holds the item`);
+              } else {
+                // No source fp available — fall back to plain placedItemName write.
+                plan.slotMemory.record(slotCenter.cx, slotCenter.cy, pc.placedItemName, plan.iteration, dstFp ?? undefined);
+                console.log(`[agentbeats] slotMemory write (no sourceFp to compare): slot=${pc.rasterIndex}(${pc.slotName ?? "?"}) item=${pc.placedItemName}`);
+              }
             } else if ((pc.actionKind === "place_one" || pc.actionKind === "place_all") && pc.placedItemName) {
-              console.warn(`[agentbeats] place verify matched but stddev=${post.stddev.toFixed(1)} too low to confirm fill — skipping slotMemory write for slot=${pc.rasterIndex}(${pc.slotName ?? "?"}); next probe Pass B will resolve`);
+              console.warn(`[agentbeats] place verify matched but stddev=${post.stddev.toFixed(1)} too low to confirm fill — skipping slotMemory write for slot=${pc.rasterIndex}(${pc.slotName ?? "?"})`);
             }
-            // Record / clear cursorItemSignature based on this click:
-            //   pickup OK  -> cursor now carries the item from the source slot.
-            //                Capture the source's prePatch RGB as the signature.
-            //   place_all OK (kind=click) -> cursor is now empty.
-            //                Clear the signature.
-            //   place_one OK -> cursor still carries (count-1) of same item.
-            //                Keep signature.
-            //   auto_return OK -> cursor empty. Clear.
+            // Record / clear cursorItemSignature based on this click,
+            // gated by CV-evidence:
+            //   pickup OK   -> cursor now carries the item; capture
+            //                  source's prePatch RGB as the signature.
+            //   place_all / auto_return OK + CV-confirmed dst-fp ≈
+            //   src-fp -> cursor is now empty (placement transferred).
+            //   place_all / auto_return OK but CV-MISMATCH -> click
+            //   verified post.stddev change but the item didn't
+            //   actually transfer; keep cursorItemSignature so the
+            //   agent knows it's still holding (e.g. accidentally
+            //   swapped with neighbor mid-chain).
             if (pc.actionKind === "pickup" && pc.prePatch) {
               plan.cursorItemSignature = {
                 meanR: pc.prePatch.meanR,
@@ -1501,7 +1527,17 @@ export async function runClosedLoopStep(
               };
               console.log(`[agentbeats] cursorItemSignature set from pickup ${pc.slotName ?? pc.rasterIndex}: rgb=(${pc.prePatch.meanR.toFixed(0)},${pc.prePatch.meanG.toFixed(0)},${pc.prePatch.meanB.toFixed(0)})`);
             } else if (pc.actionKind === "place_all" || pc.kind === "auto_return") {
-              plan.cursorItemSignature = null;
+              // CV-verify the placement before clearing cursor signature.
+              const dstFp = samplePatchFingerprint(payload.obs, slotCenter.cx, slotCenter.cy, 6);
+              const fpDist = (a: { meanR: number; meanG: number; meanB: number }, b: { meanR: number; meanG: number; meanB: number }) =>
+                Math.hypot(a.meanR - b.meanR, a.meanG - b.meanG, a.meanB - b.meanB);
+              const cvConfirmed = !!(pc.sourceFp && dstFp && fpDist(dstFp, pc.sourceFp) < 35
+                && (pc.sourceFp.stddev === 0 || Math.abs(dstFp.stddev - pc.sourceFp.stddev) / pc.sourceFp.stddev < 0.4));
+              if (cvConfirmed || !pc.sourceFp) {
+                plan.cursorItemSignature = null;
+              } else {
+                console.warn(`[agentbeats] cursor still HOLDING after place verify: dst-fp at slot ${pc.rasterIndex} doesn't match source-fp; keeping cursorItemSignature so Planner sees holding state`);
+              }
             }
             // Arm Planner re-judge after the LAST click in a chain
             // (i.e. when no more clicks queued). The runtime fires
