@@ -599,6 +599,76 @@ export function samplePatchFingerprint(
   return { meanR, meanG, meanB, stddev: Math.sqrt(varSum / n) };
 }
 
+/** Perceptual hash of a slot patch (dHash, 64-bit). Captures spatial
+ *  texture at the slot center: each bit compares adjacent grayscale
+ *  cells in a 9×8 grid. Two patches showing the same item yield very
+ *  close hashes (Hamming distance 0–4); patches with the same mean
+ *  RGB but different items (a common Minecraft case — many block
+ *  textures share a grey/brown palette but differ in pixel layout)
+ *  diverge to Hamming distance 12+. Use a loose threshold (≤16 of 64)
+ *  for "same item" matching across frames. */
+export function samplePatchDHash(
+  jpegBase64: string,
+  cx: number,
+  cy: number,
+  size = 16,
+): bigint | null {
+  const cleaned = jpegBase64.startsWith("data:image/")
+    ? jpegBase64.replace(/^data:image\/[a-z]+;base64,/, "")
+    : jpegBase64;
+  let decoded;
+  try {
+    decoded = jpeg.decode(Buffer.from(cleaned, "base64"), { useTArray: true, formatAsRGBA: true });
+  } catch {
+    return null;
+  }
+  const { width: w, height: h, data } = decoded;
+  const half = Math.floor(size / 2);
+  // 9×8 grayscale grid. Each cell averages a (size/9 × size/8) sub-block.
+  const cols = 9, rows = 8;
+  const cellW = size / cols, cellH = size / rows;
+  const grid = new Float32Array(cols * rows);
+  const cnt = new Uint16Array(cols * rows);
+  const x0 = cx - half, y0 = cy - half;
+  for (let dy = 0; dy < size; dy += 1) {
+    const y = y0 + dy;
+    if (y < 0 || y >= h) continue;
+    const rowIdx = Math.min(rows - 1, Math.floor(dy / cellH));
+    for (let dx = 0; dx < size; dx += 1) {
+      const x = x0 + dx;
+      if (x < 0 || x >= w) continue;
+      const colIdx = Math.min(cols - 1, Math.floor(dx / cellW));
+      const i = (y * w + x) * 4;
+      const lum = 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2];
+      grid[rowIdx * cols + colIdx] += lum;
+      cnt[rowIdx * cols + colIdx] += 1;
+    }
+  }
+  for (let i = 0; i < grid.length; i += 1) {
+    if (cnt[i] > 0) grid[i] /= cnt[i];
+  }
+  // dHash: for each row, compare adjacent cells horizontally.
+  let hash = 0n;
+  for (let r = 0; r < rows; r += 1) {
+    for (let c = 0; c < cols - 1; c += 1) {
+      hash <<= 1n;
+      if (grid[r * cols + c] > grid[r * cols + c + 1]) hash |= 1n;
+    }
+  }
+  return hash;
+}
+
+/** Hamming distance between two 64-bit dHashes (popcount of XOR). */
+export function dHashDistance(a: bigint, b: bigint): number {
+  let x = a ^ b;
+  let n = 0;
+  while (x !== 0n) {
+    n += Number(x & 1n);
+    x >>= 1n;
+  }
+  return n;
+}
+
 /** Debug variant: return ALL plausible cursor components (useful for
  *  triaging false positives during calibration). */
 export function detectCursorCandidates(

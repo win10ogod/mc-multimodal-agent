@@ -24,6 +24,11 @@ export type SlotMemoryEntry = {
    *  another slot, is on the cursor, or is missing -- without paying
    *  another OCR call. */
   fingerprint?: { meanR: number; meanG: number; meanB: number; stddev: number };
+  /** dHash (64-bit perceptual hash) of the slot patch. Captures the
+   *  spatial texture of the item icon. Many MC blocks share similar
+   *  mean RGB (grey/brown palette) but differ in pixel layout — the
+   *  hash discriminates them. Hamming distance ≤16 ⇒ same item. */
+  hash?: bigint;
 };
 
 const MATCH_RADIUS_PX = 8;
@@ -33,13 +38,13 @@ export class SlotMemory {
   private entries: SlotMemoryEntry[] = [];
 
   /** Record (or update) what is at an absolute pixel position. */
-  record(x: number, y: number, item: string, step: number, fingerprint?: SlotMemoryEntry["fingerprint"]): void {
+  record(x: number, y: number, item: string, step: number, fingerprint?: SlotMemoryEntry["fingerprint"], hash?: bigint): void {
     const idx = this.findClosestIndex(x, y);
     if (idx >= 0) {
       const prev = this.entries[idx];
-      this.entries[idx] = { x, y, item, step, fingerprint: fingerprint ?? prev.fingerprint };
+      this.entries[idx] = { x, y, item, step, fingerprint: fingerprint ?? prev.fingerprint, hash: hash ?? prev.hash };
     } else {
-      this.entries.push({ x, y, item, step, fingerprint });
+      this.entries.push({ x, y, item, step, fingerprint, hash });
     }
   }
 

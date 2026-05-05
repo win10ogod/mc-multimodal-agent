@@ -15,6 +15,12 @@ export type ActionInput = {
   subtask: Subtask;
   /** OCR-confirmed slot contents at this moment (slot index + item name). */
   knownSlots: Array<{ index: number; name?: string; item: string }>;
+  /** CV-detected occupied slot indices. Slots that visually contain
+   *  SOMETHING (chroma+luminance fill test) regardless of whether the
+   *  item is identified. Subtract knownSlots indices to get
+   *  "occupied but unknown" — these are the slots verify_slots should
+   *  target when looking for an unidentified ingredient. */
+  occupiedSlotIndices: number[];
   /** GUI slot-index → role mapping for the open window. Action uses
    *  this to find craft cells by role, identify the result slot,
    *  pick free hotbar/main_inv slots, and reject non-task-relevant
@@ -40,8 +46,8 @@ const SCHEMA = {
 const SYS = `You execute ONE symbolic subtask in a Minecraft GUI. You receive the subtask plus layout_slots (slot index + role), known_slots (OCR'd contents), recipe (if any), cursor_holding, and the frame with YELLOW NUMBERED BADGES on every slot.
 
 Subtask → action mapping:
-- verify_items_visible { items }: emit verify_slots ONLY for slots you are visually CONFIDENT contain one of the listed items. Do not include uncertain or off-target slots — empty/random slots fire wasted OCR. If you cannot identify any candidate confidently, emit fallback_manual.
-- place_in_craft_grid { item }: (1) pick a craft cell (role starts "craft_2x2_" or "craft_3x3_") matching this item's recipe position. (2) Find the source slot for this item in known_slots. If item is NOT in known_slots, emit verify_slots on up to 3 hotbar/main_inv slots that VISUALLY look like the item — do NOT guess source indices. Once known_slots contains the item, emit move from=source to=craftCell count="one".
+- verify_items_visible { items }: emit verify_slots ONLY for slots you are visually CONFIDENT contain one of the listed items. Prefer indices listed in occupied_slot_indices_unknown_content — those are CV-confirmed non-empty. Do NOT include uncertain or off-target slots — empty/random slots fire wasted OCR. If you cannot identify any candidate confidently, emit fallback_manual.
+- place_in_craft_grid { item }: (1) pick a craft cell (role starts "craft_2x2_" or "craft_3x3_") matching this item's recipe position. (2) Find the source slot for this item in known_slots. If item is NOT in known_slots, emit verify_slots restricted to occupied_slot_indices_unknown_content (up to 3) that VISUALLY look like the item. Once known_slots contains the item, emit move from=source to=craftCell count="one".
 - take_result { expectedItem }: from = slot with role==="result"; to = free slot in known_slots; emit move count="all".
 - wait_for_output { expectedItem }: emit wait with holdSteps proportional to expected sim ticks (cap 60).
 - verify_state { condition }: if condition holds in frame+known, emit done; else fallback_manual.
@@ -73,6 +79,7 @@ export async function runAction(deps: ActionDeps, input: ActionInput): Promise<C
         }
       : null,
     cursor_holding: input.cursorHolding,
+    occupied_slot_indices_unknown_content: input.occupiedSlotIndices.filter((i) => !input.knownSlots.some((k) => k.index === i)),
   };
 
   const seq = String(++ACTION_CALL_SEQ).padStart(5, "0");

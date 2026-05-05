@@ -18,6 +18,11 @@ export type PlannerInput = {
    *  the perception so a slot index in either prompt unambiguously
    *  refers to the same SoM badge in the live frame. */
   knownSlots: Array<{ index: number; name?: string; item: string }>;
+  /** CV-detected occupied slot indices (chroma+luminance fill test).
+   *  Subtract knownSlots indices to get "occupied but unknown content"
+   *  — those are candidates for verify_items_visible if a recipe
+   *  ingredient hasn't been identified yet. */
+  occupiedSlotIndices: number[];
   /** What the cursor is currently carrying, if anything. */
   cursorHolding: string | null;
   /** Empty on first invocation; otherwise the in-flight list. */
@@ -99,9 +104,15 @@ function buildUserText(input: PlannerInput, userPayload: Record<string, unknown>
   const knownLines = input.knownSlots.length > 0
     ? input.knownSlots.map((s) => `  ${s.index} -> ${s.item}`).join("\n")
     : "  (none yet)";
+  const knownIdxSet = new Set(input.knownSlots.map((s) => s.index));
+  const unknownOccupied = input.occupiedSlotIndices.filter((i) => !knownIdxSet.has(i));
+  const occupiedLine = unknownOccupied.length > 0
+    ? unknownOccupied.join(", ")
+    : "(none)";
   const cursorBlock = input.cursorHolding ?? "(empty)";
-  return `Tracked items (yellow-badge id -> item, OCR-confirmed):
+  return `Tracked items (slot id -> item, OCR-confirmed):
 ${knownLines}
+Other occupied slots (CV-detected, content unknown): ${occupiedLine}
 Cursor: ${cursorBlock}
 
 ${JSON.stringify(userPayload)}`;
@@ -120,6 +131,7 @@ export async function runPlanner(deps: PlannerDeps, input: PlannerInput): Promis
         }
       : null,
     known_slots: input.knownSlots,
+    occupied_slot_indices: input.occupiedSlotIndices,
     cursor_holding: input.cursorHolding,
     current_checklist: input.currentChecklist,
     trigger: input.trigger,

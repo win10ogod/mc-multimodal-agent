@@ -11,7 +11,7 @@ import {
   lookupRecipe,
 } from "../tools/UiFastControl";
 import { probeNextCraftAction, vlmVerifySlotState } from "../tools/InventoryProbe";
-import { detectCursorWithExpectation, detectGuiLayout, samplePatchFingerprint } from "../tools/SlotDetector";
+import { detectCursorWithExpectation, detectGuiLayout, samplePatchFingerprint, samplePatchDHash, dHashDistance } from "../tools/SlotDetector";
 import { repairDecisionForTask, shouldUseModelOnStep } from "../McuPolicyUtils";
 import type { UiFastControlFrame } from "../tools/UiFastControl";
 
@@ -122,6 +122,139 @@ export async function runClosedLoopStep(
     } catch { /* fall back to raw */ }
   }
 
+  // CV-only per-frame item resolver. For every item we have a pixel
+  // fingerprint for (captured at OCR time when the item was hovered),
+  // scan all detected slots this frame and re-bind the item to the
+  // slot whose current fingerprint best matches. This replaces
+  // agent-feedback-driven mutation tracking: knowledge of WHERE every
+  // tracked item is gets re-derived from pixels each observation,
+  // before the Planner sees `known_slots`. As a side-effect, items
+  // that don't match any slot must be on the cursor — that drives
+  // `cursorHoldingMut`.
+  if (state.closedLoopCraft && payload.obs) {
+    const cp = state.closedLoopCraft;
+    const layoutForMut = cp.sessionLayout as ReturnType<typeof detectGuiLayout> | null;
+    if (layoutForMut && layoutForMut.slots.length > 0) {
+      const cursorNow = detectCursorWithExpectation(payload.obs, layoutForMut, null);
+      type Fp = { meanR: number; meanG: number; meanB: number; stddev: number };
+      const fpDist = (a: Fp, b: Fp) => Math.hypot(a.meanR - b.meanR, a.meanG - b.meanG, a.meanB - b.meanB);
+      const chroma = (fp: Fp) => Math.max(fp.meanR, fp.meanG, fp.meanB) - Math.min(fp.meanR, fp.meanG, fp.meanB);
+      // Two-path fill test:
+      //  (a) saturated item:        chroma > 12  (most blocks/items)
+      //  (b) grey item w/ texture:  luminance far from empty-slot
+      //      baseline (~139) AND stddev in the "block texture" band.
+      //      Catches cobblestone, iron, stone, snow — pure-grey items
+      //      whose chroma is ~0. Excludes:
+      //        - empty slots (low stddev, lum near 139)
+      //        - SoM/UI text overlays (modest stddev, lum near 139)
+      //        - player-avatar bleed in armor slots (stddev > 60)
+      const isFilled = (fp: Fp) => {
+        if (chroma(fp) > 12) return true;
+        const lum = (fp.meanR + fp.meanG + fp.meanB) / 3;
+        if (Math.abs(lum - 139) > 30 && fp.stddev > 18 && fp.stddev < 60) return true;
+        return false;
+      };
+      // Direct cursor-region holding detection. The held-item icon
+      // renders ~8 px NW of the cursor tip. When the cursor is NOT
+      // over a slot (no slot pixels bleeding in), the NW patch is
+      // pure GUI background unless an item is carried; high stddev
+      // or saturation there is an unambiguous "holding" signal.
+      if (cursorNow) {
+        const overSlot = layoutForMut.slots.some((s) => Math.hypot(s.cx - cursorNow.x, s.cy - cursorNow.y) < 12);
+        if (!overSlot) {
+          const heldFp = samplePatchFingerprint(payload.obs, cursorNow.x - 8, cursorNow.y - 8, 4);
+          if (heldFp) {
+            const heldC = chroma(heldFp);
+            if (heldFp.stddev > 35 || heldC > 30) {
+              cp.cursorHoldingMut = true;
+              console.log(`[agentbeats] cursor-NW: holding (stddev=${heldFp.stddev.toFixed(1)} chroma=${heldC.toFixed(1)})`);
+            } else if (heldFp.stddev < 18 && heldC < 15) {
+              cp.cursorHoldingMut = false;
+            }
+          }
+        }
+      }
+      // Per-frame fingerprint + dHash sweep. Skip slots within ~12 px
+      // of the cursor — hover highlight contaminates both signals.
+      // Only sample dHash for slots that pass the chroma fill gate, so
+      // the matcher never burns hash comparisons against empty slots.
+      const slotSigs: Array<{ index: number; cx: number; cy: number; fp: Fp; hash: bigint }> = [];
+      for (const s of layoutForMut.slots) {
+        if (cursorNow && Math.hypot(s.cx - cursorNow.x, s.cy - cursorNow.y) < 12) continue;
+        const fp = samplePatchFingerprint(payload.obs, s.cx, s.cy, 6);
+        if (!fp) continue;
+        if (!isFilled(fp)) continue;
+        const hash = samplePatchDHash(payload.obs, s.cx, s.cy, 16);
+        if (hash === null) continue;
+        slotSigs.push({ index: s.index, cx: s.cx, cy: s.cy, fp, hash });
+      }
+      // Coord→id projection: every filled slot's layout index. Surfaces
+      // to Planner + Action so they see "this slot has something in it"
+      // even when we haven't OCR'd the item name yet.
+      cp.occupiedSlotIndices = slotSigs.map((s) => s.index);
+      // Match each tracked item by Hamming distance on dHash. The hash
+      // captures pixel layout — many MC items share a grey/brown
+      // palette but differ in texture; Hamming distance separates them
+      // where mean-RGB cannot. Loose threshold (≤16/64) tolerates JPEG
+      // noise and minor stack-count rendering changes; chroma-fp is a
+      // tiebreaker.
+      const HAMMING_MAX = 16;
+      const tracked = cp.slotMemory.snapshot()
+        .filter((e) => e.item !== "empty" && e.item !== "unknown" && (!!e.hash || !!e.fingerprint));
+      const usedSlots = new Set<string>();
+      const itemsLost: Array<{ x: number; y: number; item: string }> = [];
+      for (const e of tracked) {
+        // Position anchor: if a filled slot exists at this exact
+        // pixel position, the item hasn't moved — accept without
+        // hash check. dHash is sensitive to icon scale (cob in
+        // hotbar vs cob in a smaller craft cell yields ham ≈ 30
+        // even though it's the "same" item) so for stay-put we
+        // trust position. Drift > 6 px ⇒ slot got renumbered or
+        // the item physically moved; fall through to hash match.
+        const anchor = slotSigs.find((s) => Math.hypot(s.cx - e.x, s.cy - e.y) < 6);
+        if (anchor) {
+          const key = `${anchor.cx},${anchor.cy}`;
+          if (!usedSlots.has(key)) {
+            usedSlots.add(key);
+            continue;
+          }
+        }
+        let bestKey: string | null = null, bestSlot: typeof slotSigs[number] | null = null;
+        let bestHam = HAMMING_MAX + 1, bestFpD = Infinity;
+        for (const s of slotSigs) {
+          const key = `${s.cx},${s.cy}`;
+          if (usedSlots.has(key)) continue;
+          const ham = e.hash !== undefined ? dHashDistance(e.hash, s.hash) : HAMMING_MAX;
+          if (ham > HAMMING_MAX) continue;
+          const fd = e.fingerprint ? fpDist(e.fingerprint, s.fp) : 0;
+          if (ham < bestHam || (ham === bestHam && fd < bestFpD)) {
+            bestHam = ham; bestFpD = fd; bestKey = key; bestSlot = s;
+          }
+        }
+        if (bestKey && bestSlot) {
+          usedSlots.add(bestKey);
+          const drift = Math.hypot(bestSlot.cx - e.x, bestSlot.cy - e.y);
+          if (drift > 6) {
+            cp.slotMemory.invalidate(e.x, e.y);
+            cp.slotMemory.record(bestSlot.cx, bestSlot.cy, e.item, cp.iteration, bestSlot.fp, bestSlot.hash);
+            console.log(`[agentbeats] item-track: '${e.item}' relocated (${e.x},${e.y}) -> (${bestSlot.cx},${bestSlot.cy}) ham=${bestHam} fp_d=${bestFpD.toFixed(1)}`);
+          }
+        } else {
+          itemsLost.push({ x: e.x, y: e.y, item: e.item });
+        }
+      }
+      if (itemsLost.length > 0) {
+        cp.cursorHoldingMut = true;
+        for (const lost of itemsLost) {
+          cp.slotMemory.invalidate(lost.x, lost.y);
+          console.log(`[agentbeats] item-track: '${lost.item}' not found in any slot — assumed on cursor`);
+        }
+      } else if (tracked.length > 0) {
+        cp.cursorHoldingMut = false;
+      }
+    }
+  }
+
   // Planner re-judge after a successful chain. Fires once per arm.
   if (state.closedLoopCraft && state.closedLoopCraft.judgeAfterChain && payload.obs) {
     const cp = state.closedLoopCraft;
@@ -143,13 +276,16 @@ export async function runClosedLoopStep(
           );
           return { index: closest.s?.index ?? 0, name: closest.s?.name, item: e.item };
         });
-      const cursorHoldingItem = cp.cursorItemSignature ? "(unknown item)" : null;
+      const cursorHoldingItem = cp.cursorItemSignature
+        ? "(unknown item)"
+        : cp.cursorHoldingMut === true ? "(holding something)" : null;
       const { runPlanner } = await import("./subagents/fastUi/Planner");
       const markedObs = markedObsForLLMs ?? payload.obs;
       const rj = await runPlanner({ client: deps.client, model: deps.model, recordDebug: deps.recordDebug }, {
         taskText: state.taskText,
         recipeInfo: cp.recipeOverride,
         knownSlots: knownSlotsForPlanner,
+        occupiedSlotIndices: cp.occupiedSlotIndices,
         cursorHolding: cursorHoldingItem,
         currentChecklist: cp.checklist,
         trigger: "post_action",
@@ -415,7 +551,8 @@ export async function runClosedLoopStep(
             }
             if (!mem.fingerprint) {
               // Lazy baseline capture from the probe frame (no hover).
-              plan.slotMemory.record(s.cx, s.cy, mem.item, mem.step, live);
+              const hash = samplePatchDHash(payload.obs, s.cx, s.cy, 16);
+              plan.slotMemory.record(s.cx, s.cy, mem.item, mem.step, live, hash ?? undefined);
               console.log(`[agentbeats] fp baseline captured for slot ${s.index}(${s.name ?? "?"}) item='${mem.item}' meanRGB=(${live.meanR.toFixed(0)},${live.meanG.toFixed(0)},${live.meanB.toFixed(0)}) stddev=${live.stddev.toFixed(1)}`);
               knownSlots.push({ index: s.index, name: s.name, item: mem.item, ageIters: plan.iteration - mem.step });
               continue;
@@ -490,7 +627,8 @@ export async function runClosedLoopStep(
                 if (dist < bestDist) { bestDist = dist; bestItem = k.item; }
               }
               if (bestItem && bestDist < 30) {
-                plan.slotMemory.record(s.cx, s.cy, bestItem, plan.iteration, live);
+                const hash = samplePatchDHash(payload.obs, s.cx, s.cy, 16);
+                plan.slotMemory.record(s.cx, s.cy, bestItem, plan.iteration, live, hash ?? undefined);
                 knownSlots.push({ index: s.index, name: s.name, item: bestItem, ageIters: 0 });
                 slotUpdates.push(`slot ${s.index}${s.name ? `(${s.name})` : ""} now has ${bestItem}`);
                 console.log(`[agentbeats] slot ${s.index}(${s.name ?? "?"}) matched to known item '${bestItem}' by fingerprint (dist=${bestDist.toFixed(1)})`);
@@ -530,7 +668,9 @@ export async function runClosedLoopStep(
             const layoutForAction = layoutForProbe.slots.map((s) => ({
               index: s.index, name: s.name, role: s.role,
             }));
-            const cursorHoldingItem = plan.cursorItemSignature ? "(unknown item)" : null;
+            const cursorHoldingItem = plan.cursorItemSignature
+              ? "(unknown item)"
+              : plan.cursorHoldingMut === true ? "(holding something)" : null;
             const activeItem = plan.checklist[plan.activeChecklistIdx];
             activeItem.attempts = (activeItem.attempts ?? 0) + 1;
             // Reuse the SoM-labeled image computed once at the top of body.
@@ -538,6 +678,7 @@ export async function runClosedLoopStep(
             probed = await runAction({ client: deps.client, model: deps.model, recordDebug: deps.recordDebug }, {
               subtask: activeItem.task,
               knownSlots: knownForAction,
+              occupiedSlotIndices: plan.occupiedSlotIndices,
               layoutSlots: layoutForAction,
               recipeInfo: plan.recipeOverride,
               cursorHolding: cursorHoldingItem,
@@ -655,13 +796,16 @@ export async function runClosedLoopStep(
                     );
                     return { index: closest.s?.index ?? 0, name: closest.s?.name, item: e.item };
                   });
-                const cursorHoldingItem = plan.cursorItemSignature ? "(unknown item)" : null;
+                const cursorHoldingItem = plan.cursorItemSignature
+                  ? "(unknown item)"
+                  : plan.cursorHoldingMut === true ? "(holding something)" : null;
                 const { runPlanner } = await import("./subagents/fastUi/Planner");
                 const markedObs = markedObsForLLMs ?? payload.obs ?? "";
                 const r0 = await runPlanner({ client: deps.client, model: deps.model, recordDebug: deps.recordDebug }, {
                   taskText: state.taskText,
                   recipeInfo: r,
                   knownSlots: knownSlotsForPlanner,
+                  occupiedSlotIndices: plan.occupiedSlotIndices,
                   cursorHolding: cursorHoldingItem,
                   currentChecklist: [],
                   trigger: "first",

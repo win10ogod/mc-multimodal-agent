@@ -535,6 +535,24 @@ export type ClosedLoopCraftPlan = {
    *  significant L2 distance means an item icon is overlaid on the
    *  cursor sprite at park, so the cursor is holding. */
   parkEmptyBaseline: { meanR: number; meanG: number; meanB: number; stddev: number } | null;
+  /** CV-only cursor-holding estimate. Each observation, the runtime
+   *  fingerprints every slot and tries to match each tracked item
+   *  (slotMemory entry with `fingerprint`) to the closest slot. Items
+   *  that match a slot are re-bound there (location update, no OCR);
+   *  items that DON'T match any slot are inferred to be on the cursor
+   *  → cursorHoldingMut=true. When all tracked items are accounted for
+   *  in slots → false. Independent of `cursorItemSignature` (which
+   *  only fires on click-verified pickups) and independent of cursor
+   *  position (no park requirement). */
+  cursorHoldingMut: boolean | null;
+  /** CV-derived "this slot has SOMETHING in it" set, refreshed every
+   *  observation by the per-frame resolver. Slot indices reference
+   *  the current sessionLayout. Surfaced to Planner + Action as
+   *  "occupied but unknown" candidates — combined with knownSlots
+   *  (where item identity is OCR-confirmed) it gives the LLM a
+   *  complete picture of which slots are filled vs empty without
+   *  re-OCRing anything. */
+  occupiedSlotIndices: number[];
   /** Per-slot pixel fingerprint captured at the FIRST probe of the
    *  session (cursor at park, slots in their natural starting state).
    *  Pass B uses this as the per-slot "is this slot at its initial
@@ -687,6 +705,8 @@ export function planClosedLoopCraft(taskText: string): ClosedLoopCraftPlan {
     pendingTooltipRead: null,
     pendingOcrBatch: null,
     parkEmptyBaseline: null,
+    cursorHoldingMut: null,
+    occupiedSlotIndices: [],
     recentMatchedPickup: false,
     initialSlotBaselines: new Map(),
     recipeOverride: null,
