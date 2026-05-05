@@ -1346,26 +1346,25 @@ export async function runClosedLoopStep(
             state.closedLoopHistory.unshift(`${pc.actionKind ?? pc.kind ?? "click"} slot=${pc.rasterIndex}${pc.slotName ? `(${pc.slotName})` : ""} OK`);
             state.closedLoopHistory = state.closedLoopHistory.slice(0, 5);
             // On a matched place_* verify, write the placed item name
-            // into slotMemory at the destination so the next probe
-            // sees it under "Known slot contents". Without this:
-            //   - take_result loops forever (the just-taken target
-            //     never appears in Known at the destination, so
-            //     Planner can't tick step6 done).
-            //   - Pass B's fingerprint-match on the next probe only
-            //     works when the placed item already has a captured
-            //     baseline; for newly-crafted output (diorite from
-            //     the result slot) there's no prior baseline to
-            //     match against, so the appearance scan misses it.
-            // Baseline 6398f3f had this write — over-zealous similarity
-            // gates I added later were the regression source, not the
-            // write itself. No similarity gate now: click verifier
-            // already CV-confirmed the slot got filled (post.stddev
-            // change matches expectAfter); placedItemName is taken
-            // from slotMemory at the source (or recipeOverride.target
-            // when source is the result slot — see chain build).
-            if ((pc.actionKind === "place_one" || pc.actionKind === "place_all") && pc.placedItemName) {
+            // into slotMemory at the destination so Planner sees it
+            // in Known. STRICT gate: write ONLY when the destination
+            // is HIGH-CONFIDENCE filled (post.stddev > 35), not just
+            // on the lenient matched-verify path. The matched check
+            // accepts (meanShift > 20) which can fire on a still-
+            // empty slot when the prePatch was unusual — that
+            // poisons Known with phantom items (e.g. "slot 11(main_
+            // inv_0) -> diorite" while MC actually has nothing
+            // there, leading Planner to mark take_result done with
+            // no diorite in the player's real inventory).
+            if (
+              (pc.actionKind === "place_one" || pc.actionKind === "place_all")
+              && pc.placedItemName
+              && post.stddev > 35
+            ) {
               plan.slotMemory.record(slotCenter.cx, slotCenter.cy, pc.placedItemName, plan.iteration);
-              console.log(`[agentbeats] slotMemory write on place verify: slot=${pc.rasterIndex}(${pc.slotName ?? "?"}) item=${pc.placedItemName}`);
+              console.log(`[agentbeats] slotMemory write on place verify: slot=${pc.rasterIndex}(${pc.slotName ?? "?"}) item=${pc.placedItemName} stddev=${post.stddev.toFixed(1)}`);
+            } else if ((pc.actionKind === "place_one" || pc.actionKind === "place_all") && pc.placedItemName) {
+              console.warn(`[agentbeats] place verify matched but stddev=${post.stddev.toFixed(1)} too low to confirm fill — skipping slotMemory write for slot=${pc.rasterIndex}(${pc.slotName ?? "?"}); next probe Pass B will resolve`);
             }
             // Record / clear cursorItemSignature based on this click:
             //   pickup OK  -> cursor now carries the item from the source slot.
@@ -1443,6 +1442,83 @@ export async function runClosedLoopStep(
               }
             } catch (e) {
               console.warn(`[agentbeats] VLM sub-verify call failed: ${e instanceof Error ? e.message : String(e)}; falling through to retry`);
+            }
+          }
+          // Auto-return rescue: when the auto_return click MISMATCHES
+          // (source slot still empty / wrong content after the click),
+          // the cursor still holds the leftover stack — but the click
+          // didn't drop. Often this happens because the click landed
+          // on a neighboring slot with a different item, which would
+          // SWAP and corrupt state. Redirect the cursor to ANY empty
+          // slot in the same row (or a nearby empty hotbar/main_inv
+          // slot) so the cursor ends up empty without poisoning a
+          // tracked source. Keep the cursor's-arm-empty invariant.
+          if (pc.kind === "auto_return" && payload.obs) {
+            type LayoutSlot = { index: number; name?: string; role?: string; cx: number; cy: number };
+            const layoutSnap = (plan.sessionLayout as { slots: LayoutSlot[] } | null)?.slots ?? [];
+            const obsForRescue = payload.obs;
+            // Neighbor-corruption sweep: the click may have landed on
+            // an adjacent slot (servo error / cursor-tip offset) and
+            // swapped whatever was there onto the cursor. Any tracked
+            // slot within ~14 px of the click target whose live patch
+            // significantly differs from its OCR baseline is suspect
+            // — invalidate its slotMemory entry so downstream code
+            // doesn't trust a stale identity.
+            for (const s of layoutSnap) {
+              if (s.role !== "hotbar" && s.role !== "main_inv") continue;
+              if (Math.hypot(s.cx - slotCenter.cx, s.cy - slotCenter.cy) > 14) continue;
+              if (s.index === pc.rasterIndex) continue;
+              const mem = plan.slotMemory.lookup(s.cx, s.cy);
+              if (!mem || !mem.fingerprint || mem.item === "empty" || mem.item === "unknown") continue;
+              const live = samplePatchFingerprint(obsForRescue, s.cx, s.cy, 6);
+              if (!live) continue;
+              const dr = live.meanR - mem.fingerprint.meanR;
+              const dg = live.meanG - mem.fingerprint.meanG;
+              const db = live.meanB - mem.fingerprint.meanB;
+              const dist = Math.sqrt(dr * dr + dg * dg + db * db);
+              if (dist > 35) {
+                plan.slotMemory.invalidate(s.cx, s.cy);
+                console.warn(`[agentbeats] auto_return neighbor-corruption: slot ${s.index}(${s.name ?? "?"}) drifted ${dist.toFixed(0)} from baseline; invalidating slotMemory entry (may have been accidentally swapped)`);
+              }
+            }
+            // STRICT rescue criterion: dump the cursor's contents at
+            // ANY empty hotbar/main_inv slot that's NOT in slotMemory,
+            // NOT in the corrupted-neighbor radius, and CV-confirmed
+            // empty (stddev < 25). Prefer same-row slots, then any
+            // safe slot anywhere. This keeps the cursor empty even
+            // when the original auto_return target is unsafe.
+            const isEmptyAndUntracked = (s: LayoutSlot): boolean => {
+              if (s.index === pc.rasterIndex) return false;
+              if (s.role !== "hotbar" && s.role !== "main_inv") return false;
+              if (Math.hypot(s.cx - slotCenter.cx, s.cy - slotCenter.cy) <= 14) return false;
+              const mem = plan.slotMemory.lookup(s.cx, s.cy);
+              if (mem && mem.item !== "empty" && mem.item !== "unknown") return false;
+              const patch = samplePatchFingerprint(obsForRescue, s.cx, s.cy, 12);
+              return !!patch && patch.stddev < 25;
+            };
+            const sameRowEmpty: LayoutSlot | undefined =
+              layoutSnap.find((s) => isEmptyAndUntracked(s) && Math.abs(s.cy - slotCenter.cy) <= 6)
+              ?? layoutSnap.find(isEmptyAndUntracked);
+            if (sameRowEmpty) {
+              const rescueName = sameRowEmpty.name ?? `slot${sameRowEmpty.index}`;
+              console.warn(`[agentbeats] auto_return MISMATCH at slot ${pc.rasterIndex}; redirecting cursor dump to empty slot ${sameRowEmpty.index}(${rescueName})`);
+              state.closedLoopHistory.unshift(`auto_return rescue -> ${rescueName}`);
+              state.closedLoopHistory = state.closedLoopHistory.slice(0, 5);
+              plan.pendingClick = {
+                rasterIndex: sameRowEmpty.index,
+                slotName: sameRowEmpty.name,
+                slotRole: sameRowEmpty.role,
+                frozenTarget: { x: sameRowEmpty.cx, y: sameRowEmpty.cy },
+                button: "attack",
+                shift: false,
+                expectAfter: "should_fill",
+                phase: "servo",
+                retries: 0,
+                kind: "auto_return",
+                actionKind: "place_all",
+              };
+              plan.servoSteps = 0;
+              return { kind: "act", action: defaultMcuAction(), holdSteps: 1 };
             }
           }
           // FastUI Action-agent path: NO IBVS retries — any mismatch
