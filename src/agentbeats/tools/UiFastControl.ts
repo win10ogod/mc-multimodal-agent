@@ -644,46 +644,54 @@ export function servoCursorStep(opts: {
     if (opts.shift) action.sneak = 1;
     return { action, click: true, reason: `${opts.shift ? "shift+" : ""}click err=${errMag.toFixed(1)}px` };
   }
-  // Sim-model-aware control. Empirically measured response from
-  // logged frames:
-  //   - Yaw deadzone: ~2 deg (cam=[0,-1] left cursor stuck for 4
-  //     consecutive frames — sub-2° yaw produces no motion).
-  //   - Pitch deadzone: ~4 deg (existing PITCH_DEADZONE_MIN constant).
-  //   - Effective ratios: ~6.7 px/deg yaw, ~6.7 px/deg pitch (logged
-  //     cam=10 → ~67 px). The original PX_PER_CAM constants were
-  //     slightly optimistic.
-  // Strategy: every emitted cam command must clear the deadzone of
-  // its axis. Yaw quantized at 2° (CAM_BIN_DEG). Pitch quantized at
-  // PITCH_DEADZONE_MIN (4°). When either axis error is below its
-  // deadzone equivalent (~13 px yaw / ~26 px pitch), accept the
-  // residual on that axis and let the OTHER axis converge first.
-  // Delta-sigma integrator on pitch lets sub-deadzone pitch errors
-  // accumulate across frames and fire deadzone-min corrections
-  // periodically — cursor's time-average y still converges.
-  const yawDeadzonePx = CAM_BIN_DEG * PX_PER_CAM_YAW;
-  const pitchDeadzonePx = PITCH_DEADZONE_MIN * PX_PER_CAM_PITCH;
-  // Yaw: deadzone-aware with deliberate overshoot. The classical
-  // "human strategy" for deadzone-limited actuators: when error >
-  // half the deadzone, fire the smallest deadzone-clearing command
-  // and let the cursor LAND past target by up to deadzone/2. With
-  // the ±10 px click hit-region wider than yawDeadzonePx/2 (≈8.5 px),
-  // this overshoot still places cursor inside the click region.
-  // Without this overshoot strategy cursor gets stuck in the dead
-  // band [hit_region, deadzone] where it's too far for click but
-  // too close for a quantized cam command to make progress.
+  // QUADRATIC sim model — empirically derived from servo_trajectory.jsonl
+  // (run bp47tb9i2). The sim's cursor displacement is approximately
+  // px ≈ k_q × cam² × sign(cam), with k_q ≈ 0.67 for both axes.
+  // Validated data points:
+  //   cam= 2°  →  4 px  (k_q × 4 = 2.7,  observed 4)
+  //   cam= 4°  → 11 px  (k_q × 16 = 10.7, observed 11) ✓
+  //   cam= 8°  → 38 px  (k_q × 64 = 42.9, observed 38) ✓
+  //   cam=10°  → 67 px  (k_q × 100 = 67,  observed 67) ✓
+  // A linear model with constant px/deg either undershoots (small cam)
+  // or overshoots (large cam); the quadratic inverse predicts cam
+  // accurately at every magnitude.
+  // Inverse: cam = sign(px) * sqrt(|px| / k_q), clamped to ±MAX_CAM_DEG
+  // and quantized to integer (sim doesn't accept fractional cam).
+  const K_QUAD = 0.67;
+  const quadraticInvCam = (pxErr: number): number => {
+    if (pxErr === 0) return 0;
+    const raw = Math.sign(pxErr) * Math.sqrt(Math.abs(pxErr) / K_QUAD);
+    const clamped = Math.max(-MAX_CAM_DEG, Math.min(MAX_CAM_DEG, raw));
+    return Math.round(clamped);
+  };
+  // Predict actual cursor displacement from the quantized cam value.
+  // Used so we can decide whether to emit (would the displacement be
+  // useful?) or stay put (within achievable precision).
+  const camToDisplacement = (cam: number): number => {
+    if (cam === 0) return 0;
+    return Math.sign(cam) * K_QUAD * cam * cam;
+  };
+  // Yaw deadzone: sim ignores |cam|<2 (logged: cam=1 produced 0
+  // motion for 4 consecutive frames). Smallest effective yaw cam = 2.
+  // Pitch deadzone: |cam|<PITCH_DEADZONE_MIN (4) produces 0 motion.
+  const yawDeadzonePx = camToDisplacement(CAM_BIN_DEG);          // ≈2.7 px
+  const pitchDeadzonePx = camToDisplacement(PITCH_DEADZONE_MIN); // ≈10.7 px
+  // Yaw: emit when |ex| > min-effective/2 so the smallest command
+  // doesn't OVERSHOOT past the click hit-region. The quadratic inverse
+  // computes the right cam for any error; deadzone enforced by min cam.
   let dy = 0;
   if (Math.abs(ex) > yawDeadzonePx / 2) {
-    const yawClamped = Math.max(-MAX_CAM_DEG, Math.min(MAX_CAM_DEG, ex / PX_PER_CAM_YAW));
-    dy = Math.round(yawClamped / CAM_BIN_DEG) * CAM_BIN_DEG;
+    dy = quadraticInvCam(ex);
     if (dy === 0) dy = Math.sign(ex) * CAM_BIN_DEG;
+    else if (Math.abs(dy) < CAM_BIN_DEG) dy = Math.sign(dy) * CAM_BIN_DEG;
   }
-  // Pitch: deadzone-aware with delta-sigma integrator.
+  // Pitch: same quadratic inverse + deadzone. Delta-sigma integrator
+  // accumulates sub-deadzone errors across frames.
   let dp = 0;
   if (Math.abs(ey) >= pitchDeadzonePx) {
-    const pitchClamped = Math.max(-MAX_CAM_DEG, Math.min(MAX_CAM_DEG, ey / PX_PER_CAM_PITCH));
-    dp = Math.round(pitchClamped);
+    dp = quadraticInvCam(ey);
     if (Math.abs(dp) < PITCH_DEADZONE_MIN) {
-      dp = Math.sign(pitchClamped || 1) * PITCH_DEADZONE_MIN;
+      dp = Math.sign(dp || ey) * PITCH_DEADZONE_MIN;
     }
     if (opts.integrator) opts.integrator.pitchAccumPx = 0;
   } else if (opts.integrator) {
