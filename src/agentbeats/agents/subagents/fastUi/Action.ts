@@ -43,11 +43,11 @@ const SCHEMA = {
   },
 } as const;
 
-const SYS = `You execute ONE symbolic subtask in a Minecraft GUI. You receive the subtask plus layout_slots (slot index + role), slot_state (every occupied slot, named or "unknown item"), recipe (if any), cursor_holding, and the frame with YELLOW NUMBERED BADGES on every slot. Any slot index NOT in slot_state is empty.
+const SYS = `You execute ONE symbolic subtask in a Minecraft GUI. You receive the subtask plus layout_slots (slot index + role), slot_state (slots CV detected as having content, named or "unknown item"), recipe (if any), cursor_holding, and the frame with YELLOW NUMBERED BADGES on every slot. Slots NOT in slot_state are LIKELY empty but may also be unverified content the CV missed (low-contrast grey blocks like cobblestone often go undetected).
 
 Subtask → action mapping:
-- verify_items_visible { items }: emit verify_slots ONLY for slot indices listed in slot_state — slots NOT in the list are CV-confirmed empty and OCR there is wasted. Among slot_state entries, prefer "unknown item" slots when looking for an unidentified ingredient. If you cannot pick a confident candidate, emit fallback_manual.
-- place_in_craft_grid { item }: (1) pick a craft cell (role starts "craft_2x2_" or "craft_3x3_") matching this item's recipe position. (2) Find the source slot in slot_state where the named item is recorded. If the item is only present as "unknown item" entries, emit verify_slots on up to 3 of those candidates that VISUALLY look like the item. Once slot_state names the item, emit move from=source to=craftCell count="one".
+- verify_items_visible { items }: prefer "unknown item" entries in slot_state. If a needed item isn't in slot_state at all, scan up to 3 unlisted hotbar/main_inv slots that VISUALLY look like the item — do NOT assume an inventory lacks the item just because slot_state doesn't name it. If you cannot pick a confident candidate even visually, emit fallback_manual.
+- place_in_craft_grid { item }: (1) pick a craft cell (role starts "craft_2x2_" or "craft_3x3_") matching this item's recipe position. (2) Find the source slot in slot_state where the named item is recorded. If the item is only present as "unknown item" entries, emit verify_slots on up to 3 of those. If it's not in slot_state at all but the recipe says you should have it, emit verify_slots on up to 3 unlisted hotbar slots that visually match. Once slot_state names the item, emit move from=source to=craftCell count="one".
 - take_result { expectedItem }: from = slot with role==="result"; to = free slot in known_slots; emit move count="all".
 - wait_for_output { expectedItem }: emit wait with holdSteps proportional to expected sim ticks (cap 60).
 - verify_state { condition }: if condition holds in frame+known, emit done; else fallback_manual.
@@ -82,7 +82,7 @@ export async function runAction(deps: ActionDeps, input: ActionInput): Promise<C
   const userPayload = {
     subtask: input.subtask,
     slot_state: slotState,
-    slot_state_note: "any slot index not listed is empty",
+    slot_state_note: "slots not listed are likely empty OR contents not yet inspected (CV may miss low-contrast grey items)",
     layout_slots: input.layoutSlots,
     recipe: input.recipeInfo
       ? {

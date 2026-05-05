@@ -92,7 +92,7 @@ Subtask kinds (no numbers, no slot indices):
 - wait_for_output { expectedItem }
 - verify_state { condition }
 
-The "Slot state" block lists every slot that visibly has SOMETHING in it. Each line is either "id N -> <item>" (OCR-confirmed) or "id N -> unknown item" (CV-detected but unidentified). Any slot index NOT listed is empty.
+The "Slot state" block lists every slot CV detected as having something in it. Each line is either "id N -> <item>" (OCR-confirmed) or "id N -> unknown item" (CV-detected but unidentified). Slots NOT listed are likely empty but may also contain items CV missed (e.g., low-contrast grey blocks); if a recipe ingredient is missing from the listing, prefer verify_items_visible to confirm rather than assuming the inventory lacks it.
 
 On the FIRST call for a crafting task: emit one place_in_craft_grid per ingredient unit (one slot is one item) → take_result { expectedItem }. Use verify_items_visible first only if the recipe ingredients aren't already named in slot_state.
 
@@ -117,7 +117,7 @@ function buildUserText(input: PlannerInput, userPayload: Record<string, unknown>
     .map((i) => `  ${i} -> ${knownByIdx.get(i) ?? "unknown item"}`);
   const slotBlock = lines.length > 0 ? lines.join("\n") : "  (all slots empty)";
   const cursorBlock = input.cursorHolding ?? "(empty)";
-  return `Slot state (any id not listed is empty):
+  return `Slot state (slots not listed are empty OR contents not yet inspected):
 ${slotBlock}
 Cursor: ${cursorBlock}
 

@@ -139,28 +139,28 @@ export async function runClosedLoopStep(
       type Fp = { meanR: number; meanG: number; meanB: number; stddev: number };
       const fpDist = (a: Fp, b: Fp) => Math.hypot(a.meanR - b.meanR, a.meanG - b.meanG, a.meanB - b.meanB);
       const chroma = (fp: Fp) => Math.max(fp.meanR, fp.meanG, fp.meanB) - Math.min(fp.meanR, fp.meanG, fp.meanB);
-      // Three-path fill test (each path catches a class of items the
-      // others miss; together they exclude every confirmed false-
-      // positive class):
-      //  (a) saturated item: chroma > 25 (quartz, crafting table,
-      //      most colored blocks).
-      //  (b) low-chroma textured item: chroma > 12 AND stddev > 60.
-      //      Catches cobblestone in hotbar (chroma~17 stddev~80) but
-      //      excludes the false-positive plateau (empty slots whose
-      //      yellowish background tint reads chroma~17 stddev~50).
-      //  (c) pure-grey textured item: luminance far from empty-slot
-      //      baseline (~139) AND stddev in the "block texture" band.
-      //      Catches cob/iron/stone in craft cells (chroma 0,
-      //      stddev 25-50). Excludes:
-      //        - empty slots (low stddev, lum near 139)
-      //        - SoM/UI text overlays (modest stddev, lum near 139)
-      //        - player-avatar bleed in armor slots (stddev > 60).
-      const isFilled = (fp: Fp) => {
+      // Role-aware fill test. Cobblestone reads chroma=0 stddev≈100
+      // lum≈103 in the raw frame — pure grey, very textured, far
+      // from empty-slot baseline (139). The player-avatar render in
+      // armor slots produces the EXACT same fingerprint shape, so a
+      // single rule can't separate them. Discriminator is role:
+      //   - in armor / offhand / unknown slots: require visible color
+      //     (chroma > 25). Avatar bleed has chroma 1-6 ⇒ stays empty.
+      //   - in hotbar/main_inv/craft/result: any of:
+      //       (a) saturated:           chroma > 25
+      //       (b) colored-textured:    chroma > 12 AND stddev > 18
+      //       (c) grey-textured item:  lum far from 139 AND stddev > 18
+      //     Empty slot (lum~139 stddev<10) and SoM-text overlay
+      //     (lum~139 stddev~35) both fall through to false.
+      const isFilled = (fp: Fp, role?: string) => {
         const c = chroma(fp);
         if (c > 25) return true;
-        if (c > 12 && fp.stddev > 60) return true;
+        const isItemSlot = role === "hotbar" || role === "main_inv"
+          || role === "craft_2x2" || role === "craft_3x3" || role === "result";
+        if (!isItemSlot) return false;
+        if (c > 12 && fp.stddev > 18) return true;
         const lum = (fp.meanR + fp.meanG + fp.meanB) / 3;
-        if (Math.abs(lum - 139) > 30 && fp.stddev > 18 && fp.stddev < 60) return true;
+        if (Math.abs(lum - 139) > 30 && fp.stddev > 18) return true;
         return false;
       };
       // Direct cursor-region holding detection. The held-item icon
@@ -199,7 +199,7 @@ export async function runClosedLoopStep(
         const fp = samplePatchFingerprint(payload.obs, s.cx, s.cy, 6);
         if (!fp) continue;
         const bboxOccluded = medianArea > 0 && s.w * s.h < medianArea * 0.7;
-        if (!isFilled(fp) && !bboxOccluded) continue;
+        if (!isFilled(fp, s.role) && !bboxOccluded) continue;
         const hash = samplePatchDHash(payload.obs, s.cx, s.cy, 16);
         if (hash === null) continue;
         slotSigs.push({ index: s.index, cx: s.cx, cy: s.cy, fp, hash });
