@@ -533,68 +533,18 @@ export class McuVisualPolicy {
     };
     this.contexts.set(contextId, state);
 
-    // ── MCU_USE_PLANNER gated branch ──────────────────────────────────────
-    // When MCU_USE_PLANNER=1: run the planner/dispatcher BEFORE the existing
-    // closed-loop body. When the gate is off (default), this block is skipped
-    // entirely and behavior is byte-identical to the previous implementation.
-    const usePlanner = process.env.MCU_USE_PLANNER === "1";
-    if (usePlanner) {
-      // Lazy-init episode for this contextId
-      let episode = this.episodes.get(contextId);
-      if (!episode) {
-        const taskText = state.taskText || ((payload as any)?.task ?? "");
-        episode = makeEpisodeState(taskText);
-        this.episodes.set(contextId, episode);
-      }
-
-      // First-time plan
-      if (episode.subgoals.length === 0) {
-        const { planGoals } = await import("./agents/GoalPlanner");
-        const out = await planGoals(
-          { client: this.client, model: this.config.openai.model },
-          episode.taskText,
-          [],
-        );
-        if (out.overall_done) {
-          episode.earlyStop = true;
-          state.earlyStop = true;
-          return { ...ACTION_PAYLOAD_PREFIX, action: defaultMcuAction(), hold_steps: this.config.agentbeats.maxHoldSteps };
-        }
-        episode.subgoals = out.subgoals;
-        // singleTask dropped in planner-first refactor
-      }
-
-      const currentSubgoal = episode.subgoals[episode.idx];
-      // Route non-ui_inventory subgoals through dispatcher with stub world sub-agents.
-      if (currentSubgoal && currentSubgoal.kind !== "ui_inventory") {
-        const worldDeps = { client: this.client, model: this.config.openai.model };
-        const subagents: Record<SubAgentKind, SubAgent> = {
-          ui_inventory: { kind: "ui_inventory", systemPrompt: "", step: async () => ({ kind: "subgoal_failed", reason: "ui_inventory bridge not yet wired" }) },
-          world_explore: createWorldExplorer(worldDeps),
-          mining: createMining(worldDeps),
-          combat: createCombat(worldDeps),
-          placing: createPlacing(worldDeps),
-        };
-        const result = await dispatchObservation(
-          {
-            client: this.client,
-            plannerModel: this.config.openai.model,
-            subagents,
-            runClosedLoopStep: async () => ({ kind: "subgoal_failed", reason: "closed-loop bridge not yet wired" }),
-          },
-          episode,
-          { imageBase64: payload.obs ?? "", contextId },
-        );
-        if (episode.earlyStop) {
-          state.earlyStop = true;
-        }
-        return { ...ACTION_PAYLOAD_PREFIX, action: result.action, hold_steps: result.holdSteps };
-      }
-      // else: single-task ui_inventory (or multi-task with ui_inventory first) —
-      // fall through to the existing closed-loop body unchanged.
+    if (state.earlyStop) {
+      return { ...ACTION_PAYLOAD_PREFIX, action: defaultMcuAction(), hold_steps: this.config.agentbeats.maxHoldSteps };
     }
-    // ── end MCU_USE_PLANNER gated branch ──────────────────────────────────
 
+    return await this.dispatchEpisode(contextId, state, payload);
+  }
+
+  private async dispatchEpisode(
+    contextId: string,
+    state: McuContextState,
+    payload: McuObservationPayload,
+  ): Promise<McuPolicyDecision> {
     const step = Math.max(0, Number.isFinite(payload.step) ? Number(payload.step) : 0);
     let episode = this.episodes.get(contextId);
     if (!episode) {
@@ -602,45 +552,54 @@ export class McuVisualPolicy {
       this.episodes.set(contextId, episode);
     }
 
+    const worldDeps = { client: this.client, model: this.config.openai.model };
+    const subagents: Record<SubAgentKind, SubAgent> = {
+      ui_inventory: {
+        kind: "ui_inventory", systemPrompt: "",
+        step: async () => ({ kind: "subgoal_failed", reason: "ui_inventory must be invoked via runClosedLoopStep (GUI gate)" }),
+      },
+      world_explore: createWorldExplorer(worldDeps),
+      mining: createMining(worldDeps),
+      combat: createCombat(worldDeps),
+      placing: createPlacing(worldDeps),
+    };
+
     const recorder = getDebugRecorder();
-    const closedLoopResult = await runClosedLoopStep(
+    const closedLoopDeps = {
+      client: this.client,
+      model: this.config.openai.model,
+      apiKey: this.config.openai.apiKey || undefined,
+      maxHoldSteps: this.config.agentbeats.maxHoldSteps,
+      defaultHoldSteps: this.config.agentbeats.defaultHoldSteps,
+      modelEveryNSteps: this.config.agentbeats.modelEveryNSteps,
+      debugDir: recorder.getDir(),
+      recordDebug: async (kind: string, p: unknown) => { recorder.record({ type: kind, data: p as Record<string, unknown> }); },
+      modelDecision: (ctx: McuContextState, s: number) => this.modelDecision(ctx, s),
+    };
+
+    const result = await dispatchObservation(
       {
         client: this.client,
-        model: this.config.openai.model,
-        apiKey: this.config.openai.apiKey || undefined,
-        maxHoldSteps: this.config.agentbeats.maxHoldSteps,
-        defaultHoldSteps: this.config.agentbeats.defaultHoldSteps,
-        modelEveryNSteps: this.config.agentbeats.modelEveryNSteps,
-        debugDir: recorder.getDir(),
-        recordDebug: async (kind, payload) => { recorder.record({ type: kind, data: payload as Record<string, unknown> }); },
-        modelDecision: (ctx, s) => this.modelDecision(ctx, s),
+        plannerModel: this.config.openai.model,
+        subagents,
+        runClosedLoopStep: async ({ state: ep, obsBase64, contextId: cid }) => {
+          return await runClosedLoopStep(closedLoopDeps, {
+            context: state,
+            episode: ep,
+            obsBase64,
+            contextId: cid,
+            payload,
+            step,
+          });
+        },
       },
-      {
-        context: state,
-        episode,
-        obsBase64: payload.obs ?? "",
-        contextId,
-        payload,
-        step,
-      },
+      episode,
+      { imageBase64: payload.obs ?? "", contextId },
     );
 
-    // Propagate earlyStop set inside runClosedLoopStep back to the caller
-    if (closedLoopResult.kind === "subgoal_done") {
-      state.earlyStop = true;
-      return { ...ACTION_PAYLOAD_PREFIX, action: defaultMcuAction(), hold_steps: this.config.agentbeats.maxHoldSteps };
-    }
-    if (closedLoopResult.kind === "subgoal_failed") {
-      // Transition behavior: closed-loop fallback_manual now escalates to the
-      // planner via subgoal_failed. The planner will reflect on the failure on
-      // its next turn (Task 3.5). Until that wiring exists, the wrapper emits
-      // a noop hold so the episode advances to the next observation, where the
-      // planner-first dispatcher (Task 6) will pick up the BLOCKED escalation.
-      // Do NOT set state.earlyStop here — completion ownership belongs to the planner.
-      return { ...ACTION_PAYLOAD_PREFIX, action: defaultMcuAction(), hold_steps: this.config.agentbeats.maxHoldSteps };
-    }
-    // kind === "act"
-    return { ...ACTION_PAYLOAD_PREFIX, action: closedLoopResult.action, hold_steps: closedLoopResult.holdSteps };
+    if (episode.earlyStop) state.earlyStop = true;
+
+    return { ...ACTION_PAYLOAD_PREFIX, action: result.action, hold_steps: result.holdSteps };
   }
 
 
