@@ -1235,7 +1235,15 @@ export async function runClosedLoopStep(
             // tooltip and OCR would correctly read the wrong slot's
             // item -- corrupting slotMemory. 3 px keeps the cursor
             // pixel inside the intended slot.
-            const arrived = !!cursor && Math.hypot(cursor.x - slotCenter.cx, cursor.y - slotCenter.cy) < 3;
+            // Hover-arrival threshold tuned to the quadratic model's
+            // achievable precision. Smallest effective cam (yaw 2°)
+            // produces ~2.7 px displacement; smallest pitch (4°) gives
+            // ~10.7 px. So in the err=[3, 6] band, the controller
+            // bounces because every emit overshoots back across.
+            // Accept arrival at ≤5 px — the cursor IS inside the
+            // intended slot's interior (slot is 16×16 px) for tooltip
+            // rendering, and this avoids deadband oscillation.
+            const arrived = !!cursor && Math.hypot(cursor.x - slotCenter.cx, cursor.y - slotCenter.cy) <= 5;
             if (arrived || plan.servoSteps > SERVO_STEP_CAP) {
               console.log(`[agentbeats] hover arrived at ${pc.slotName ?? pc.rasterIndex} cursor=(${cursor?.x},${cursor?.y}); leaving cursor for tooltip; clearing pendingClick`);
               state.closedLoopHistory.unshift(`hover slot=${pc.rasterIndex}${pc.slotName ? `(${pc.slotName})` : ""} done`);
