@@ -558,6 +558,61 @@ export async function runClosedLoopStep(
             }
             knownSlots.push({ index: s.index, name: s.name, item: mem.item, ageIters: plan.iteration - mem.step });
           }
+          // CURSOR-HOLDING IDENTIFICATION via pixel-patch matching.
+          // The cursor's held-item icon renders at ~(cursor.x-8,
+          // cursor.y-8). Sample that area as a patch, then run
+          // patchSimilarity against EVERY known-item patch in
+          // slotMemory. Best match (≥0.6 similarity) wins → that's
+          // what the cursor holds. Authoritative ID even when:
+          //   - prior cursorItemSignature is missing/wrong
+          //   - the agent did a swap and our intent-tracking is stale
+          //   - the cursor is over a slot containing a different item
+          // The user described this as "must solve" for reliable UI
+          // interaction.
+          if (plan.cursor && payload.obs) {
+            const cursorPatch = samplePatchPixels(payload.obs, plan.cursor.x - 8, plan.cursor.y - 8, 14);
+            if (cursorPatch) {
+              // Foreground pixel count — empty cursor area has all
+              // BG pixels (mask sums to ~0). Skip identification when
+              // there's nothing to match.
+              let fgCount = 0;
+              for (let i = 0; i < cursorPatch.mask.length; i += 1) fgCount += cursorPatch.mask[i];
+              if (fgCount > 12) {
+                let bestItem: string | null = null;
+                let bestSim = 0.6; // threshold
+                let bestFp: { meanR: number; meanG: number; meanB: number; stddev: number } | undefined = undefined;
+                for (const e of plan.slotMemory.snapshot()) {
+                  if (!e.patch || e.item === "empty" || e.item === "unknown") continue;
+                  const sim = patchSimilarity(e.patch, cursorPatch);
+                  if (sim > bestSim) {
+                    bestSim = sim;
+                    bestItem = e.item;
+                    bestFp = e.fingerprint;
+                  }
+                }
+                if (bestItem) {
+                  const priorItem = plan.cursorItemSignature?.item;
+                  if (priorItem !== bestItem) {
+                    plan.cursorItemSignature = {
+                      meanR: bestFp?.meanR ?? 128,
+                      meanG: bestFp?.meanG ?? 128,
+                      meanB: bestFp?.meanB ?? 128,
+                      item: bestItem,
+                    };
+                    console.warn(`[agentbeats] cursor-pixel-id: cursor holds '${bestItem}' (sim=${bestSim.toFixed(2)}); prior was '${priorItem ?? "(empty)"}'`);
+                  }
+                } else if (plan.cursorItemSignature) {
+                  // Cursor area has FG pixels but no known item
+                  // matches. Could be a freshly-crafted item we have
+                  // no patch baseline for yet — keep current sig.
+                }
+              } else if (plan.cursorItemSignature) {
+                // Cursor area is empty pixels — cursor is empty.
+                console.log(`[agentbeats] cursor-pixel-id: cursor area shows no foreground; clearing signature (was '${plan.cursorItemSignature.item ?? "?"}')`);
+                plan.cursorItemSignature = null;
+              }
+            }
+          }
           // Pass B: filled-slot identification. For every detected
           // slot that has no memory entry but visually contains
           // SOMETHING (not in the empty band), find the closest
