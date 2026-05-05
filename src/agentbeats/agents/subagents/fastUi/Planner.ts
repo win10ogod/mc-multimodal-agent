@@ -73,14 +73,13 @@ On SUBSEQUENT calls (post_action):
   * verify_state is done when the condition holds.
 - all_done is true only when EVERY item is done AND the task's success state is visible (e.g. recipe target in regular inventory).
 
-CRITICAL — anti-loop rule:
-The Action agent fires AT MOST ONCE per subtask. Every checklist item carries an "attempts" counter that reflects how many times Action has been dispatched for it. After Action runs, IBVS verifies and hands back to you.
-- If attempts >= 1 on the item AND your observation supports completion → mark done=true.
-- If attempts >= 1 AND observation does NOT support completion → DO NOT keep the same activeIdx; either:
-   (a) replace this subtask with a different approach (e.g. swap to verify_slots covering a different slot range), or
-   (b) skip it (mark done=true with the assumption it failed silently and let downstream subtasks recover), or
-   (c) insert a new prerequisite subtask BEFORE this one and point next_idx to that prerequisite.
-- NEVER return the same activeIdx with the same subtask + same attempts >= 1. That would loop the Action agent.
+CRITICAL — Planner owns retry decisions:
+The Action agent fires once per dispatch. After it runs, IBVS verifies the click outcome (matched / mismatched) and hands control back to you with the result reflected in recent_history (e.g. "place_one slot=2 OK", "pickup slot=46 FAILED post.stddev=..."). YOU then read the current frame + Known + recent_history and decide:
+  (a) success → tick done=true on the item.
+  (b) IBVS mismatched but observation suggests partial progress → keep same activeIdx for ONE retry. The runtime will re-dispatch Action.
+  (c) clearly not making progress → replace the subtask with a different approach OR insert a prerequisite OR mark done=true and rely on downstream recovery.
+HARD CAP: if checklist item's attempts >= 3, you MUST take path (a) or (c). Returning the same activeIdx with attempts >= 3 unchanged is forbidden — it would deadlock the loop.
+Action NEVER decides whether to retry. Only YOU do.
 
 Output strict JSON:
   { "all_done": bool, "next_idx": int (-1 if all_done; otherwise index of first still-undone item), "checklist": [...] }
