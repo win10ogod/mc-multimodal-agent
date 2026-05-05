@@ -98,17 +98,17 @@ Output strict JSON:
 Each item: { id, text, task, done, attempts }. PRESERVE attempts.`;
 
 function buildUserText(input: PlannerInput, userPayload: Record<string, unknown>): string {
-  // Tracked-items block — only OCR-confirmed names. Probe Pass A/B
-  // owns slotMemory mutation; the LLM gets the authoritative list
-  // here. Slots not listed are either empty or not yet inspected
-  // (verify_items_visible is the way to disambiguate).
+  // Use the SAME phrasing the baseline closed-loop probe used so the
+  // LLM treats this listing the same way it was trained to interpret
+  // probe-style "Known slot contents". Probe Pass A/B owns slotMemory
+  // mutation; the LLM gets the authoritative list here.
   const lines = input.knownSlots
     .slice()
     .sort((a, b) => a.index - b.index)
-    .map((s) => `  ${s.index} -> ${s.item}`);
+    .map((s) => `  slot ${s.index}${s.name ? `(${s.name})` : ""} -> ${s.item}`);
   const slotBlock = lines.length > 0 ? lines.join("\n") : "  (none yet)";
   const cursorBlock = input.cursorHolding ?? "(empty)";
-  return `Tracked items (slot id -> item, OCR-confirmed):
+  return `Known slot contents (from prior tooltip reads -- TRUST these instead of guessing from image):
 ${slotBlock}
 Cursor: ${cursorBlock}
 

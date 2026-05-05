@@ -78,7 +78,7 @@ function buildActionUserText(input: ActionInput): string {
   const slotLines = input.knownSlots
     .slice()
     .sort((a, b) => a.index - b.index)
-    .map((s) => `  ${s.index} -> ${s.item}`);
+    .map((s) => `  slot ${s.index}${s.name ? `(${s.name})` : ""} -> ${s.item}`);
   const slotBlock = slotLines.length > 0 ? slotLines.join("\n") : "  (none yet)";
   const byRole: Record<string, number[]> = {};
   for (const s of input.layoutSlots) {
@@ -106,7 +106,7 @@ function buildActionUserText(input: ActionInput): string {
     : "Recipe: (none)";
   return `Subtask: ${subtaskLine}
 
-Tracked items (slot id -> item, OCR-confirmed):
+Known slot contents (from prior tooltip reads -- TRUST these instead of guessing from image):
 ${slotBlock}
 Cursor: ${cursorBlock}
 
