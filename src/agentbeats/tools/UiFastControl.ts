@@ -614,39 +614,43 @@ export function servoCursorStep(opts: {
     if (opts.shift) action.sneak = 1;
     return { action, click: true, reason: `${opts.shift ? "shift+" : ""}click err=${errMag.toFixed(1)}px` };
   }
-  // Camera-delta proportional to pixel error. Clamp + quantize per frame.
+  // Adaptive servo: fast when far, slow when close. Bin granularity
+  // shrinks as cursor approaches target so the final landing step
+  // can place the cursor within the slot's hit-region rather than
+  // overshooting in 17 px chunks.
+  //   errMag > 30 px : 2 deg bin (~17 px yaw / 10 px pitch) — coarse approach
+  //   15..30 px      : 1 deg bin (~8.5 px / 5 px) — medium
+  //    8..15 px      : 0.5 deg bin (~4.3 px / 2.5 px) — fine
+  //    < 8 px        : 0.25 deg bin (~2.1 px / 1.25 px) — precision landing
+  let bin: number;
+  if (errMag > 30) bin = 2;
+  else if (errMag > 15) bin = 1;
+  else if (errMag > 8) bin = 0.5;
+  else bin = 0.25;
+  const quantizeAdaptive = (deg: number): number => {
+    const clamped = Math.max(-MAX_CAM_DEG, Math.min(MAX_CAM_DEG, deg));
+    return Math.round(clamped / bin) * bin;
+  };
   let yawDeg = ex / PX_PER_CAM_YAW;
   let pitchDeg = ey / PX_PER_CAM_PITCH;
-  // Clamp + bin
-  yawDeg = Math.max(-MAX_CAM_DEG, Math.min(MAX_CAM_DEG, yawDeg));
-  pitchDeg = Math.max(-MAX_CAM_DEG, Math.min(MAX_CAM_DEG, pitchDeg));
-  let dy = quantizeCam(yawDeg);
-  let dp = quantizeCam(pitchDeg);
-  // Pitch deadzone: if remaining error is below half the deadzone, drop
-  // it so we don't oscillate.
-  if (dp !== 0 && Math.abs(dp) < PITCH_DEADZONE_MIN) {
-    dp = Math.sign(dp) * PITCH_DEADZONE_MIN;
-  }
+  let dy = quantizeAdaptive(yawDeg);
+  let dp = quantizeAdaptive(pitchDeg);
+  // Pitch deadzone (unchanged): if remaining error below half the
+  // deadzone, drop pitch to avoid oscillation.
   if (Math.abs(pitchDeg) * PX_PER_CAM_PITCH < PITCH_DEADZONE_MIN / 2) dp = 0;
   if (dy === 0 && dp === 0) {
-    // Sub-quantum stuck: cursor is within ~half a cam-bin of the
-    // target but neither axis can compute a non-zero correction.
-    // Force the smallest cam (2 deg = ~17 px) in the dominant
-    // error axis so the cursor at least moves to a different sub-
-    // pixel position before the click cap fires. This breaks the
-    // deterministic stuck-then-click-the-same-pixel loop where the
-    // click consistently lands at the slot edge and MC's effective
-    // hit region rejects it.
+    // Sub-bin stuck: nudge by the current adaptive bin in the
+    // dominant error axis to break the deterministic stuck-loop.
     const action = defaultMcuAction();
     if (Math.abs(ex) >= Math.abs(ey)) {
-      action.camera = [0, Math.sign(ex) * 2];
+      action.camera = [0, Math.sign(ex) * bin];
     } else {
-      action.camera = [Math.sign(ey) * 2, 0];
+      action.camera = [Math.sign(ey) * bin, 0];
     }
     return {
       action,
       click: false,
-      reason: `kick err=${errMag.toFixed(1)}px cam=[${action.camera[0]},${action.camera[1]}] (sub-quantum stuck nudge)`,
+      reason: `nudge err=${errMag.toFixed(1)}px cam=[${action.camera[0]},${action.camera[1]}] bin=${bin} (sub-bin stuck)`,
     };
   }
   const action = defaultMcuAction();
