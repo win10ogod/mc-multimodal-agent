@@ -42,12 +42,21 @@ const FINISH_TOOL_DEF = {
   },
 };
 
+export type PlannerLoopDeps = {
+  client: OpenAI;
+  model: string;
+  recordDebug?: (kind: string, payload: unknown) => Promise<void> | void;
+};
+
 export async function runPlannerLoop(
-  deps: { client: OpenAI; model: string },
+  deps: PlannerLoopDeps,
   state: EpisodeState,
   obsBase64: string,
   contextId: string,
 ): Promise<PlannerLoopResult> {
+  const log = async (kind: string, payload: unknown) => {
+    try { await deps.recordDebug?.(kind, payload); } catch { /* swallow */ }
+  };
   if (state.pendingReflection) {
     const r = state.pendingReflection;
     if (state.plannerMessages.length === 0) {
@@ -85,6 +94,13 @@ export async function runPlannerLoop(
     FINISH_TOOL_DEF,
   ];
 
+  await log("planner_turn_start", {
+    taskText: state.taskText,
+    pendingReflection: state.pendingReflection ?? null,
+    checklist: state.checklist.read(),
+    messageCount: state.plannerMessages.length,
+  });
+
   const MAX_TOOL_HOPS = 6;
   for (let hop = 0; hop < MAX_TOOL_HOPS; hop++) {
     const resp = await deps.client.chat.completions.create({
@@ -93,10 +109,15 @@ export async function runPlannerLoop(
       tools,
     });
     const msg = resp.choices?.[0]?.message;
-    if (!msg) return { kind: "error", reason: "empty planner response" };
+    if (!msg) {
+      await log("planner_error", { hop, reason: "empty planner response" });
+      return { kind: "error", reason: "empty planner response" };
+    }
     state.plannerMessages.push({ role: "assistant", content: msg.content ?? "", tool_calls: msg.tool_calls as any });
+    await log("planner_assistant", { hop, content: msg.content ?? "", tool_calls: msg.tool_calls ?? null });
 
     if (!msg.tool_calls || msg.tool_calls.length === 0) {
+      await log("planner_error", { hop, reason: "planner produced text instead of tool call" });
       return { kind: "error", reason: "planner produced text instead of tool call" };
     }
     for (const tc of msg.tool_calls as any[]) {
@@ -105,26 +126,32 @@ export async function runPlannerLoop(
 
       if (fname === "task_complete") {
         if (!state.checklist.allDone()) {
-          state.plannerMessages.push({
-            role: "tool", tool_call_id: tc.id,
-            content: `error: cannot complete — checklist still has items not 'done':\n${state.checklist.format()}`,
-          });
-          continue; // keep looping so planner addresses remaining items
+          const content = `error: cannot complete — checklist still has items not 'done':\n${state.checklist.format()}`;
+          state.plannerMessages.push({ role: "tool", tool_call_id: tc.id, content });
+          await log("planner_tool", { hop, name: fname, args: fargs, result: content, ok: false });
+          continue;
         }
+        await log("planner_done", { hop, checklist: state.checklist.read() });
         return { kind: "done" };
       }
       if (fname === "dispatch_subgoal") {
+        await log("planner_dispatch", { hop, subgoal: fargs });
         return { kind: "dispatch", subgoal: fargs as Subgoal };
       }
       const tool = stateBoundTools.find(t => t.name === fname);
       if (!tool) {
-        state.plannerMessages.push({ role: "tool", tool_call_id: tc.id as string, content: `error: unknown tool ${fname}` });
+        const content = `error: unknown tool ${fname}`;
+        state.plannerMessages.push({ role: "tool", tool_call_id: tc.id as string, content });
+        await log("planner_tool", { hop, name: fname, args: fargs, result: content, ok: false });
         continue;
       }
       const result = await tool.run({ obsBase64, contextId, client: deps.client, model: deps.model }, fargs);
       const text = result.ok ? result.text : `error: ${result.error}`;
       state.plannerMessages.push({ role: "tool", tool_call_id: tc.id as string, content: text });
+      await log("planner_tool", { hop, name: fname, args: fargs, result: text, ok: result.ok });
     }
   }
-  return { kind: "error", reason: `planner exceeded ${MAX_TOOL_HOPS} tool hops without dispatching` };
+  const reason = `planner exceeded ${MAX_TOOL_HOPS} tool hops without dispatching`;
+  await log("planner_error", { reason });
+  return { kind: "error", reason };
 }

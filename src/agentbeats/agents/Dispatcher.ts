@@ -21,6 +21,9 @@ export type DispatchDeps = {
     obsBase64: string;
     contextId: string;
   }) => Promise<SubAgentStep>;
+  /** Optional debug sink — receives planner_turn_start / planner_assistant /
+   *  planner_tool / planner_dispatch / planner_done / planner_error events. */
+  recordDebug?: (kind: string, payload: unknown) => Promise<void> | void;
 };
 
 export type DispatchResult = {
@@ -43,7 +46,7 @@ export async function dispatchObservation(
   if (state.subgoals.length === 0 || state.idx >= state.subgoals.length) {
     state.subgoals = []; state.idx = 0;
     const r = await runPlannerLoop(
-      { client: deps.client, model: deps.plannerModel },
+      { client: deps.client, model: deps.plannerModel, recordDebug: deps.recordDebug },
       state, obs.imageBase64, obs.contextId,
     );
     if (r.kind === "done") { state.earlyStop = true; return NOOP_DONE; }

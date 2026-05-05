@@ -582,6 +582,7 @@ export class McuVisualPolicy {
         client: this.client,
         plannerModel: this.config.openai.model,
         subagents,
+        recordDebug: closedLoopDeps.recordDebug,
         runClosedLoopStep: async ({ state: ep, obsBase64, contextId: cid }) => {
           return await runClosedLoopStep(closedLoopDeps, {
             context: state,
