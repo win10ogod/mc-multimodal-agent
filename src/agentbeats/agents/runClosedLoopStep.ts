@@ -89,6 +89,8 @@ export async function runClosedLoopStep(
   // entry guarantees we never get stuck re-emitting the same subtask.
   if (
     state.closedLoopCraft
+    && !state.closedLoopCraft.done
+    && state.closedLoopCraft.sessionLayout != null
     && !state.closedLoopCraft.pendingClick
     && state.closedLoopCraft.pendingChain.length === 0
     && !state.closedLoopCraft.pendingOcrBatch
