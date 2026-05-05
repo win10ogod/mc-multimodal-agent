@@ -647,9 +647,17 @@ export function servoCursorStep(opts: {
   // periodically — cursor's time-average y still converges.
   const yawDeadzonePx = CAM_BIN_DEG * PX_PER_CAM_YAW;
   const pitchDeadzonePx = PITCH_DEADZONE_MIN * PX_PER_CAM_PITCH;
-  // Yaw: emit only when |ex| ≥ yaw deadzone. Quantize at 2° bin.
+  // Yaw: deadzone-aware with deliberate overshoot. The classical
+  // "human strategy" for deadzone-limited actuators: when error >
+  // half the deadzone, fire the smallest deadzone-clearing command
+  // and let the cursor LAND past target by up to deadzone/2. With
+  // the ±10 px click hit-region wider than yawDeadzonePx/2 (≈8.5 px),
+  // this overshoot still places cursor inside the click region.
+  // Without this overshoot strategy cursor gets stuck in the dead
+  // band [hit_region, deadzone] where it's too far for click but
+  // too close for a quantized cam command to make progress.
   let dy = 0;
-  if (Math.abs(ex) >= yawDeadzonePx) {
+  if (Math.abs(ex) > yawDeadzonePx / 2) {
     const yawClamped = Math.max(-MAX_CAM_DEG, Math.min(MAX_CAM_DEG, ex / PX_PER_CAM_YAW));
     dy = Math.round(yawClamped / CAM_BIN_DEG) * CAM_BIN_DEG;
     if (dy === 0) dy = Math.sign(ex) * CAM_BIN_DEG;
