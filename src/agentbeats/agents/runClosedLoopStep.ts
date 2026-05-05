@@ -12,7 +12,7 @@ import {
 } from "../tools/UiFastControl";
 import { probeNextCraftAction, vlmVerifySlotState } from "../tools/InventoryProbe";
 import { detectCursorWithExpectation, detectGuiLayout, samplePatchFingerprint } from "../tools/SlotDetector";
-import { repairDecisionForTask, shouldUseModelOnStep } from "../McuPolicy";
+import { repairDecisionForTask, shouldUseModelOnStep } from "../McuPolicyUtils";
 import type { UiFastControlFrame } from "../tools/UiFastControl";
 
 export type ClosedLoopDeps = {

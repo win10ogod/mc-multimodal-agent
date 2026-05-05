@@ -23,6 +23,12 @@ import {
   type ClosedLoopCraftPlan,
   type UiFastControlFrame,
 } from "./tools/UiFastControl";
+import {
+  ACTION_PAYLOAD_PREFIX,
+  isRecord,
+  normalizeMcuAction,
+} from "./McuPolicyUtils";
+export { normalizeMcuAction } from "./McuPolicyUtils";
 import { dispatchObservation } from "./agents/Dispatcher";
 import { runClosedLoopStep } from "./agents/runClosedLoopStep";
 import { getDebugRecorder } from "./tools/DebugRecorder";
@@ -64,11 +70,6 @@ export type McuContextState = {
   earlyStop: boolean;
 };
 
-const ACTION_PAYLOAD_PREFIX = {
-  type: "action",
-  action_type: "env",
-} as const;
-
 const MCU_CAMERA_BINS = 11;
 const MCU_CAMERA_NULL_BIN = Math.floor(MCU_CAMERA_BINS / 2);
 const MCU_CAMERA_MAX_DEG = 10;
@@ -90,10 +91,6 @@ const MCU_INVENTORY_BUTTON_INDEX = BUTTON_GROUPS.reduce((total, group) => total 
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function mergeBody(target: Record<string, unknown>, source: Record<string, unknown> | undefined): void {
@@ -188,56 +185,6 @@ function jsonCandidates(text: string): string[] {
   return [...candidates];
 }
 
-function binary(value: unknown): 0 | 1 {
-  if (value === 1 || value === true || value === "1" || value === "true") {
-    return 1;
-  }
-  return 0;
-}
-
-function clampNumber(value: unknown, min: number, max: number, fallback = 0): number {
-  const parsed = typeof value === "number" ? value : Number.parseFloat(String(value ?? ""));
-  if (!Number.isFinite(parsed)) {
-    return fallback;
-  }
-  return Math.max(min, Math.min(max, parsed));
-}
-
-export function normalizeMcuAction(value: unknown): McuEnvAction {
-  const source = isRecord(value) ? value : {};
-  const action = defaultMcuAction();
-  for (const key of MCU_BUTTON_KEYS) {
-    action[key] = binary(source[key]);
-  }
-
-  if (action.forward && action.back) {
-    action.back = 0;
-  }
-  if (action.left && action.right) {
-    action.right = 0;
-  }
-  if (!action.forward) {
-    action.sprint = 0;
-  }
-
-  let hotbarSelected = false;
-  for (let slot = 1; slot <= 9; slot += 1) {
-    const key = `hotbar.${slot}` as McuButtonKey;
-    if (action[key] && hotbarSelected) {
-      action[key] = 0;
-    } else if (action[key]) {
-      hotbarSelected = true;
-    }
-  }
-
-  const camera = Array.isArray(source.camera) ? source.camera : [];
-  action.camera = [
-    clampNumber(camera[0], -MCU_CAMERA_MAX_DEG, MCU_CAMERA_MAX_DEG),
-    clampNumber(camera[1], -MCU_CAMERA_MAX_DEG, MCU_CAMERA_MAX_DEG),
-  ];
-  return action;
-}
-
 export function parseMcuActionText(text: string): (McuPolicyDecision & { task_done?: boolean }) | undefined {
   for (const candidate of jsonCandidates(text)) {
     try {
@@ -305,10 +252,6 @@ export function toCompactMcuAgentActionPayload(action: McuEnvAction): McuCompact
     buttons: [buttonsIndex],
     camera: [cameraIndex],
   };
-}
-
-export function shouldUseModelOnStep(step: number, modelEveryNSteps: number): boolean {
-  return step <= 0 || step % Math.max(1, modelEveryNSteps) === 0;
 }
 
 function taskKind(taskText: string): string {
@@ -419,85 +362,6 @@ export function taskSpecificGuidance(taskText: string): string {
     default:
       return "";
   }
-}
-
-function isMiningLikeTask(taskText: string): boolean {
-  return /mine|mining|dig|stone|cobble|diamond|iron|coal|ore|obsidian|dirt|wood|log|tree|grass|挖|礦|石|木|樹|草/.test(
-    taskText.toLowerCase(),
-  );
-}
-
-function isWoolTask(taskText: string): boolean {
-  return /wool|shear|sheep|羊毛|剪羊|綿羊/.test(taskText.toLowerCase());
-}
-
-function isBuildingLikeTask(taskText: string): boolean {
-  return /build|place|house|hut|tower|bridge|造|建|放置/.test(taskText.toLowerCase());
-}
-
-function hasPhysicalIntent(action: McuEnvAction): boolean {
-  return (
-    MCU_BUTTON_KEYS.some((key) => action[key] === 1) ||
-    Math.abs(action.camera[0]) >= 0.1 ||
-    Math.abs(action.camera[1]) >= 0.1
-  );
-}
-
-function isCraftingLikeTask(taskText: string): boolean {
-  return /craft|recipe|smelt|brew|enchant|furnace|crafting[_ ]?table|enchanting[_ ]?table|inventory|物品欄|合成|熔煉|釀造|附魔/i.test(
-    taskText.toLowerCase(),
-  );
-}
-
-function isDropLikeTask(taskText: string): boolean {
-  return /\bdrop\b|throw|丟|扔|拋/i.test(taskText.toLowerCase());
-}
-
-export function repairDecisionForTask(decision: McuPolicyDecision, taskText: string, step: number): McuPolicyDecision {
-  const action = normalizeMcuAction(decision.action);
-
-  const woolTask = isWoolTask(taskText);
-  const miningLikeTask = isMiningLikeTask(taskText);
-  const buildingLikeTask = isBuildingLikeTask(taskText);
-  const craftingLikeTask = isCraftingLikeTask(taskText);
-  const dropLikeTask = isDropLikeTask(taskText);
-
-  if (!craftingLikeTask) {
-    action.inventory = 0;
-  }
-  if (!dropLikeTask) {
-    action.drop = 0;
-  }
-
-  if (woolTask && action.attack && !action.use) {
-    action.attack = 0;
-    action.use = 1;
-  }
-
-  if (miningLikeTask && !woolTask && !buildingLikeTask && !craftingLikeTask && action.use && !action.attack) {
-    action.use = 0;
-    action.attack = 1;
-  }
-
-  if (!hasPhysicalIntent(action)) {
-    action.forward = miningLikeTask || woolTask ? 1 : 0;
-    action.sprint = 0;
-    action.camera = [0, step % 32 < 16 ? 8 : -8];
-  }
-
-  let holdSteps = decision.hold_steps;
-  if (!holdSteps || holdSteps < 1) {
-    holdSteps = action.attack ? 6 : action.use ? 2 : 3;
-  }
-  if (action.attack && /obsidian/.test(taskText.toLowerCase())) {
-    holdSteps = Math.max(holdSteps, 10);
-  }
-
-  return {
-    ...ACTION_PAYLOAD_PREFIX,
-    hold_steps: holdSteps,
-    action,
-  };
 }
 
 function compactRecentActions(actions: McuEnvAction[]): string {
@@ -768,7 +632,12 @@ export class McuVisualPolicy {
       return { ...ACTION_PAYLOAD_PREFIX, action: defaultMcuAction(), hold_steps: this.config.agentbeats.maxHoldSteps };
     }
     if (closedLoopResult.kind === "subgoal_failed") {
-      // Treat a hard failure the same as earlyStop for backward compat.
+      // Transition behavior: closed-loop fallback_manual now escalates to the
+      // planner via subgoal_failed. The planner will reflect on the failure on
+      // its next turn (Task 3.5). Until that wiring exists, the wrapper emits
+      // a noop hold so the episode advances to the next observation, where the
+      // planner-first dispatcher (Task 6) will pick up the BLOCKED escalation.
+      // Do NOT set state.earlyStop here — completion ownership belongs to the planner.
       return { ...ACTION_PAYLOAD_PREFIX, action: defaultMcuAction(), hold_steps: this.config.agentbeats.maxHoldSteps };
     }
     // kind === "act"
