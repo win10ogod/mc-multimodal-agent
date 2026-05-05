@@ -201,6 +201,24 @@ export async function runClosedLoopStep(
       // to Planner + Action so they see "this slot has something in it"
       // even when we haven't OCR'd the item name yet.
       cp.occupiedSlotIndices = slotSigs.map((s) => s.index);
+      // Debug: dump the raw obs once per iteration so the resolver's
+      // input can be inspected offline. Marked frames are dumped by
+      // the Planner/Action call sites; this path captures the
+      // unmarked frame the resolver actually consumes.
+      const debugDir = process.env.AGENTBEATS_DEBUG_DIR;
+      if (debugDir) {
+        try {
+          // eslint-disable-next-line @typescript-eslint/no-require-imports
+          const fs = require("node:fs") as typeof import("node:fs");
+          // eslint-disable-next-line @typescript-eslint/no-require-imports
+          const pathMod = require("node:path") as typeof import("node:path");
+          const m = payload.obs.match(/^data:image\/([a-z]+);base64,(.+)$/);
+          const ext = m ? m[1] : "jpg";
+          const raw = m ? m[2] : payload.obs;
+          const seq = String(cp.iteration).padStart(5, "0");
+          fs.writeFileSync(pathMod.join(debugDir, `resolver_${seq}_raw.${ext}`), Buffer.from(raw, "base64"));
+        } catch { /* swallow */ }
+      }
       // Match each tracked item by Hamming distance on dHash. The hash
       // captures pixel layout — many MC items share a grey/brown
       // palette but differ in texture; Hamming distance separates them

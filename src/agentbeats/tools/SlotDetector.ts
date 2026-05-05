@@ -942,17 +942,31 @@ function annotateWithLayout(
   // Confidence: at least 50% of layout slots accounted for.
   if (matched.length < layout.slots.length * 0.5) return null;
 
-  // 2. Lock every layout slot to its LAYOUT-PREDICTED center, full
-  //    slot-side bbox. The CV-discovered centroid shifts when an item
-  //    occupies the slot (the icon's bbox pulls the centroid 2-5 px),
-  //    which puts the patch sample near the slot's shadow edge instead
-  //    of the icon body and drops chroma to baseline. Using the
-  //    template position guarantees consistent slot centers across
-  //    empty/filled states — fingerprinting becomes deterministic and
-  //    items in slots no longer read as empty-tinted background.
+  // 2. Backfill layout slots that no discovered component matched. This
+  //    covers slots with items in them (icon darkens slot interior past
+  //    our threshold) -- we still have the layout's pixel center.
   const out: GuiSlot[] = [];
+  // Discovered + matched slots: keep CV centroid (anchored to actual
+  // rendered slot pixels — more accurate than the template's predicted
+  // position when window detection is even slightly off). Force the
+  // bbox to FULL slot side so the SoM mark covers the whole slot
+  // regardless of how much of the interior the connected component
+  // managed to capture (item icons occlude most of the dark-grey
+  // interior, shrinking the cv bbox).
   const slotPx = Math.max(8, Math.round(disc.slotPx));
+  for (const m of matched) {
+    out.push({
+      index: 0,
+      cx: m.disc.cx,
+      cy: m.disc.cy,
+      w: slotPx,
+      h: slotPx,
+      name: layoutScreen[m.layoutIdx].name,
+      role: layoutScreen[m.layoutIdx].role,
+    });
+  }
   for (let i = 0; i < layoutScreen.length; i += 1) {
+    if (matchedLayout.has(i)) continue;
     const ls = layoutScreen[i];
     out.push({
       index: 0,
@@ -963,6 +977,11 @@ function annotateWithLayout(
       name: ls.name,
       role: ls.role,
     });
+  }
+  // Unmatched discovered components (probably spurious or modded extras):
+  // keep them anonymous so the agent can still see them.
+  for (const u of unmatched) {
+    out.push({ index: 0, cx: u.cx, cy: u.cy, w: slotPx, h: slotPx });
   }
   // Unmatched discovered components (probably spurious or modded extras):
   // keep them anonymous so the agent can still see them.
