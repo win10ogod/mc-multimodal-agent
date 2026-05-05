@@ -578,7 +578,15 @@ export async function runClosedLoopStep(
               // the item moved. The matched-click verify is the CV
               // evidence; the source memory entry is the identity.
               const fromMem = plan.slotMemory.lookup(fromSlot.cx, fromSlot.cy);
-              const placedItemName = fromMem?.item;
+              // If the source is the recipe result slot, the recipe defines
+              // what's being taken — even though no OCR ever ran on the
+              // result slot. This lets the take destination get a correct
+              // slotMemory write on matched verify, which in turn makes
+              // Known show the target item and lets the next probe judge
+              // the task complete instead of looping take->take forever.
+              const placedItemName =
+                fromMem?.item
+                ?? (fromSlot.role === "result" && plan.recipeOverride ? plan.recipeOverride.target : undefined);
               const mkClick = (s: { index: number; name?: string; role?: string; cx: number; cy: number }, button: "attack" | "use", expectAfter: "should_empty" | "should_fill", actionKind: "pickup" | "place_one" | "place_all" | "take", kind: "click" | "auto_return", placedItemName?: string): import("../tools/UiFastControl").PendingClick => ({
                 rasterIndex: s.index, slotName: s.name, slotRole: s.role,
                 frozenTarget: { x: s.cx, y: s.cy },
