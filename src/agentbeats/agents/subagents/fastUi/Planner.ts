@@ -59,15 +59,12 @@ const SCHEMA = {
                   "place_in_craft_grid",
                   "take_result",
                   "wait_for_output",
-                  "click_ui",
                   "verify_state",
                 ],
               },
               items: { type: "array", items: { type: "string" } },
               item: { type: "string" },
               expectedItem: { type: "string" },
-              uiName: { type: "string" },
-              slotIndex: { type: "integer" },
               condition: { type: "string" },
             },
           },
@@ -84,10 +81,9 @@ Subtask kinds (no numbers, no slot indices):
 - place_in_craft_grid { item }
 - take_result { expectedItem }
 - wait_for_output { expectedItem }
-- click_ui { slotIndex?, uiName? } — click ANY clickable UI element. Prefer slotIndex when you can read the slot's SoM badge directly from the frame (exact, unambiguous — both you and the Action see the same numbered badges). Use uiName when you mean a role-tagged anchor like "recipe_book_button" or a visually-named element like "<item>_recipe". Both fields together is fine; Action prefers slotIndex.
 - verify_state { condition }
 
-On the FIRST call for a crafting task: PREFER opening the recipe book to auto-fill the grid. Plan: click_ui { uiName: "recipe_book_button" } → click_ui { uiName: "<targetItem>_recipe" } → take_result { expectedItem }. The layout/perception is REFRESHED before every Planner call so newly-revealed panel slots become available. Fall back to manual placement (one place_in_craft_grid per ingredient + take_result) ONLY if a previous recipe-book click failed (BLOCKED or attempts exhausted).
+On the FIRST call for a crafting task: emit one place_in_craft_grid per ingredient unit (one slot is one item) → take_result { expectedItem }. Use verify_items_visible first only if known_items doesn't already cover the recipe ingredients.
 
 On post_action calls: VERIFY the Action's last report against the actual frame + known_items before ticking done. Action sometimes falsely reports success — never trust its OK at face value. Confirm visually that the expected effect occurred. If the report says success but the frame disagrees, leave the item undone. Preserve item ids and order. Keep activeIdx for one more attempt only if observation shows partial progress; otherwise advance / replace / mark done. Never return same activeIdx with attempts >= 3 unchanged.
 

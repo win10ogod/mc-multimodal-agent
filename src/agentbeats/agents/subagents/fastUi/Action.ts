@@ -33,7 +33,7 @@ const SCHEMA = {
   required: ["action"],
   additionalProperties: true,
   properties: {
-    action: { type: "string", enum: ["move", "put", "click", "verify_slots", "wait", "done", "fallback_manual"] },
+    action: { type: "string", enum: ["move", "put", "verify_slots", "wait", "done", "fallback_manual"] },
   },
 } as const;
 
@@ -44,13 +44,6 @@ Subtask → action mapping:
 - place_in_craft_grid { item }: (1) pick a craft cell (role starts "craft_2x2_" or "craft_3x3_") matching this item's recipe position. (2) Find the source slot for this item in known_slots. If item is NOT in known_slots, emit verify_slots on up to 3 hotbar/main_inv slots that VISUALLY look like the item — do NOT guess source indices. Once known_slots contains the item, emit move from=source to=craftCell count="one".
 - take_result { expectedItem }: from = slot with role==="result"; to = free slot in known_slots; emit move count="all".
 - wait_for_output { expectedItem }: emit wait with holdSteps proportional to expected sim ticks (cap 60).
-- click_ui { slotIndex?, uiName? }: emit { "action": "click", "slot": <resolvedIdx> }. Resolution order — TRY HARD before giving up:
-  1. If slotIndex is present, click that exact index.
-  2. Else if uiName matches a layout_slots[i].role exactly (e.g. "recipe_book_button"), click that slot.
-  3. For uiName ending "_recipe" (e.g. "diorite_recipe"): the recipe-book panel is open and the entry shows the recipe target's item icon. Read the YELLOW BADGES on the frame, find the panel slot whose icon visually matches the named item (compare with how the same item looks in known_slots / hotbar), and click it.
-  4. If you SEE candidate panel cells but cannot pick top-1 with confidence, emit verify_slots on up to 3 of those cells — the next iteration will have OCR'd names and you can resolve cleanly.
-  5. ONLY emit fallback_manual when NO candidate cells exist on the frame at all.
-  Never give up on step 3/4 just because you're uncertain — verify_slots IS the resolution tool.
 - verify_state { condition }: if condition holds in frame+known, emit done; else fallback_manual.
 
 Rules:
@@ -60,7 +53,6 @@ Rules:
 
 Output strict JSON, one action only:
   { "action": "move", "from": A, "to": B, "count": "one"|"all" }
-  { "action": "click", "slot": N }
   { "action": "verify_slots", "slots": [N,...] }
   { "action": "wait", "holdSteps": N }
   { "action": "done" }

@@ -200,13 +200,6 @@ export type CraftAction =
    *  duration). Runtime emits defaultMcuAction with `holdSteps`
    *  bumped, then re-probes. */
   | { action: "wait"; holdSteps: number; reason?: string }
-  /** Single button-click on a UI slot. Used for clickable elements
-   *  whose own pixels do not change after clicking (recipe-book
-   *  toggle, recipe entries, anvil rename, trade buttons). The
-   *  runtime emits ONE click and skips IBVS pixel verification —
-   *  the side effect (panel opens, grid auto-fills) is observed by
-   *  the next planner re-perception, not by patch fingerprint. */
-  | { action: "click"; slot: number; reason?: string }
   | { action: "done"; reason?: string }
   | { action: "fallback_manual"; reason?: string }
   // Low-level operations kept for backwards compatibility / fine-grained

@@ -23,12 +23,6 @@ export type Subtask =
   | { kind: "take_result"; expectedItem: string }
   /** Wait for async output (smelting/brewing) to appear. */
   | { kind: "wait_for_output"; expectedItem: string }
-  /** Click any UI element. Provide EITHER slotIndex (from the SoM
-   *  badges in the shared perception — exact and unambiguous) OR
-   *  uiName (role-tagged or visual match). Slot and button are
-   *  the same thing in the FastUI subagent: any clickable region is
-   *  just a slot index in the live layout. */
-  | { kind: "click_ui"; slotIndex?: number; uiName?: string }
   /** Confirm-only step. Action emits done if condition holds in
    *  Known + frame. */
   | { kind: "verify_state"; condition: string };
