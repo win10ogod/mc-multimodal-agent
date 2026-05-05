@@ -44,7 +44,7 @@ export async function dispatchObservation(
     const out = await planGoals({ client: deps.client, model: deps.plannerModel }, state.taskText, state.completedSummaries);
     if (out.overall_done) { state.earlyStop = true; return NOOP_DONE; }
     state.subgoals = out.subgoals;
-    state.singleTask = out.subgoals.length === 1;
+    // singleTask dropped in planner-first refactor — every task goes through planner loop
   }
 
   const current = state.subgoals[state.idx];
@@ -83,7 +83,6 @@ export async function dispatchObservation(
     state.history.push(`done: ${current.description} -> ${step.summary}`);
     state.idx += 1;
     if (state.idx >= state.subgoals.length) {
-      if (state.singleTask) { state.earlyStop = true; return NOOP_DONE; }
       const out = await planGoals({ client: deps.client, model: deps.plannerModel }, state.taskText, state.completedSummaries);
       if (out.overall_done || out.subgoals.length === 0) { state.earlyStop = true; return NOOP_DONE; }
       state.subgoals = out.subgoals;
@@ -94,7 +93,6 @@ export async function dispatchObservation(
 
   // subgoal_failed
   state.history.push(`failed: ${current.description} -> ${step.reason}`);
-  if (state.singleTask) { state.earlyStop = true; return NOOP_DONE; }
   const out = await planGoals({ client: deps.client, model: deps.plannerModel }, state.taskText, [...state.completedSummaries, `FAILED: ${step.reason}`]);
   if (out.overall_done || out.subgoals.length === 0) { state.earlyStop = true; return NOOP_DONE; }
   state.subgoals = out.subgoals;

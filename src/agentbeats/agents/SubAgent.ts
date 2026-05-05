@@ -40,11 +40,16 @@ export type EpisodeState = {
   subgoals: Subgoal[];
   idx: number;
   completedSummaries: string[];
-  singleTask: boolean;
   earlyStop: boolean;
   uiState: ClosedLoopCraftPlan | null;
   history: string[];
   iteration: number;
+  plannerMessages: Array<{
+    role: "system" | "user" | "assistant" | "tool";
+    content: string;
+    tool_call_id?: string;
+    tool_calls?: any[];
+  }>;
 };
 
 export function makeEpisodeState(taskText: string): EpisodeState {
@@ -53,10 +58,10 @@ export function makeEpisodeState(taskText: string): EpisodeState {
     subgoals: [],
     idx: 0,
     completedSummaries: [],
-    singleTask: false,
     earlyStop: false,
     uiState: null,
     history: [],
     iteration: 0,
+    plannerMessages: [],
   };
 }

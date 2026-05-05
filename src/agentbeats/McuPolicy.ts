@@ -561,13 +561,12 @@ export class McuVisualPolicy {
           return { ...ACTION_PAYLOAD_PREFIX, action: defaultMcuAction(), hold_steps: this.config.agentbeats.maxHoldSteps };
         }
         episode.subgoals = out.subgoals;
-        episode.singleTask = out.subgoals.length === 1;
+        // singleTask dropped in planner-first refactor
       }
 
       const currentSubgoal = episode.subgoals[episode.idx];
-      // Single-task ui_inventory bypass: fall through to existing closed-loop body unchanged.
-      // Multi-subgoal first-step that is NOT ui_inventory: route through dispatcher with stub world sub-agents.
-      if (!episode.singleTask && currentSubgoal && currentSubgoal.kind !== "ui_inventory") {
+      // Route non-ui_inventory subgoals through dispatcher with stub world sub-agents.
+      if (currentSubgoal && currentSubgoal.kind !== "ui_inventory") {
         const worldDeps = { client: this.client, model: this.config.openai.model };
         const subagents: Record<SubAgentKind, SubAgent> = {
           ui_inventory: { kind: "ui_inventory", systemPrompt: "", step: async () => ({ kind: "subgoal_failed", reason: "ui_inventory bridge not yet wired" }) },

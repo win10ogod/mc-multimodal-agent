@@ -477,7 +477,7 @@ export async function runClosedLoopStep(
                 if (!out.overall_done && out.subgoals.length > 0) {
                   ep.subgoals = out.subgoals;
                   ep.idx = 0;
-                  ep.singleTask = false;  // multi-step now
+                  // singleTask dropped in planner-first refactor
                   console.log(`[agentbeats] GoalPlanner re-plan after fallback_manual: ${out.subgoals.length} subgoals -> ${out.subgoals.map((s) => `${s.kind}:${s.description}`).join(" | ")}`);
                 } else {
                   console.warn(`[agentbeats] GoalPlanner re-plan returned empty/overall_done=true; giving up`);
