@@ -1496,14 +1496,19 @@ export class McuVisualPolicy {
               }
               pc.prePatch = samplePatchFingerprint(payload.obs, slotCenter.cx, slotCenter.cy) ?? undefined;
               // Pre-condition for "should_empty" actions (pickup/take):
-              // source slot MUST currently have an item (pre.stddev
-              // high). If it looks already empty, the click would do
-              // nothing -- abort and reprobe so the VLM picks a slot
-              // that actually has the ingredient.
+              // source slot MUST currently have an item. Use the same
+              // stricter fingerprint -- low stddev AND mean in the
+              // empty band (~120-160). A bright item (e.g. nether
+              // quartz, mean ~190) has low stddev but is NOT empty.
+              const preLum = pc.prePatch
+                ? (pc.prePatch.meanR + pc.prePatch.meanG + pc.prePatch.meanB) / 3
+                : 0;
+              const preInEmptyBand = preLum > 120 && preLum < 160;
               if (pc.expectAfter === "should_empty"
                   && pc.prePatch
-                  && pc.prePatch.stddev < 25) {
-                console.warn(`[agentbeats] pickup/take aborted: slot=${pc.rasterIndex}(${pc.slotName ?? "?"}) looks already empty (pre.stddev=${pc.prePatch.stddev.toFixed(1)})`);
+                  && pc.prePatch.stddev < 25
+                  && preInEmptyBand) {
+                console.warn(`[agentbeats] pickup/take aborted: slot=${pc.rasterIndex}(${pc.slotName ?? "?"}) looks already empty (pre.stddev=${pc.prePatch.stddev.toFixed(1)} lum=${preLum.toFixed(0)})`);
                 state.closedLoopHistory.unshift(`abort ${pc.kind ?? "click"} slot=${pc.rasterIndex} (source slot empty; nothing to grab)`);
                 state.closedLoopHistory = state.closedLoopHistory.slice(0, 5);
                 plan.pendingClick = null;
@@ -1567,8 +1572,31 @@ export class McuVisualPolicy {
               plan.pendingClick = null;
               return { ...ACTION_PAYLOAD_PREFIX, action: defaultMcuAction(), hold_steps: 1 };
             }
-            const isEmpty = post.stddev < 25;
-            const isFilled = post.stddev > 35;
+            // Empty/filled determination using a stricter fingerprint:
+            //   - Empty slot has mid-gray RGB mean (band ~120-160)
+            //     AND low stddev (uniform). A pale item like nether
+            //     quartz has stddev close to empty BUT its mean is
+            //     much brighter (~190+) so the brightness check
+            //     keeps it from being misclassified as empty.
+            //   - Filled = high stddev OR mean outside the empty
+            //     band (very bright OR very dark).
+            //   - Cross-check against pre-click patch: a meaningful
+            //     RGB-mean shift (>20) in the expected direction
+            //     also confirms the transition.
+            const lum = (post.meanR + post.meanG + post.meanB) / 3;
+            const inEmptyBand = lum > 120 && lum < 160;
+            const meanShift = pc.prePatch
+              ? Math.sqrt(
+                  (post.meanR - pc.prePatch.meanR) ** 2
+                  + (post.meanG - pc.prePatch.meanG) ** 2
+                  + (post.meanB - pc.prePatch.meanB) ** 2,
+                )
+              : 0;
+            const isEmpty = (post.stddev < 25 && inEmptyBand)
+              || (pc.expectAfter === "should_empty" && meanShift > 20);
+            const isFilled = post.stddev > 35
+              || !inEmptyBand
+              || (pc.expectAfter === "should_fill" && meanShift > 20);
             const matched = pc.expectAfter === "should_empty" ? isEmpty : isFilled;
             // A successful click mutated the slot's contents — the slot
             // memory entry (if any) for this absolute pos is now stale.
