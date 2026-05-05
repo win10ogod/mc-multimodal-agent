@@ -6,6 +6,7 @@ import type { RecipeInfo } from "../../../tools/UiFastControl";
 export type ActionDeps = {
   client: OpenAI;
   model: string;
+  recordDebug?: (kind: string, payload: unknown) => Promise<void> | void;
 };
 
 export type ActionInput = {
@@ -58,6 +59,8 @@ Output strict JSON, one action only:
   { "action": "done" }
   { "action": "fallback_manual", "reason": "..." }`;
 
+let ACTION_CALL_SEQ = 0;
+
 export async function runAction(deps: ActionDeps, input: ActionInput): Promise<CraftAction> {
   const userPayload = {
     subtask: input.subtask,
@@ -72,6 +75,24 @@ export async function runAction(deps: ActionDeps, input: ActionInput): Promise<C
       : null,
     cursor_holding: input.cursorHolding,
   };
+
+  const seq = String(++ACTION_CALL_SEQ).padStart(5, "0");
+  const debugDir = process.env.AGENTBEATS_DEBUG_DIR;
+  if (debugDir) {
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      const fs = require("node:fs") as typeof import("node:fs");
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      const pathMod = require("node:path") as typeof import("node:path");
+      const promptText = `[fastui-action ${seq}]\nSYSTEM:\n${SYS}\n\nUSER (JSON):\n${JSON.stringify(userPayload, null, 2)}\n`;
+      fs.writeFileSync(pathMod.join(debugDir, `fastui_action_${seq}_prompt.txt`), promptText);
+      if (input.obsBase64) {
+        fs.writeFileSync(pathMod.join(debugDir, `fastui_action_${seq}_input.jpg`), Buffer.from(input.obsBase64, "base64"));
+      }
+    } catch (e) {
+      console.warn(`[fastui-action ${seq}] debug dump failed: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  }
   const dataUrl = input.obsBase64.startsWith("data:image/")
     ? input.obsBase64
     : `data:image/jpeg;base64,${input.obsBase64}`;
@@ -106,5 +127,10 @@ export async function runAction(deps: ActionDeps, input: ActionInput): Promise<C
     return { action: "fallback_manual", reason: "action LLM returned unparseable JSON" } as CraftAction;
   }
   console.log(`[fastui-action] subtask=${input.subtask.kind} -> ${parsed.action}${parsed.from!==undefined?` from=${parsed.from}`:""}${parsed.to!==undefined?` to=${parsed.to}`:""}`);
+  try {
+    await deps.recordDebug?.("fastui_action_call", {
+      seq, subtask: input.subtask, output: parsed,
+    });
+  } catch { /* swallow */ }
   return parsed as CraftAction;
 }

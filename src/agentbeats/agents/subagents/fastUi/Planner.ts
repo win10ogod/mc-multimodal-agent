@@ -5,6 +5,7 @@ import type { RecipeInfo } from "../../../tools/UiFastControl";
 export type PlannerDeps = {
   client: OpenAI;
   model: string;
+  recordDebug?: (kind: string, payload: unknown) => Promise<void> | void;
 };
 
 export type PlannerInput = {
@@ -87,11 +88,13 @@ Subtask kinds (no numbers, no slot indices):
 
 On the FIRST call: emit the shortest plan. For crafting, that's typically (skip verify if known_items already shows ingredients) → one place_in_craft_grid per ingredient unit → one take_result.
 
-On post_action calls: VERIFY the Action's last report against the actual frame + known_items before ticking done. Action sometimes falsely reports success (CV mismatch, click landed on wrong slot, etc.) — never trust its OK at face value. Confirm visually that the expected effect occurred. If the report says success but the frame disagrees, leave the item undone and decide whether to retry or replace it. Preserve item ids and order. Keep activeIdx for one more attempt only if observation shows partial progress; otherwise advance / replace / mark done. Never return same activeIdx with attempts >= 3 unchanged.
+On post_action calls: VERIFY the Action's last report against the actual frame + known_items before ticking done. Action sometimes falsely reports success — never trust its OK at face value. Confirm visually that the expected effect occurred. If the report says success but the frame disagrees, leave the item undone. Preserve item ids and order. Keep activeIdx for one more attempt only if observation shows partial progress; otherwise advance / replace / mark done. Never return same activeIdx with attempts >= 3 unchanged.
 
 Output strict JSON:
   { "all_done": bool, "next_idx": int (-1 if all_done), "checklist": [...] }
 Each item: { id, text, task, done, attempts }. PRESERVE attempts.`;
+
+let PLANNER_CALL_SEQ = 0;
 
 export async function runPlanner(deps: PlannerDeps, input: PlannerInput): Promise<PlanResult> {
   const userPayload = {
@@ -109,6 +112,24 @@ export async function runPlanner(deps: PlannerDeps, input: PlannerInput): Promis
     trigger: input.trigger,
     recent_history: input.recentHistory,
   };
+
+  const seq = String(++PLANNER_CALL_SEQ).padStart(5, "0");
+  const debugDir = process.env.AGENTBEATS_DEBUG_DIR;
+  if (debugDir) {
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      const fs = require("node:fs") as typeof import("node:fs");
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      const pathMod = require("node:path") as typeof import("node:path");
+      const promptText = `[fastui-planner ${seq}]\nSYSTEM:\n${SYS}\n\nUSER (JSON):\n${JSON.stringify(userPayload, null, 2)}\n`;
+      fs.writeFileSync(pathMod.join(debugDir, `fastui_planner_${seq}_prompt.txt`), promptText);
+      if (input.obsBase64) {
+        fs.writeFileSync(pathMod.join(debugDir, `fastui_planner_${seq}_input.jpg`), Buffer.from(input.obsBase64, "base64"));
+      }
+    } catch (e) {
+      console.warn(`[fastui-planner ${seq}] debug dump failed: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  }
   const dataUrl = input.obsBase64.startsWith("data:image/")
     ? input.obsBase64
     : `data:image/jpeg;base64,${input.obsBase64}`;
@@ -146,6 +167,13 @@ export async function runPlanner(deps: PlannerDeps, input: PlannerInput): Promis
     return { kind: "continue", checklist: input.currentChecklist, nextIdx: input.currentChecklist.findIndex((c) => !c.done) };
   }
   console.log(`[fastui-planner] trigger=${input.trigger} all_done=${parsed.all_done} next_idx=${parsed.next_idx} checklist=[${parsed.checklist.map((c) => `${c.done ? "x" : " "}${c.id} task.kind=${(c.task as any)?.kind ?? "MISSING"}`).join(", ")}]`);
+  try {
+    await deps.recordDebug?.("fastui_planner_call", {
+      seq, trigger: input.trigger,
+      input: userPayload,
+      output: { all_done: parsed.all_done, next_idx: parsed.next_idx, checklist: parsed.checklist },
+    });
+  } catch { /* swallow */ }
   if (parsed.all_done) return { kind: "all_done", checklist: parsed.checklist };
   return { kind: "continue", checklist: parsed.checklist, nextIdx: parsed.next_idx };
 }

@@ -107,7 +107,7 @@ export async function runClosedLoopStep(
       const knownItemsForPlanner = Array.from(new Set(cp.slotMemory.snapshot().map((e) => e.item).filter(i => i && i !== "empty")));
       const cursorHoldingItem = cp.cursorItemSignature ? "(unknown item)" : null;
       const { runPlanner } = await import("./subagents/fastUi/Planner");
-      const rj = await runPlanner({ client: deps.client, model: deps.model }, {
+      const rj = await runPlanner({ client: deps.client, model: deps.model, recordDebug: deps.recordDebug }, {
         taskText: state.taskText,
         recipeInfo: cp.recipeOverride,
         knownItems: knownItemsForPlanner,
@@ -494,7 +494,7 @@ export async function runClosedLoopStep(
             const cursorHoldingItem = plan.cursorItemSignature ? "(unknown item)" : null;
             const activeItem = plan.checklist[plan.activeChecklistIdx];
             activeItem.attempts = (activeItem.attempts ?? 0) + 1;
-            probed = await runAction({ client: deps.client, model: deps.model }, {
+            probed = await runAction({ client: deps.client, model: deps.model, recordDebug: deps.recordDebug }, {
               subtask: activeItem.task,
               knownSlots: knownForAction,
               layoutSlots: layoutForAction,
@@ -605,7 +605,7 @@ export async function runClosedLoopStep(
                 const knownItemsForPlanner = Array.from(new Set(plan.slotMemory.snapshot().map((e) => e.item).filter(i => i && i !== "empty")));
                 const cursorHoldingItem = plan.cursorItemSignature ? "(unknown item)" : null;
                 const { runPlanner } = await import("./subagents/fastUi/Planner");
-                const r0 = await runPlanner({ client: deps.client, model: deps.model }, {
+                const r0 = await runPlanner({ client: deps.client, model: deps.model, recordDebug: deps.recordDebug }, {
                   taskText: state.taskText,
                   recipeInfo: r,
                   knownItems: knownItemsForPlanner,
@@ -620,6 +620,12 @@ export async function runClosedLoopStep(
               } catch (e) {
                 console.warn(`[fastui-planner] initial seed failed: ${e instanceof Error ? e.message : String(e)}`);
               }
+              // Return a noop frame so the inventory stays open and the
+              // next observation enters with the freshly seeded checklist.
+              // Without this the body falls through to the VLM model
+              // decision path which would press 'inventory' (closing the
+              // GUI) and ruin the session.
+              return { kind: "act", action: defaultMcuAction(), holdSteps: 1 };
             } else {
               state.closedLoopHistory.unshift(`recipe_lookup '${probed.item}' -> NOT FOUND in minecraft-data`);
               state.closedLoopHistory = state.closedLoopHistory.slice(0, 5);
