@@ -998,15 +998,14 @@ export class McuVisualPolicy {
             plan.slotMemory.pruneStale(plan.iteration);
             const knownSlots: Array<{ index: number; name?: string; item: string; ageIters: number }> = [];
             // CV item tracking from the CURRENT PROBE FRAME (cursor is
-            // parked here, no hover highlight on slot icons). For each
-            // slot in memory:
-            //   1. Sample its current natural fingerprint.
-            //   2. If memory has no fingerprint yet, this is the
-            //      baseline -- store it.
-            //   3. If memory already has a fingerprint, compare. A
-            //      significant drift toward empty (low stddev,
-            //      different mean) means the item left.
+            // parked here, no hover highlight). Pass A: for each slot
+            // in memory, lazily capture its natural fingerprint OR
+            // detect it just emptied (item disappeared). Pass B: for
+            // each disappeared item, scan all currently-occupied slots
+            // not in memory to find where the item moved -- match by
+            // RGB-mean distance to the disappeared item's fingerprint.
             const disappearedItems: string[] = [];
+            const disappearedFps: Array<{ item: string; fp: { meanR: number; meanG: number; meanB: number; stddev: number } }> = [];
             for (const s of layoutForProbe.slots) {
               const mem = plan.slotMemory.lookup(s.cx, s.cy);
               if (!mem || mem.item === "empty" || mem.item === "unknown") continue;
@@ -1030,11 +1029,42 @@ export class McuVisualPolicy {
               const liveLooksEmpty = live.stddev < 20 && liveLum > 120 && liveLum < 160;
               if (distFromBaseline > 40 && liveLooksEmpty) {
                 disappearedItems.push(mem.item);
+                disappearedFps.push({ item: mem.item, fp: mem.fingerprint });
                 plan.slotMemory.invalidate(s.cx, s.cy);
                 console.log(`[agentbeats] item disappeared: '${mem.item}' was at slot ${s.index}(${s.name ?? "?"}) -- dist=${distFromBaseline.toFixed(1)} liveLum=${liveLum.toFixed(1)} live.stddev=${live.stddev.toFixed(1)}`);
                 continue;
               }
               knownSlots.push({ index: s.index, name: s.name, item: mem.item, ageIters: plan.iteration - mem.step });
+            }
+            // Pass B: appeared-item match. For each disappeared item,
+            // scan all currently-non-empty slots whose memory is
+            // empty; if a slot's fingerprint matches the disappeared
+            // item's stored fingerprint, the item moved there. Record
+            // memory at that slot so the agent sees the placement.
+            for (const { item, fp } of disappearedFps) {
+              let bestSlot: typeof layoutForProbe.slots[0] | null = null;
+              let bestDist = Infinity;
+              for (const s of layoutForProbe.slots) {
+                if (plan.slotMemory.lookup(s.cx, s.cy)) continue; // already known
+                const live = samplePatchFingerprint(payload.obs, s.cx, s.cy, 6);
+                if (!live) continue;
+                const lum = (live.meanR + live.meanG + live.meanB) / 3;
+                const looksEmpty = live.stddev < 20 && lum > 120 && lum < 160;
+                if (looksEmpty) continue;
+                const dr = live.meanR - fp.meanR;
+                const dg = live.meanG - fp.meanG;
+                const db = live.meanB - fp.meanB;
+                const dist = Math.sqrt(dr * dr + dg * dg + db * db);
+                if (dist < bestDist) { bestDist = dist; bestSlot = s; }
+              }
+              if (bestSlot && bestDist < 30) {
+                const live = samplePatchFingerprint(payload.obs, bestSlot.cx, bestSlot.cy, 6) ?? undefined;
+                plan.slotMemory.record(bestSlot.cx, bestSlot.cy, item, plan.iteration, live);
+                knownSlots.push({ index: bestSlot.index, name: bestSlot.name, item, ageIters: 0 });
+                console.log(`[agentbeats] item appeared: '${item}' is now at slot ${bestSlot.index}(${bestSlot.name ?? "?"}) -- dist=${bestDist.toFixed(1)}`);
+              } else {
+                console.log(`[agentbeats] item '${item}' disappeared but no matching slot found (best dist=${bestDist.toFixed(1)}); likely on cursor`);
+              }
             }
             const result = await probeNextCraftAction({
               client: this.client,
