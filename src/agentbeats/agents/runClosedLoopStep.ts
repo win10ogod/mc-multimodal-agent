@@ -9,6 +9,7 @@ import {
 import {
   servoCursorStep,
   lookupRecipe,
+  makeServoIntegrator,
 } from "../tools/UiFastControl";
 import { probeNextCraftAction, vlmVerifySlotState } from "../tools/InventoryProbe";
 import { detectCursorWithExpectation, detectGuiLayout, samplePatchFingerprint } from "../tools/SlotDetector";
@@ -1122,12 +1123,19 @@ export async function runClosedLoopStep(
 
         // === Phase: servo === move cursor to slot, then click
         if (pc.phase === "servo") {
+          // Per-pendingClick delta-sigma pitch integrator. Lives on
+          // pc so it persists across frames while the servo
+          // converges; reset on a fresh click target.
+          if (!(pc as any).servoIntegrator) {
+            (pc as any).servoIntegrator = makeServoIntegrator();
+          }
           const stepResult = servoCursorStep({
             cursor,
             target: { x: slotCenter.cx, y: slotCenter.cy },
             button: pc.button,
             shift: pc.shift,
             hitThresholdPx: HIT_THRESHOLD_PX,
+            integrator: (pc as any).servoIntegrator,
           });
           plan.servoSteps += 1;
           // Hover: servo to slot, then exit WITHOUT clicking. Cursor

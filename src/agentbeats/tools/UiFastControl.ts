@@ -596,12 +596,27 @@ export type ClosedLoopCraftPlan = {
  *  transfers crafted items to inventory regardless of what cursor holds.
  *  Returns null if the cursor wasn't detected and we should noop this
  *  frame and re-observe. */
+/** Pitch integrator state — carried across servoCursorStep calls so
+ *  sub-deadzone pitch errors can accumulate and eventually fire a
+ *  deadzone-min correction. Classical delta-sigma modulation: when
+ *  |integrator| exceeds deadzone, emit a step of that magnitude and
+ *  decrement; otherwise emit 0 and let it accumulate. Result: the
+ *  cursor's average y-position converges on target even though
+ *  individual frames produce 0-or-deadzone pitch motion. */
+export type ServoIntegrator = { pitchAccumPx: number };
+export function makeServoIntegrator(): ServoIntegrator { return { pitchAccumPx: 0 }; }
+
 export function servoCursorStep(opts: {
   cursor: { x: number; y: number } | null;
   target: { x: number; y: number };
   button: "attack" | "use";
   shift?: boolean;
   hitThresholdPx?: number;
+  /** Optional integrator for delta-sigma pitch compensation. When
+   *  provided, sub-deadzone pitch errors accumulate across calls
+   *  and fire a deadzone-min correction once accumulated error
+   *  crosses the threshold. */
+  integrator?: ServoIntegrator;
 }): { action: McuEnvAction; click: boolean; reason: string } | null {
   if (!opts.cursor) return null;
   const ex = opts.target.x - opts.cursor.x;
@@ -636,26 +651,41 @@ export function servoCursorStep(opts: {
   else bin = 0.25;
   const yawClamped = Math.max(-MAX_CAM_DEG, Math.min(MAX_CAM_DEG, ex / PX_PER_CAM_YAW));
   let dy = Math.round(yawClamped / bin) * bin;
-  // Pitch handling — deadzone-aware, NOT adaptive.
+  // Pitch handling — deadzone-aware with optional delta-sigma
+  // integrator for sub-deadzone drift compensation.
+  //
   // MC's sim has a 4-deg pitch deadzone: sub-4° commands produce
-  // zero cursor motion. So the smallest effective pitch step is
-  // ±4° = ±20 px, giving y-precision of ±10 px (half the step).
-  //   - If |ey| ≤ 10 px : pitch stays 0 (cursor close enough on y).
-  //   - If |ey| > 10 px : issue a pitch command; small commands get
-  //     INFLATED to PITCH_DEADZONE_MIN so they actually produce
-  //     motion. Large errors quantize at 1-deg bins and clamp to
-  //     MAX_CAM_DEG.
-  // This restores the y-axis convergence behavior the original
-  // (pre-adaptive) servo had, while preserving the new yaw
-  // precision for x.
-  const pitchDeg = ey / PX_PER_CAM_PITCH;
+  // ZERO cursor motion. Without compensation, sub-deadzone errors
+  // (|ey| < 20 px) result in y permanently stuck at ±10 px from
+  // target.
+  //
+  // Delta-sigma modulation (control-theory standard for actuators
+  // with deadzones): accumulate the sub-deadzone error across frames
+  // in the integrator. When accumulated error crosses the deadzone,
+  // emit a deadzone-min correction and decrement. This gives the
+  // cursor an average y-position that converges to target even
+  // though every individual frame is 0-or-deadzone pitch motion.
   let dp = 0;
-  const halfDeadzonePx = (PITCH_DEADZONE_MIN / 2) * PX_PER_CAM_PITCH;
-  if (Math.abs(ey) > halfDeadzonePx) {
-    const pitchClamped = Math.max(-MAX_CAM_DEG, Math.min(MAX_CAM_DEG, pitchDeg));
+  const deadzonePx = PITCH_DEADZONE_MIN * PX_PER_CAM_PITCH;
+  if (Math.abs(ey) >= deadzonePx) {
+    // Large error — direct pitch command, quantize at 1° and inflate
+    // to deadzone-min if needed.
+    const pitchClamped = Math.max(-MAX_CAM_DEG, Math.min(MAX_CAM_DEG, ey / PX_PER_CAM_PITCH));
     dp = Math.round(pitchClamped);
     if (Math.abs(dp) < PITCH_DEADZONE_MIN) {
       dp = Math.sign(pitchClamped || 1) * PITCH_DEADZONE_MIN;
+    }
+    // Reset integrator on direct command — it's about to be
+    // satisfied by this frame's actual cursor motion.
+    if (opts.integrator) opts.integrator.pitchAccumPx = 0;
+  } else if (opts.integrator) {
+    // Sub-deadzone — accumulate the residual y-error.
+    opts.integrator.pitchAccumPx += ey;
+    if (Math.abs(opts.integrator.pitchAccumPx) >= deadzonePx) {
+      // Integrator crossed threshold — fire one deadzone-min step
+      // and decrement the integrator by what this step "deposited".
+      dp = Math.sign(opts.integrator.pitchAccumPx) * PITCH_DEADZONE_MIN;
+      opts.integrator.pitchAccumPx -= dp * PX_PER_CAM_PITCH;
     }
   }
   if (dy === 0 && dp === 0) {
