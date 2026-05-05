@@ -1102,6 +1102,30 @@ export function detectGuiLayout(
     slots = filled.map((s, i) => ({ index: i, cx: s.cx, cy: s.cy, w: s.w, h: s.h }));
   }
 
+  // Append synthetic anchors for fixed UI elements that the colour /
+  // grey-mass slot detector cannot pick up (recipe-book toggle, etc.).
+  // Template matching against pre-saved icon crops in data/ui-templates/.
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const { matchTemplate } = require("./UiTemplateMatch") as typeof import("./UiTemplateMatch");
+    const recipeBook = matchTemplate(jpegBase64, "recipe_book");
+    if (recipeBook) {
+      slots.push({
+        index: slots.length,
+        cx: recipeBook.cx,
+        cy: recipeBook.cy,
+        w: recipeBook.bbox.w,
+        h: recipeBook.bbox.h,
+        name: "recipe_book",
+        role: "recipe_book_button",
+      });
+    }
+  } catch (e) {
+    if (process.env.SLOT_DEBUG === "1") {
+      console.warn(`[slot-detector] template anchor pass failed: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  }
+
   return {
     windowX: disc.windowX,
     windowY: disc.windowY,
