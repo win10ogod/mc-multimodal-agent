@@ -1004,6 +1004,32 @@ function annotateWithLayout(
     else rows.push([s]);
   }
   for (const row of rows) row.sort((a, b) => a.cx - b.cx);
+  // Per-row outlier snap. Empty slots are well-aligned to the inventory
+  // grid; only filled slots have shrunken cv bboxes that drift cy by
+  // 2-5 px (item icon pulls the centroid). For each row, take the
+  // median bbox area as the row's "true" empty-slot size; any slot
+  // whose area is significantly smaller is filled — snap its cy to
+  // the row's median cy AND expand its w/h to the row median so
+  // downstream sampling/SoM rendering treats it identically to its
+  // empty neighbors. Don't touch slots that already match the row
+  // norm — they're empty and well-aligned.
+  for (const row of rows) {
+    if (row.length < 3) continue;
+    const ys = row.map((s) => s.cy).sort((a, b) => a - b);
+    const ws = row.map((s) => s.w).sort((a, b) => a - b);
+    const hs = row.map((s) => s.h).sort((a, b) => a - b);
+    const medianCy = ys[Math.floor(ys.length / 2)];
+    const medianW = ws[Math.floor(ws.length / 2)];
+    const medianH = hs[Math.floor(hs.length / 2)];
+    const medianArea = medianW * medianH;
+    for (const s of row) {
+      if (s.w * s.h < medianArea * 0.85) {
+        s.cy = medianCy;
+        s.w = medianW;
+        s.h = medianH;
+      }
+    }
+  }
   out.length = 0;
   for (const s of rows.flat()) out.push(s);
   out.forEach((s, i) => { s.index = i; });
