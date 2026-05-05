@@ -490,13 +490,6 @@ export async function runClosedLoopStep(
               disappearedItems.push(mem.item);
               if (mem.fingerprint) disappearedFps.push({ item: mem.item, fp: mem.fingerprint });
               plan.slotMemory.invalidate(s.cx, s.cy);
-              // Infer cursor-holding from disappearance: when a slot's
-              // tracked item vanishes and we don't already have a
-              // cursorItemSignature, the item is likely on the cursor
-              // (the agent moved it but the place verify failed to
-              // confirm transfer). Surface the LIKELY item name to
-              // Planner so the next move can target this item directly
-              // ("place from cursor" instead of "find a source slot").
               if (!plan.cursorItemSignature && mem.fingerprint) {
                 plan.cursorItemSignature = {
                   meanR: mem.fingerprint.meanR,
@@ -507,6 +500,49 @@ export async function runClosedLoopStep(
                 console.log(`[agentbeats] inferred cursor holding '${mem.item}' from disappearance at slot ${s.index}(${s.name ?? "?"})`);
               }
               console.log(`[agentbeats] item disappeared: '${mem.item}' was at slot ${s.index}(${s.name ?? "?"}) -- dist=${distFromBaseline.toFixed(1)} liveLum=${liveLum.toFixed(1)} live.stddev=${live.stddev.toFixed(1)}`);
+              continue;
+            }
+            // SWAP DETECTION: slot still looks filled (not empty) but
+            // its fingerprint shifted SIGNIFICANTLY from baseline AND
+            // the cursor was holding something. MC's click semantics:
+            // clicking a filled slot with a non-empty cursor swaps
+            // contents — slot now has cursor's old item, cursor now
+            // has slot's old item. Detect this by comparing live fp
+            // to mem.fingerprint; large drift while still filled =
+            // swap signature. Exchange identities accordingly:
+            //   - slot's slotMemory entry is updated to the cursor's
+            //     prior item name (with a fresh fp baseline).
+            //   - cursor signature is updated to the slot's prior
+            //     item name (we KNOW what was there before).
+            // This is the user's request: "we can't prevent swap, but
+            // we can swap the context when slot HAS item and changes
+            // significantly".
+            if (
+              distFromBaseline > 40
+              && !liveLooksEmpty
+              && live.stddev > 35
+              && plan.cursorItemSignature
+              && plan.cursorItemSignature.item
+              && plan.cursorItemSignature.item !== mem.item
+            ) {
+              const cursorItem = plan.cursorItemSignature.item;
+              const slotItem = mem.item;
+              // New slot identity = cursor's prior item; new fp = live.
+              plan.slotMemory.invalidate(s.cx, s.cy);
+              plan.slotMemory.record(s.cx, s.cy, cursorItem, plan.iteration, live);
+              // New cursor identity = slot's prior item.
+              if (mem.fingerprint) {
+                plan.cursorItemSignature = {
+                  meanR: mem.fingerprint.meanR,
+                  meanG: mem.fingerprint.meanG,
+                  meanB: mem.fingerprint.meanB,
+                  item: slotItem,
+                };
+              } else {
+                plan.cursorItemSignature.item = slotItem;
+              }
+              console.warn(`[agentbeats] SWAP DETECTED at slot ${s.index}(${s.name ?? "?"}): was '${slotItem}' now '${cursorItem}'; cursor was '${cursorItem}' now '${slotItem}' (dist=${distFromBaseline.toFixed(1)})`);
+              knownSlots.push({ index: s.index, name: s.name, item: cursorItem, ageIters: 0 });
               continue;
             }
             knownSlots.push({ index: s.index, name: s.name, item: mem.item, ageIters: plan.iteration - mem.step });
