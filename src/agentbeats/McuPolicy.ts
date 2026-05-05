@@ -1149,8 +1149,39 @@ export class McuVisualPolicy {
                 state.closedLoopHistory = state.closedLoopHistory.slice(0, 5);
               }
             } else if (probed.action === "fallback_manual") {
-              console.log(`[agentbeats] closed-loop probe says fallback_manual reason=${probed.reason ?? ""} -- handing control to manual LLM cursor`);
+              console.log(`[agentbeats] closed-loop probe says fallback_manual reason=${probed.reason ?? ""} -- escalating to GoalPlanner`);
               plan.done = true;
+              // GoalPlanner escalation: when MCU_USE_PLANNER is on,
+              // re-plan immediately using the structured BLOCKED reason
+              // the sub-agent emitted. The planner is expected to
+              // insert prerequisite subgoals (e.g. obtain/place a
+              // crafting_table) at the head of the queue and requeue
+              // the original task at the tail.
+              if (process.env.MCU_USE_PLANNER === "1") {
+                const ep = this.episodes.get(contextId);
+                if (ep) {
+                  const failReason = probed.reason ?? "closed-loop sub-agent emitted fallback_manual";
+                  ep.completedSummaries.push(`SUBGOAL_FAILED: ${failReason}`);
+                  try {
+                    const { planGoals } = await import("./agents/GoalPlanner");
+                    const out = await planGoals(
+                      { client: this.client, model: this.config.openai.model },
+                      ep.taskText,
+                      ep.completedSummaries,
+                    );
+                    if (!out.overall_done && out.subgoals.length > 0) {
+                      ep.subgoals = out.subgoals;
+                      ep.idx = 0;
+                      ep.singleTask = false;  // multi-step now
+                      console.log(`[agentbeats] GoalPlanner re-plan after fallback_manual: ${out.subgoals.length} subgoals -> ${out.subgoals.map((s) => `${s.kind}:${s.description}`).join(" | ")}`);
+                    } else {
+                      console.warn(`[agentbeats] GoalPlanner re-plan returned empty/overall_done=true; giving up`);
+                    }
+                  } catch (e) {
+                    console.warn(`[agentbeats] GoalPlanner re-plan failed: ${e instanceof Error ? e.message : String(e)}`);
+                  }
+                }
+              }
             } else if (probed.action === "recipe_lookup") {
               // Sub-agent recipe query: look up via minecraft-data,
               // store on the plan for use in subsequent probes' RECIPE
