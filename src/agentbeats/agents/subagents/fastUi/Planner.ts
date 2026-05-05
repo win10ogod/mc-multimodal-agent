@@ -96,16 +96,15 @@ Output strict JSON:
 Each item: { id, text, task, done, attempts }. PRESERVE attempts.`;
 
 function buildUserText(input: PlannerInput, userPayload: Record<string, unknown>): string {
-  const knownSlotsBlock = input.knownSlots.length > 0
-    ? input.knownSlots.map((s) => `  slot ${s.index}${s.name ? `(${s.name})` : ""} = ${s.item}`).join("\n")
-    : "  (none yet — Action agent will OCR-confirm slots as it works)";
+  const knownLines = input.knownSlots.length > 0
+    ? input.knownSlots.map((s) => `  ${s.index} -> ${s.item}`).join("\n")
+    : "  (none yet)";
   const cursorBlock = input.cursorHolding ?? "(empty)";
-  return `Tracked status from action agent (OCR-confirmed — trust this):
-${knownSlotsBlock}
-Cursor holding: ${cursorBlock}
+  return `Tracked items (yellow-badge id -> item, OCR-confirmed):
+${knownLines}
+Cursor: ${cursorBlock}
 
-Payload:
-${JSON.stringify(userPayload, null, 2)}`;
+${JSON.stringify(userPayload)}`;
 }
 
 let PLANNER_CALL_SEQ = 0;
