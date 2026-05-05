@@ -386,11 +386,7 @@ export async function probeNextCraftAction(opts: {
       }
       if (plan.length > 0) {
         // Mark each step DONE when Known shows the dest cell has the
-        // expected ingredient. This stops the agent from re-emitting
-        // already-completed steps. Map back from Row/Col to slot
-        // raster index using craftSlots[r*gridCols+c]; check
-        // opts.knownSlots for that index + matching item name (with
-        // tolerant prefix match for "quartz"/"nether_quartz" etc).
+        // expected ingredient.
         const ingMatches = (memItem: string, recItem: string) =>
           memItem === recItem || memItem.endsWith("_" + recItem) || recItem.endsWith("_" + memItem);
         let nextStep = -1;
@@ -408,10 +404,12 @@ export async function probeNextCraftAction(opts: {
         lines.push(`Placement plan (${recipeInfo.inShape ? "SHAPED" : "shapeless"}; execute one step per probe iteration):`);
         for (let i = 0; i < plan.length; i += 1) {
           const p = plan[i];
+          const cell = stepStates[i].cell;
+          const slotRef = cell ? `slot ${cell.index}${cell.name ? `(${cell.name})` : ""}` : `Row ${p.row} Col ${p.col}`;
           const tag = stepStates[i].done ? " [DONE -- skip]" : (i === nextStep ? " [NEXT]" : "");
-          lines.push(`  Step ${i + 1}: place 1x ${p.ingredient} at Row ${p.row} Col ${p.col}${tag}`);
+          lines.push(`  Step ${i + 1}: place at ${slotRef} = ${p.ingredient}${tag}`);
         }
-        lines.push(`Steps marked [DONE -- skip] are already verified by CV in Known slot contents -- do NOT re-emit them. Execute the [NEXT] step. Resolve by: find the source slot in "Known" whose item matches the ingredient (handle naming variants like "quartz" <-> "nether_quartz"), then emit move{from=<source slot>, to=<Row/Col slot index above>, count:"one"}. After all steps, take the crafted result from the result slot.`);
+        lines.push(`Steps marked [DONE -- skip] are already verified by CV -- do NOT re-emit. Execute the [NEXT] step. Resolve by finding the source slot in "Known" matching the ingredient (handle naming variants like "quartz" <-> "nether_quartz"), then emit move{from=<source slot>, to=<dest slot from above>, count:"one"}. After all steps, take the crafted result from the result slot.`);
       }
     }
     return lines.join("\n");
