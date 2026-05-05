@@ -186,9 +186,19 @@ export function markInventoryFrame(jpegBase64: string, sessionLayout?: GuiLayout
     }
   }
 
-  // Re-encode as PNG (lossless so the marks remain crisp)
+  // Re-encode as PNG (lossless so the marks remain crisp). The MC
+  // simulator emits JPEGs whose jpeg-js decode comes out in BGR(A)
+  // byte order despite formatAsRGBA: swap R↔B on the way out so the
+  // PNG has true RGBA and the LLM sees correct colors (e.g. Alex's
+  // skin/hair tones aren't blue-tinted). Mark drawing assumes the
+  // same byte order, so this swap also corrects the badge colors.
   const png = new PNG({ width: w, height: h });
-  px.copy(png.data);
+  for (let i = 0; i < px.length; i += 4) {
+    png.data[i]     = px[i + 2]; // R <- B
+    png.data[i + 1] = px[i + 1]; // G
+    png.data[i + 2] = px[i];     // B <- R
+    png.data[i + 3] = px[i + 3]; // A
+  }
   const pngBuf = PNG.sync.write(png);
   return {
     pngBase64: pngBuf.toString("base64"),
