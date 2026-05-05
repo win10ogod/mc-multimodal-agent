@@ -571,6 +571,15 @@ export type ClosedLoopCraftPlan = {
    *  significant L2 distance means an item icon is overlaid on the
    *  cursor sprite at park, so the cursor is holding. */
   parkEmptyBaseline: { meanR: number; meanG: number; meanB: number; stddev: number } | null;
+  /** Pixel-level empty-cursor reference: a 14×14 RGBA patch captured
+   *  at park position the FIRST time the cursor verifies empty.
+   *  Used as the diff reference for later cursor-identification:
+   *  later samples at the same park-cursor offset get pixel-wise
+   *  subtracted against this; pixels with significant difference
+   *  are the held-item icon (in isolation from GUI background).
+   *  This is what makes cursor-matching actually work — without a
+   *  clean empty baseline, you can't tell GUI bg from held icon. */
+  parkEmptyCursorPatch: { w: number; h: number; rgba: Uint8Array } | null;
   /** Per-slot pixel fingerprint captured at the FIRST probe of the
    *  session (cursor at park, slots in their natural starting state).
    *  Pass B uses this as the per-slot "is this slot at its initial
@@ -767,6 +776,7 @@ export function planClosedLoopCraft(taskText: string): ClosedLoopCraftPlan {
     pendingTooltipRead: null,
     pendingOcrBatch: null,
     parkEmptyBaseline: null,
+    parkEmptyCursorPatch: null,
     recentMatchedPickup: false,
     initialSlotBaselines: new Map(),
     recipeOverride: null,
