@@ -1003,9 +1003,17 @@ export async function runClosedLoopStep(
       // (success: clear & next probe | fail: retry up to MAX_RETRIES).
       if (plan.pendingClick !== null && !plan.done) {
         const pc = plan.pendingClick;
-        // Resolve current target slot pixel by semantic name (stable
-        // across frames even when raster indices shift).
+        // Resolve current target slot pixel. Prefer the FROZEN pixel
+        // position recorded at click setup — it doesn't drift across
+        // observations the way per-frame template matches can (e.g.
+        // when the cursor sprite passes over a template anchor and
+        // momentarily occludes its match). Fall back to layout
+        // re-resolution by semantic name/role/index if frozen target
+        // wasn't set.
         const resolveSlot = (): { cx: number; cy: number } => {
+          if (pc.frozenTarget) {
+            return { cx: pc.frozenTarget.x, cy: pc.frozenTarget.y };
+          }
           if (pc.slotName) {
             const f = layout!.slots.find((s) => s.name === pc.slotName);
             if (f) return { cx: f.cx, cy: f.cy };
@@ -1016,7 +1024,7 @@ export async function runClosedLoopStep(
           }
           const f = layout!.slots[pc.rasterIndex];
           if (f) return { cx: f.cx, cy: f.cy };
-          return { cx: pc.frozenTarget.x, cy: pc.frozenTarget.y };
+          return { cx: 0, cy: 0 };
         };
         const slotCenter = resolveSlot();
 
@@ -1098,17 +1106,37 @@ export async function runClosedLoopStep(
             }
             return emit(defaultMcuAction());
           }
-          // Require at least one servo step before allowing a click.
-          // Inventory slots are ~18 px apart, and HIT_THRESHOLD_PX is
-          // a few px. If the prior chain step left the cursor already
-          // within hit threshold of the NEW target, servoCursorStep
-          // would return click=true on the very first tick and fire
-          // a click before the cursor was actually re-aimed for the
-          // new slot -- which can land on a neighbor or fail to
-          // register. Forcing a servo step ensures the cursor settles
-          // freshly on the intended slot center.
-          const shouldClickNow = plan.servoSteps > SERVO_STEP_CAP
-            || (stepResult && stepResult.click && plan.servoSteps >= 1);
+          // Click only when the cursor is actually INSIDE the slot's
+          // bbox. Servo as long as cursor is still making progress
+          // toward target; bail only if it stalls (lastErrMag - errMag
+          // < STUCK_DELTA) for STUCK_THRESHOLD consecutive steps.
+          const slotForBox = layout!.slots[pc.rasterIndex];
+          const slotHalfW = Math.max(6, Math.round((slotForBox?.w ?? 16) / 2) + 2);
+          const slotHalfH = Math.max(6, Math.round((slotForBox?.h ?? 16) / 2) + 2);
+          const cursorInsideSlot = !!cursor
+            && Math.abs(cursor.x - slotCenter.cx) <= slotHalfW
+            && Math.abs(cursor.y - slotCenter.cy) <= slotHalfH;
+          const errMagNow = cursor
+            ? Math.hypot(cursor.x - slotCenter.cx, cursor.y - slotCenter.cy)
+            : Infinity;
+          const STUCK_DELTA = 1.0;       // <1 px improvement counts as stuck
+          const STUCK_THRESHOLD = 4;     // bail after 4 consecutive stalls
+          const lastErr = (pc as any).lastErrMag ?? Infinity;
+          if (errMagNow >= lastErr - STUCK_DELTA) {
+            (pc as any).stuckCount = ((pc as any).stuckCount ?? 0) + 1;
+          } else {
+            (pc as any).stuckCount = 0;
+          }
+          (pc as any).lastErrMag = errMagNow;
+          const isStuck = ((pc as any).stuckCount ?? 0) >= STUCK_THRESHOLD;
+          if (isStuck && !cursorInsideSlot) {
+            console.warn(`[agentbeats] servo stuck: cursor (${cursor?.x},${cursor?.y}) target (${slotCenter.cx},${slotCenter.cy}) err=${errMagNow.toFixed(1)}px no improvement for ${STUCK_THRESHOLD} steps; aborting`);
+            state.closedLoopHistory.unshift(`abort ${pc.slotName ?? pc.rasterIndex} (servo stuck off-slot)`);
+            state.closedLoopHistory = state.closedLoopHistory.slice(0, 5);
+            plan.pendingClick = null;
+            return emit(defaultMcuAction());
+          }
+          const shouldClickNow = cursorInsideSlot && plan.servoSteps >= 1;
           if (shouldClickNow) {
             // Safety: clicking outside the inventory window drops the
             // held stack to the world ("throw"). Refuse to fire if the
@@ -1127,25 +1155,7 @@ export async function runClosedLoopStep(
               plan.layoutHint = null;
               return emit(defaultMcuAction());
             }
-            // Safety: even when SERVO_STEP_CAP forces a fire, refuse if
-            // cursor is OUTSIDE the slot's own bbox — a click landing on
-            // the gray gap between buttons triggers nothing (recipe-book
-            // toggle), or fires on the wrong slot (item slots). Better
-            // to abort and let the planner re-perceive than to silently
-            // miss the click.
-            const slotForGuard = layout!.slots[pc.rasterIndex];
-            const slotHalfW = Math.max(6, Math.round((slotForGuard?.w ?? 16) / 2) + 2);
-            const slotHalfH = Math.max(6, Math.round((slotForGuard?.h ?? 16) / 2) + 2);
-            const insideSlot = !!cursor
-              && Math.abs(cursor.x - slotCenter.cx) <= slotHalfW
-              && Math.abs(cursor.y - slotCenter.cy) <= slotHalfH;
-            if (!insideSlot) {
-              console.warn(`[agentbeats] click suppressed: cursor (${cursor?.x},${cursor?.y}) outside slot ${pc.slotName ?? pc.rasterIndex} bbox @(${slotCenter.cx},${slotCenter.cy}) ±(${slotHalfW},${slotHalfH}); aborting`);
-              state.closedLoopHistory.unshift(`abort ${pc.slotName ?? pc.rasterIndex} (cursor outside slot bbox)`);
-              state.closedLoopHistory = state.closedLoopHistory.slice(0, 5);
-              plan.pendingClick = null;
-              return emit(defaultMcuAction());
-            }
+            // shouldClickNow already required cursor inside slot bbox.
             pc.prePatch = samplePatchFingerprint(payload.obs, slotCenter.cx, slotCenter.cy) ?? undefined;
             // Pre-condition for "should_empty" actions (pickup/take):
             // source slot MUST currently have an item. Use the same
