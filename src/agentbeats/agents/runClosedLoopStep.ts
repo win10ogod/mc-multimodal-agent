@@ -1378,17 +1378,18 @@ export async function runClosedLoopStep(
             const probedSlot = layoutForProbe.slots[probed.slot];
             if (!probedSlot) {
               console.warn(`[agentbeats] probe returned slot ${probed.slot} but layout only has ${layout.slots.length}; skipping`);
-            } else if (probed.action === "pickup" && cursorHolding === true) {
-              // Hard guard: cursor is already carrying an item, so a
-              // "pickup" would actually swap stacks and corrupt state.
-              // Skip this probe; next iteration the VLM will see the
-              // updated cursor_holding=yes hint and choose place_all.
-              console.warn(`[agentbeats] probe asked for pickup at slot ${probed.slot} but CV says cursor is HOLDING; refusing -- will reprobe`);
-              state.closedLoopHistory.unshift(`refused pickup slot=${probed.slot} (cursor not empty)`);
+            } else if (probed.action === "pickup" && plan.cursorItemSignature?.item) {
+              // Hard guard: cursor is already carrying an item per the
+              // RUNTIME-TRACKED state (set on confirmed pickup, cleared
+              // on confirmed place_all). Use this instead of the legacy
+              // CV cursorHolding IIFE which false-positives on grey
+              // items + animated bg.
+              console.warn(`[agentbeats] probe asked for pickup at slot ${probed.slot} but cursor holds ${plan.cursorItemSignature.item} (per tracked state); refusing -- will reprobe`);
+              state.closedLoopHistory.unshift(`refused pickup slot=${probed.slot} (cursor holding ${plan.cursorItemSignature.item})`);
               state.closedLoopHistory = state.closedLoopHistory.slice(0, 5);
-            } else if (probed.action === "take" && cursorHolding === true) {
-              console.warn(`[agentbeats] probe asked for take at slot ${probed.slot} but CV says cursor is HOLDING; refusing -- will reprobe`);
-              state.closedLoopHistory.unshift(`refused take slot=${probed.slot} (cursor not empty)`);
+            } else if (probed.action === "take" && plan.cursorItemSignature?.item) {
+              console.warn(`[agentbeats] probe asked for take at slot ${probed.slot} but cursor holds ${plan.cursorItemSignature.item} (per tracked state); refusing -- will reprobe`);
+              state.closedLoopHistory.unshift(`refused take slot=${probed.slot} (cursor holding ${plan.cursorItemSignature.item})`);
               state.closedLoopHistory = state.closedLoopHistory.slice(0, 5);
             } else {
               if (probed.action === "pickup"
