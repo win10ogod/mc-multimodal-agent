@@ -70,6 +70,7 @@ const SCHEMA = {
                 ],
               },
               items: { type: "array", items: { type: "string" } },
+              slots: { type: "array", items: { type: "integer" } },
               sourceSlot: { type: "integer" },
               destSlot: { type: "integer" },
               expectedItem: { type: "string" },
@@ -90,7 +91,7 @@ function buildSystemPrompt(opts: { taskCategory?: "crafting" | "smelting" | "bre
   const baseRules = `You plan a checklist of PRIMITIVE subtasks for a Minecraft GUI subagent. Each subtask maps to ONE primitive click; the runtime executes and auto-ticks done on confirmed verify.
 
 Subtask kinds (with explicit slot indices):
-- verify_items_visible { items }: hover & OCR up to 3 candidate slots to confirm named items exist.
+- verify_items_visible { items?, slots? }: OCR slots to refresh Known. Pass items=[...] to have the Action find candidate slots, OR pass slots=[N1, N2, ...] to OCR specific slot indices (use this to confirm the result slot holds the crafted item, or to confirm a deposit target is empty before take_result).
 - pickup { sourceSlot, expectedItem }: left-click sourceSlot. Cursor MUST be empty before; will hold expectedItem after.
 - place_one { destSlot, expectedItem }: right-click destSlot to drop ONE item. Cursor MUST hold expectedItem; cursor still holds (stack-1) after.
 - place_all { destSlot, expectedItem }: left-click destSlot to drop the whole stack. Cursor MUST hold expectedItem; cursor empty after.
@@ -108,31 +109,40 @@ Each item: { id, text, task, done, attempts }.`;
 
   const fewShotCrafting = `
 
-EXAMPLE — task "craft oak_planks". Recipe: 1x oak_log → 4x oak_planks (shapeless, single cell). Suppose Known says slot 38(hotbar_0)=oak_log; placement plan: 1. oak_log at slot 2. Result slot: 7.
+EXAMPLE — task "craft oak_planks". Recipe: 1x oak_log → 4x oak_planks (shapeless, single cell). Placement plan: 1. oak_log at slot 2. Result slot: 7. Known is empty at episode start (no slots OCR'd yet).
 
-Optimal first checklist:
-  step1: pickup { sourceSlot: 38, expectedItem: "oak_log" }
-  step2: place_all { destSlot: 2, expectedItem: "oak_log" }    // shapeless single-cell → place_all (whole stack; MC consumes 1 per craft cycle)
-  step3: take_result { expectedItem: "oak_planks" }            // left-click result slot 7 → cursor now holds 4x oak_planks
-  step4: place_all { destSlot: 38, expectedItem: "oak_planks" }  // deposit into a free hotbar/main_inv slot (the just-emptied source 38 is fine)
+Optimal first checklist (verify FIRST when Known doesn't already cover the recipe ingredients):
+  step1: verify_items_visible { items: ["oak_log"] }                    // OCR hotbar slots that visually look like oak_log
+  step2: pickup { sourceSlot: 38, expectedItem: "oak_log" }              // sourceSlot resolved AFTER verify confirms slot 38=oak_log
+  step3: place_all { destSlot: 2, expectedItem: "oak_log" }              // shapeless single-cell → place_all (whole stack)
+  step4: verify_items_visible { slots: [7, 38] }                         // confirm result slot 7 has "oak_planks" AND deposit slot 38 is now empty
+  step5: take_result { expectedItem: "oak_planks" }                      // cursor holds 4x oak_planks
+  step6: place_all { destSlot: 38, expectedItem: "oak_planks" }          // deposit into the (verified empty) slot 38
 next_idx: 0
 
-EXAMPLE — task "craft diorite". Recipe: 2x cobblestone + 2x quartz, shaped inShape=[[cobble,quartz],[quartz,cobble]] → cobble at cell(0,0)=slot 2, quartz at cell(0,1)=slot 3, quartz at cell(1,0)=slot 5, cobble at cell(1,1)=slot 6. Result slot: 7. Suppose slot 38=cobblestone, slot 39=nether_quartz.
+EXAMPLE — task "craft diorite". Recipe: 2x cobblestone + 2x quartz, shaped inShape=[[cobble,quartz],[quartz,cobble]] → cobble at cell(0,0)=slot 2, quartz at cell(0,1)=slot 3, quartz at cell(1,0)=slot 5, cobble at cell(1,1)=slot 6. Result slot: 7. Known is empty at episode start.
 
 Optimal first checklist:
-  step1: pickup { sourceSlot: 38, expectedItem: "cobblestone" }
-  step2: place_one { destSlot: 2, expectedItem: "cobblestone" }
-  step3: place_one { destSlot: 6, expectedItem: "cobblestone" }
-  step4: place_all { destSlot: 38, expectedItem: "cobblestone" }    // return cobble remainder to source so cursor is empty
-  step5: pickup { sourceSlot: 39, expectedItem: "nether_quartz" }
-  step6: place_one { destSlot: 3, expectedItem: "nether_quartz" }
-  step7: place_one { destSlot: 5, expectedItem: "nether_quartz" }
-  step8: place_all { destSlot: 39, expectedItem: "nether_quartz" }    // return quartz remainder
-  step9: take_result { expectedItem: "diorite" }                       // cursor holds diorite
-  step10: place_all { destSlot: 38, expectedItem: "diorite" }          // deposit diorite to a free hotbar slot
+  step1: verify_items_visible { items: ["cobblestone", "nether_quartz"] }   // OCR up to 3 visually-matching hotbar slots
+  step2: pickup { sourceSlot: 38, expectedItem: "cobblestone" }              // sourceSlot resolved AFTER verify
+  step3: place_one { destSlot: 2, expectedItem: "cobblestone" }
+  step4: place_one { destSlot: 6, expectedItem: "cobblestone" }
+  step5: place_all { destSlot: 38, expectedItem: "cobblestone" }    // return cobble remainder to source so cursor is empty
+  step6: pickup { sourceSlot: 39, expectedItem: "nether_quartz" }
+  step7: place_one { destSlot: 3, expectedItem: "nether_quartz" }
+  step8: place_one { destSlot: 5, expectedItem: "nether_quartz" }
+  step9: place_all { destSlot: 39, expectedItem: "nether_quartz" }    // return quartz remainder
+  step10: verify_items_visible { slots: [7, 11] }                     // confirm result slot 7 has "diorite" AND deposit slot 11 is empty before the take/deposit dance
+  step11: take_result { expectedItem: "diorite" }                     // cursor holds diorite
+  step12: place_all { destSlot: 11, expectedItem: "diorite" }         // deposit to slot 11 (verified empty) — NOT 38/39 (still hold ingredients after returns)
 next_idx: 0
 
-GENERAL RULE: for each ingredient with multiple target cells, emit pickup → K×place_one → place_all back to source. For a single-cell shapeless recipe, pickup → place_all into the cell. Always end with take_result followed by place_all to deposit the crafted output into a free hotbar/main_inv slot.`;
+NOTE on verify_items_visible:
+- Place ONE at the top with items=[...] when Known is missing any recipe ingredient. Action OCRs candidate hotbar slots.
+- Place ONE before take_result with slots=[result_slot, deposit_slot] to confirm the crafted item is present AND the deposit target is empty.
+- The runtime auto-ticks each verify_items_visible once OCR completes; Re-PLAN reads the refreshed Known and adjusts sourceSlot fields in subsequent pickup/place steps.
+
+GENERAL RULE: for each ingredient with multiple target cells, emit pickup → K×place_one → place_all back to source. For a single-cell shapeless recipe, pickup → place_all into the cell. Always end with take_result followed by place_all into an EMPTY main_inv/hotbar slot — NOT an ingredient source slot (those are still filled after the return-remainder place_all). Pick a slot index that is NOT in Known and visually empty.`;
 
   return baseRules + (category === "crafting" ? fewShotCrafting : "");
 }

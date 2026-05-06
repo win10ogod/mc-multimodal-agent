@@ -100,7 +100,7 @@ function buildActionUserText(input: ActionInput): string {
   const subtask = input.subtask;
   const subtaskLine = (() => {
     switch (subtask.kind) {
-      case "verify_items_visible": return `verify_items_visible items=[${subtask.items.join(", ")}]`;
+      case "verify_items_visible": return `verify_items_visible items=[${(subtask.items ?? []).join(", ")}] slots=[${(subtask.slots ?? []).join(", ")}]`;
       case "pickup":               return `pickup sourceSlot=${subtask.sourceSlot} expectedItem=${subtask.expectedItem}`;
       case "place_one":            return `place_one destSlot=${subtask.destSlot} expectedItem=${subtask.expectedItem}`;
       case "place_all":            return `place_all destSlot=${subtask.destSlot} expectedItem=${subtask.expectedItem}`;

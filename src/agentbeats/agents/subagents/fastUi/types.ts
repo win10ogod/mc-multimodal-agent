@@ -9,10 +9,12 @@
  *  subtask into a click verbatim.
  */
 export type Subtask =
-  /** Confirm by OCR that named items exist in inventory. Action
-   *  picks candidate slots itself. Skip when caller already trusts
-   *  Known. */
-  | { kind: "verify_items_visible"; items: string[] }
+  /** OCR slots to learn their contents. Either the planner names
+   *  expected items (Action picks candidate slots) or it lists
+   *  specific slot indices (Action verifies those exact slots).
+   *  When both are empty/missing, Action falls back to OCR'ing up
+   *  to 3 visually-suspicious slots. */
+  | { kind: "verify_items_visible"; items?: string[]; slots?: number[] }
   /** Pick up (whole stack at) source slot — left-click. Cursor
    *  becomes loaded with `expectedItem` so the runtime can record
    *  cursor identity on confirmed pickup. */
