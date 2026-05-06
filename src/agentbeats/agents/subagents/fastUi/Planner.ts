@@ -155,7 +155,9 @@ NOTE on verify_items_visible:
 - Place ONE before take_result with slots=[result_slot, deposit_slot] to confirm the crafted item is present AND the deposit target is empty.
 - The runtime auto-ticks each verify_items_visible once OCR completes; Re-PLAN reads the refreshed Known and adjusts sourceSlot fields in subsequent pickup/place steps.
 
-GENERAL RULE: for each ingredient with multiple target cells, emit pickup → K×place_one → place_all back to source. For a single-cell shapeless recipe, pickup → place_all into the cell. Always end with take_result followed by place_all into an EMPTY main_inv/hotbar slot — NOT an ingredient source slot (those are still filled after the return-remainder place_all). Pick a slot index that is NOT in Known and visually empty.`;
+DEPOSIT SLOT RULE: any place_all that deposits a held item into "free inventory" MUST target a slot whose role is hotbar (slot indices 38..46) or main_inv (slot indices 11..37). NEVER pick offhand (slot 10), armor (0, 1, 8, 9), craft cells (2, 3, 5, 6 for 2x2; or 9 craft slots for 3x3), the result slot, or gap slot 4. The Slots-by-role block in the user prompt lists exact ranges per layout — follow it.
+
+GENERAL RULE: for each ingredient with multiple target cells, emit pickup → K×place_one → place_all back to source. For a single-cell shapeless recipe, pickup → place_all into the cell. Always end with take_result followed by place_all into a hotbar/main_inv slot that is NOT in Known and visually empty (and NOT an ingredient source slot — those are filled after the return-remainder place_all).`;
 
   return baseRules + (category === "crafting" ? fewShotCrafting : "");
 }
