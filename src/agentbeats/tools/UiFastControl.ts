@@ -16,7 +16,9 @@
  * benchmark's 640x360 obs resolution. No task-name-based hardcoding.
  */
 import minecraftData from "minecraft-data";
-import { defaultMcuAction, type McuEnvAction } from "./McuPrompt";
+import { SlotMemory } from "./SlotMemory";
+import { defaultMcuAction, type McuEnvAction } from "../McuPrompt";
+import type { ChecklistItem } from "../agents/subagents/fastUi/types";
 import type { GuiLayout } from "./SlotDetector";
 
 export type UiFastControlFrame = {
@@ -49,9 +51,29 @@ export type ProbeRequest = {
 // K_pitch=5.0 with deadzone=4 and converged stably at "stuck err ~5-8 px".
 // Earlier this session I tried K_yaw=3.5, K_pitch=6.5 hoping to fix the
 // stall but it didn't help (same floor) and regressed elsewhere. Reverting.
-const PX_PER_CAM_YAW = 8.5;
-const PX_PER_CAM_PITCH = 5.0;
+// Empirical sim response measured from servo_trajectory.jsonl
+// (servo-test eval biqlibgm9, May 2026). Earlier hard-coded values
+// of 8.5/5.0 were wildly off — yaw was 4× too high, which made the
+// servo's deadzone gate suppress legit corrections at err=12 px and
+// the cursor got stuck.
+//
+// Yaw  (cam=2°  → +4 px observed)        ⇒  2.0 px/deg
+// Pitch -10°    → -67 px observed         ⇒  6.7 px/deg (down)
+// Pitch +4°     → +11 px observed         ⇒  2.75 px/deg (small +ve)
+//
+// Pitch is asymmetric / magnitude-dependent — using the small-step
+// (precision phase) value 2.75 makes the controller's predicted
+// displacement match actual landing within ±1 px for the final
+// approach. Large-pitch frames overshoot the prediction but that's
+// fine for the rapid-approach phase.
+const PX_PER_CAM_YAW = 2.0;
+const PX_PER_CAM_PITCH = 2.75;
 const PITCH_DEADZONE_MIN = 4;        // smallest pitch cmd that still produces visible cursor motion in the sim
+// Camera bin granularity. The MC env appears to have a yaw deadzone
+// around ~2 deg — sub-2-deg cam values produce inconsistent or zero
+// cursor motion (logged: cam=[0,-1] left cursor stuck at the same
+// pixel for 4 frames). Stick with 2 deg as the smallest bin so
+// every emit reliably moves the cursor.
 const CAM_BIN_DEG = 2;
 const MAX_CAM_DEG = 10;
 
@@ -202,10 +224,15 @@ export function parseTargetItem(taskText: string): string | null {
 }
 
 type RecipeIngredient = { name: string; count: number };
-type RecipeInfo = {
+export type RecipeInfo = {
   target: string;
   ingredients: RecipeIngredient[];
   requiresTable: boolean;
+  /** When non-null, the recipe is SHAPED -- each cell is identified by
+   *  ingredient name (or null for empty). Row-major. Caller can map this
+   *  to the craft grid's raster slots to emit a position-correct plan.
+   *  When null, the recipe is shapeless and any cell arrangement works. */
+  inShape: Array<Array<string | null>> | null;
 };
 
 export function lookupRecipe(target: string, version = "1.20.4"): RecipeInfo | null {
@@ -262,10 +289,21 @@ export function lookupRecipe(target: string, version = "1.20.4"): RecipeInfo | n
     const def = data.items[id];
     if (def) ingredients.push({ name: def.name, count });
   }
+  // Build inShape with item-name strings for shaped recipes; null for
+  // shapeless. Caller maps row/col to raster craft-grid cells.
+  let inShape: Array<Array<string | null>> | null = null;
+  if (recipe.inShape) {
+    inShape = recipe.inShape.map((row) => row.map((id) => {
+      if (typeof id !== "number" || id <= 0) return null;
+      const def = data.items[id];
+      return def ? def.name : null;
+    }));
+  }
   return {
     target: resolvedName,
     ingredients,
     requiresTable: !!recipe.requiresTable,
+    inShape,
   };
 }
 
@@ -432,11 +470,36 @@ export type PendingClick = {
   kind?: "click" | "cleanup" | "auto_return";
   /** Probe action this click was derived from. */
   actionKind?: "pickup" | "place_one" | "place_all" | "take";
+  /** Item name to record at this click's slot on a CV-matched verify
+   *  for place_one/place_all clicks. Set at chain-build time from the
+   *  source slot's SlotMemory entry. The CV-matched verify is the
+   *  evidence the slot really got the item; the source-slot lookup
+   *  supplies the identity. */
+  placedItemName?: string;
+  /** Source slot's RGB fingerprint at chain-build time. Used at place
+   *  verify to CV-confirm the placement actually transferred the
+   *  intended item: compare destination's post-fill fp to this
+   *  sourceFp. If similar, record placedItemName at destination. If
+   *  dissimilar, the click missed/swapped — log + do NOT record (and
+   *  keep cursorItemSignature so the agent knows it still holds). */
+  sourceFp?: { meanR: number; meanG: number; meanB: number; stddev: number };
+  /** Cursor's actual pixel position at the moment the click fired.
+   *  May differ from the intended slot center (servo precision is
+   *  finite). The verify step looks up which layout slot CONTAINS
+   *  this pixel — that's the slot MC actually applied the click to.
+   *  All slotMemory + cursor-state updates use this ACTUAL slot, so
+   *  context reflects what really happened, not what was intended.
+   *  E.g., if cursor was at (303, 247) when click fired but pc
+   *  targeted slot 38 at (260, 247), MC actually clicked slot 41 —
+   *  Pickup metadata gets associated with slot 41, not 38. */
+  clickedAt?: { x: number; y: number };
 };
 
 export type ClosedLoopCraftPlan = {
-  target: string;
-  ingredient: string;
+  /** Raw task text. Passed straight to the probe so it can reason over
+   *  any UI for any task without us teaching the tool what crafting /
+   *  smelting / chest / villager / etc. mean. */
+  taskText: string;
   cursor: { x: number; y: number };
   iteration: number;
   done: boolean;
@@ -470,6 +533,21 @@ export type ClosedLoopCraftPlan = {
   /** Slot from which the agent first picked up the ingredient stack. Used
    *  to instruct the VLM to return leftover items here after place_one. */
   pickupSourceSlot: { index: number; name?: string } | null;
+  /** RGB signature of the item currently being carried by the cursor.
+   *  Captured from the prePatch of the most recent successful pickup
+   *  (when the source slot was filled, before the click emptied it).
+   *  Used by the swap guard so place_all onto a slot containing the
+   *  SAME item is allowed (will stack in MC) instead of refused.
+   *
+   *  `item`: the LIKELY item name on the cursor — derived either
+   *  from the source slot's slotMemory entry at pickup time, or
+   *  inferred at probe time when Pass A sees a tracked slot's item
+   *  vanished but no other slot was just filled with that item. The
+   *  Planner prompt surfaces this so the agent can plan its next
+   *  move based on what's in hand. Rule-based detection of the
+   *  cursor's held-icon pixels alone is unreliable; the
+   *  what-disappeared inference is far more robust. */
+  cursorItemSignature: { meanR: number; meanG: number; meanB: number; item?: string } | null;
   /** Queued follow-up clicks that should fire after the current pendingClick
    *  verifies successfully. Used to expand a single high-level VLM action
    *  (move, put) into a sequence of low-level clicks the existing state
@@ -488,6 +566,83 @@ export type ClosedLoopCraftPlan = {
   /** How many frames we've spent trying to park the cursor before the
    *  current probe. Capped to avoid dead-loop when cursor can't move. */
   parkSteps: number;
+  /** When true, the next probe round skips the park step. Set after a
+   *  "hover" action so the cursor stays on the slot the VLM asked to
+   *  inspect (so MC renders the tooltip in the next probe image). */
+  skipNextPark: boolean;
+  /** Per-UI-session memory of "what is at absolute pixel position X,Y"
+   *  populated by tooltip OCR after each hover. Surfaced to the probe in
+   *  the next prompt so the VLM doesn't re-hover the same slot. */
+  slotMemory: SlotMemory;
+  /** Pixel-level empty-cursor reference: a 14×14 RGBA patch captured
+   *  at park position the FIRST time the cursor verifies empty.
+   *  Used as the diff reference for later cursor-identification:
+   *  later samples at the same park-cursor offset get pixel-wise
+   *  subtracted against this; pixels with significant difference
+   *  are the held-item icon (in isolation from GUI background).
+   *  This is what makes cursor-matching actually work — without a
+   *  clean empty baseline, you can't tell GUI bg from held icon. */
+  parkEmptyCursorPatch: { w: number; h: number; rgba: Uint8Array } | null;
+  /** Most recent park-state snapshot of every slot in the active
+   *  layout + the cursor-area patch. Captured when the cursor is at
+   *  park (outside the GUI, no sprite over slots). Reused as the
+   *  pre-state for the next primitive click and updated to the
+   *  post-state once the click completes. Replaces the per-click
+   *  slot-center stddev verify gate.
+   *  Spec: docs/superpowers/specs/2026-05-07-park-snapshot-action-verify-design.md */
+  lastParkSnapshot: import("./SnapshotDiff").LayoutSnapshot | null;
+  /** Last observed cursor position at probe time. Used to gate baseline
+   *  capture on cursor STABILITY: if the cursor hasn't been within 2 px
+   *  of itself for 2 consecutive probes, it's still settling and the
+   *  baseline patch would be sampled at a stale position, mismatching
+   *  every later live sample. Cleared whenever we issue any cam motion. */
+  lastProbeCursor: { x: number; y: number } | null;
+  /** Per-slot pixel fingerprint captured at the FIRST probe of the
+   *  session (cursor at park, slots in their natural starting state).
+   *  Pass B uses this as the per-slot "is this slot at its initial
+   *  state?" reference -- a slot whose live patch closely matches its
+   *  initial baseline is unchanged (still empty / still its starting
+   *  item) and won't be misidentified as a freshly placed item. Keyed
+   *  by absolute pixel position rounded to ints to survive minor
+   *  detection jitter. */
+  initialSlotBaselines: Map<string, { meanR: number; meanG: number; meanB: number; stddev: number }>;
+  /** True for one probe cycle right after a CV-matched pickup verify
+   *  (slot's pixels confirmed transition filled->empty). The
+   *  cursor-holding signal AND-gates this with a park-baseline pixel
+   *  diff: only when BOTH are true do we report cursorHolding=true.
+   *  Cleared on the next matched place. */
+  recentMatchedPickup: boolean;
+  /** Recipe metadata cached when the sub-agent queries via the
+   *  recipe_lookup action. Surfaced to the probe in subsequent
+   *  iterations as the RECIPE / Placement plan blocks. */
+  recipeOverride: RecipeInfo | null;
+  /** When non-null, an OCR-on-settle is expected for the next obs frame
+   *  (cursor was just hovered onto a slot; tooltip should be rendered). */
+  pendingTooltipRead: { slotIndex: number; x: number; y: number; slotName?: string; retries?: number } | null;
+  /** Active verify_slots batch: queue of non-empty slots to hover + OCR
+   *  in sequence. After the last slot, the runtime servos cursor back to
+   *  a park position before falling through to the next probe call so
+   *  the cursor never lingers on a real item across iterations. */
+  pendingOcrBatch: {
+    slots: Array<{ slot: number; x: number; y: number; name?: string }>;
+    idx: number;
+    /** Set when we've finished all slots and are now servoing back to
+     *  the park position; OCR is suppressed in this phase. */
+    parking: boolean;
+  } | null;
+  /** Probe-graph step list owned by the Planner agent. Empty until
+   *  recipe_lookup resolves and the rule-based seed builds the initial
+   *  list. The Planner ticks `done` after each chain-end based on
+   *  observation; the Action agent receives one item at a time. */
+  checklist: ChecklistItem[];
+  /** Index of the [ ] item the Action agent is currently executing.
+   *  Cleared after a successful chain-end so the Planner can pick
+   *  the next [ ] on its next turn. */
+  activeChecklistIdx: number;
+  /** Set true on a chain-end where source slot was role==="result".
+   *  The runtime fires the Planner agent on the next entry to update
+   *  the checklist + judge completion. */
+  judgeAfterChain: boolean;
 };
 
 /** Servo control law: given current cursor + target slot pixel center,
@@ -498,12 +653,27 @@ export type ClosedLoopCraftPlan = {
  *  transfers crafted items to inventory regardless of what cursor holds.
  *  Returns null if the cursor wasn't detected and we should noop this
  *  frame and re-observe. */
+/** Pitch integrator state — carried across servoCursorStep calls so
+ *  sub-deadzone pitch errors can accumulate and eventually fire a
+ *  deadzone-min correction. Classical delta-sigma modulation: when
+ *  |integrator| exceeds deadzone, emit a step of that magnitude and
+ *  decrement; otherwise emit 0 and let it accumulate. Result: the
+ *  cursor's average y-position converges on target even though
+ *  individual frames produce 0-or-deadzone pitch motion. */
+export type ServoIntegrator = { pitchAccumPx: number };
+export function makeServoIntegrator(): ServoIntegrator { return { pitchAccumPx: 0 }; }
+
 export function servoCursorStep(opts: {
   cursor: { x: number; y: number } | null;
   target: { x: number; y: number };
   button: "attack" | "use";
   shift?: boolean;
   hitThresholdPx?: number;
+  /** Optional integrator for delta-sigma pitch compensation. When
+   *  provided, sub-deadzone pitch errors accumulate across calls
+   *  and fire a deadzone-min correction once accumulated error
+   *  crosses the threshold. */
+  integrator?: ServoIntegrator;
 }): { action: McuEnvAction; click: boolean; reason: string } | null {
   if (!opts.cursor) return null;
   const ex = opts.target.x - opts.cursor.x;
@@ -516,40 +686,69 @@ export function servoCursorStep(opts: {
     if (opts.shift) action.sneak = 1;
     return { action, click: true, reason: `${opts.shift ? "shift+" : ""}click err=${errMag.toFixed(1)}px` };
   }
-  // Camera-delta proportional to pixel error. Clamp + quantize per frame.
-  let yawDeg = ex / PX_PER_CAM_YAW;
-  let pitchDeg = ey / PX_PER_CAM_PITCH;
-  // Clamp + bin
-  yawDeg = Math.max(-MAX_CAM_DEG, Math.min(MAX_CAM_DEG, yawDeg));
-  pitchDeg = Math.max(-MAX_CAM_DEG, Math.min(MAX_CAM_DEG, pitchDeg));
-  let dy = quantizeCam(yawDeg);
-  let dp = quantizeCam(pitchDeg);
-  // Pitch deadzone: if remaining error is below half the deadzone, drop
-  // it so we don't oscillate.
-  if (dp !== 0 && Math.abs(dp) < PITCH_DEADZONE_MIN) {
-    dp = Math.sign(dp) * PITCH_DEADZONE_MIN;
+  // QUADRATIC sim model — empirically derived from servo_trajectory.jsonl
+  // (run bp47tb9i2). The sim's cursor displacement is approximately
+  // px ≈ k_q × cam² × sign(cam), with k_q ≈ 0.67 for both axes.
+  // Validated data points:
+  //   cam= 2°  →  4 px  (k_q × 4 = 2.7,  observed 4)
+  //   cam= 4°  → 11 px  (k_q × 16 = 10.7, observed 11) ✓
+  //   cam= 8°  → 38 px  (k_q × 64 = 42.9, observed 38) ✓
+  //   cam=10°  → 67 px  (k_q × 100 = 67,  observed 67) ✓
+  // A linear model with constant px/deg either undershoots (small cam)
+  // or overshoots (large cam); the quadratic inverse predicts cam
+  // accurately at every magnitude.
+  // Inverse: cam = sign(px) * sqrt(|px| / k_q), clamped to ±MAX_CAM_DEG
+  // and quantized to integer (sim doesn't accept fractional cam).
+  const K_QUAD = 0.67;
+  const quadraticInvCam = (pxErr: number): number => {
+    if (pxErr === 0) return 0;
+    const raw = Math.sign(pxErr) * Math.sqrt(Math.abs(pxErr) / K_QUAD);
+    const clamped = Math.max(-MAX_CAM_DEG, Math.min(MAX_CAM_DEG, raw));
+    return Math.round(clamped);
+  };
+  // Predict actual cursor displacement from the quantized cam value.
+  // Used so we can decide whether to emit (would the displacement be
+  // useful?) or stay put (within achievable precision).
+  const camToDisplacement = (cam: number): number => {
+    if (cam === 0) return 0;
+    return Math.sign(cam) * K_QUAD * cam * cam;
+  };
+  // Yaw deadzone: sim ignores |cam|<2 (logged: cam=1 produced 0
+  // motion for 4 consecutive frames). Smallest effective yaw cam = 2.
+  // Pitch deadzone: |cam|<PITCH_DEADZONE_MIN (4) produces 0 motion.
+  const yawDeadzonePx = camToDisplacement(CAM_BIN_DEG);          // ≈2.7 px
+  const pitchDeadzonePx = camToDisplacement(PITCH_DEADZONE_MIN); // ≈10.7 px
+  // Yaw: emit when |ex| > min-effective/2 so the smallest command
+  // doesn't OVERSHOOT past the click hit-region. The quadratic inverse
+  // computes the right cam for any error; deadzone enforced by min cam.
+  let dy = 0;
+  if (Math.abs(ex) > yawDeadzonePx / 2) {
+    dy = quadraticInvCam(ex);
+    if (dy === 0) dy = Math.sign(ex) * CAM_BIN_DEG;
+    else if (Math.abs(dy) < CAM_BIN_DEG) dy = Math.sign(dy) * CAM_BIN_DEG;
   }
-  if (Math.abs(pitchDeg) * PX_PER_CAM_PITCH < PITCH_DEADZONE_MIN / 2) dp = 0;
-  if (dy === 0 && dp === 0) {
-    // Sub-quantum stuck: cursor is within ~half a cam-bin of the
-    // target but neither axis can compute a non-zero correction.
-    // Force the smallest cam (2 deg = ~17 px) in the dominant
-    // error axis so the cursor at least moves to a different sub-
-    // pixel position before the click cap fires. This breaks the
-    // deterministic stuck-then-click-the-same-pixel loop where the
-    // click consistently lands at the slot edge and MC's effective
-    // hit region rejects it.
-    const action = defaultMcuAction();
-    if (Math.abs(ex) >= Math.abs(ey)) {
-      action.camera = [0, Math.sign(ex) * 2];
-    } else {
-      action.camera = [Math.sign(ey) * 2, 0];
+  // Pitch: same quadratic inverse + deadzone. Delta-sigma integrator
+  // accumulates sub-deadzone errors across frames.
+  let dp = 0;
+  if (Math.abs(ey) >= pitchDeadzonePx) {
+    dp = quadraticInvCam(ey);
+    if (Math.abs(dp) < PITCH_DEADZONE_MIN) {
+      dp = Math.sign(dp || ey) * PITCH_DEADZONE_MIN;
     }
-    return {
-      action,
-      click: false,
-      reason: `kick err=${errMag.toFixed(1)}px cam=[${action.camera[0]},${action.camera[1]}] (sub-quantum stuck nudge)`,
-    };
+    if (opts.integrator) opts.integrator.pitchAccumPx = 0;
+  } else if (opts.integrator) {
+    opts.integrator.pitchAccumPx += ey;
+    if (Math.abs(opts.integrator.pitchAccumPx) >= pitchDeadzonePx) {
+      dp = Math.sign(opts.integrator.pitchAccumPx) * PITCH_DEADZONE_MIN;
+      opts.integrator.pitchAccumPx -= dp * PX_PER_CAM_PITCH;
+    }
+  }
+  if (dy === 0 && dp === 0) {
+    // Both axes inside their deadzones — cursor as close as the sim
+    // can place it. Should be within click hit-region; the verifier
+    // tolerates ±8.5 px on x / ±10 px on y, which is exactly this
+    // "passive parking" zone.
+    return null;
   }
   const action = defaultMcuAction();
   action.camera = [dp, dy];
@@ -560,44 +759,56 @@ export function servoCursorStep(opts: {
   };
 }
 
-/** Returns null if the task is not a single-ingredient 2x2 craft we handle. */
-export function planClosedLoopCraft(taskText: string): ClosedLoopCraftPlan | null {
-  const target = parseTargetItem(taskText);
-  if (!target) return null;
-  const recipe = lookupRecipe(target);
-  if (!recipe) return null;
-  if (recipe.requiresTable) return null;
-  if (recipe.ingredients.length !== 1) return null;
-  if (recipe.ingredients[0].count !== 1) return null;
+/** Always returns a plan. The closed-loop is gated purely at RUNTIME
+ *  by whether the SoM detector finds a multi-slot inventory layout in
+ *  the current obs frame -- no text-keyword filtering, no recipe-name
+ *  matching. If the agent never opens a UI, the closed-loop block
+ *  noops and the regular VLM handles world actions (mining, fighting,
+ *  exploring, killing the ender dragon, etc.). The moment any GUI
+ *  appears -- crafting grid, furnace, chest, anvil, villager, brewing
+ *  stand, enchanting table, modded container -- the probe + servo +
+ *  click + verify machinery takes over generically. The probe sees
+ *  the raw taskText so it can reason about whatever the goal is. */
+export function planClosedLoopCraft(taskText: string): ClosedLoopCraftPlan {
   return {
-    target: recipe.target,
-    ingredient: recipe.ingredients[0].name,
+    taskText,
     cursor: CURSOR_OPEN_CENTER,
     iteration: 0,
     done: false,
-    // Bumped from 8 -> 16: retry/cleanup/SoM-reset cycles can chew
-    // through several probes per "real" action, and falling back to
-    // manual LLM cursor control runs at ~3% success.
-    maxIterations: 16,
+    maxIterations: 32,
     pendingClick: null,
     awaitingVerify: null,
     servoSteps: 0,
     layoutHint: null,
     sessionLayout: null,
     pickupSourceSlot: null,
+    cursorItemSignature: null,
     pendingChain: [],
     lastCursorRead: null,
     lastEmittedCam: [0, 0],
     staleCursorFrames: 0,
     parkSteps: 0,
+    skipNextPark: false,
+    slotMemory: new SlotMemory(),
+    pendingTooltipRead: null,
+    pendingOcrBatch: null,
+    parkEmptyCursorPatch: null,
+    lastParkSnapshot: null,
+    lastProbeCursor: null,
+    recentMatchedPickup: false,
+    initialSlotBaselines: new Map(),
+    recipeOverride: null,
+    checklist: [],
+    activeChecklistIdx: -1,
+    judgeAfterChain: false,
   };
 }
 
 /** Legacy phase 1 for backwards-compat tests; now equivalent to open+settle. */
 export function buildUiFastControlPhase1(taskText: string): UiFastControlFrame[] | null {
-  const plan = planClosedLoopCraft(taskText);
-  if (!plan) return null;
-  return buildCraftOpenInventoryFrames(plan.target);
+  const target = parseTargetItem(taskText);
+  if (!target) return null;
+  return buildCraftOpenInventoryFrames(target);
 }
 
 /**

@@ -174,6 +174,18 @@ export function markInventoryFrame(jpegBase64: string, sessionLayout?: GuiLayout
   const h = decoded.height;
   const px = Buffer.from(decoded.data.buffer, decoded.data.byteOffset, decoded.data.byteLength);
 
+  // jpeg-js with formatAsRGBA returns BGR byte order despite the
+  // option name. We swap R↔B once HERE so the resulting PNG file is
+  // in correct RGBA byte order — the LLMs see Steve's shirt as cyan
+  // (not yellow), and downstream consumers (Action/Planner debug
+  // dumps that save the PNG directly) get true-color images.
+  // DebugRecorder skips the swap for PNG inputs to avoid double-swap.
+  for (let i = 0; i < px.length; i += 4) {
+    const r = px[i];
+    px[i] = px[i + 2];
+    px[i + 2] = r;
+  }
+
   // Prefer the session-locked layout (stable marks across frames). Only
   // run fresh detection when the caller hasn't supplied one.
   const layout = sessionLayout ?? detectGuiLayout(cleaned);
@@ -186,9 +198,9 @@ export function markInventoryFrame(jpegBase64: string, sessionLayout?: GuiLayout
     }
   }
 
-  // Re-encode as PNG (lossless so the marks remain crisp)
+  // Re-encode as PNG. px is already RGBA (we swapped at decode time).
   const png = new PNG({ width: w, height: h });
-  px.copy(png.data);
+  png.data.set(px);
   const pngBuf = PNG.sync.write(png);
   return {
     pngBase64: pngBuf.toString("base64"),
