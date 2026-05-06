@@ -99,7 +99,13 @@ Subtask kinds (with explicit slot indices):
 - wait_for_output { expectedItem }: wait for furnace/brewing output.
 - verify_state { condition }: confirm a non-action condition holds.
 
-CURSOR INVARIANT: before pickup, cursor must be empty. Before place_*, cursor must hold the expected item.
+CURSOR INVARIANT (HARD): before pickup, cursor must be empty. Before place_*, cursor must hold the expected item. THIS MEANS:
+
+If the user prompt's "Cursor:" line shows the cursor holding ANY item, your output's FIRST not-yet-done subtask CANNOT be a pickup. It MUST be either:
+  (a) a place_one or place_all that matches the held item to a recipe-required cell (if the held item still has placements pending in the recipe), OR
+  (b) a place_all to a verified-empty inventory slot (to dump the cursor before the next pickup).
+
+If you emit pickup as the first pending step while cursor is non-empty, MC will SWAP — corrupting both the source slot and the cursor. This is the most common plan failure; double-check before returning.
 
 RE-PLAN MANDATE — read this every post_action call. If ANY of the following holds, you MUST modify the checklist (insert / replace / re-order steps); do NOT just preserve the prior list and bump next_idx:
   1. Cursor holds an item that the next pending subtask doesn't expect (e.g. next is pickup but cursor non-empty; next is place_one cobblestone but cursor holds quartz). Insert a recovery primitive (place_all to dump cursor into a known-empty slot, then re-pickup the right item) BEFORE the original next step.
