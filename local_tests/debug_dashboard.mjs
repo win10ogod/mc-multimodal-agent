@@ -63,21 +63,12 @@ rows.sort((a, b) => {
 // Map each row to its likely associated image: probe → 0000N_probe_input.png,
 // action → fastui_action_NNNNN_input.png, ocr → 200NNN_slot_ocr.png, etc.
 function findImage(row) {
+  // imageFile is now set by DebugRecorder for ALL event types that
+  // pass an image (probe_input, fastui_action_call, fastui_planner_call,
+  // slot_ocr). Filenames use the global event seq so listing the dir
+  // sorts chronologically.
   if (row.imageFile) return row.imageFile;
-  if (row.type === "fastui_action_call") {
-    const seq = String(row.data?.seq ?? "").padStart(5, "0");
-    return `fastui_action_${seq}_input.png`;
-  }
-  if (row.type === "fastui_planner_call") {
-    const seq = String(row.data?.seq ?? "").padStart(5, "0");
-    return `fastui_planner_${seq}_input.png`;
-  }
-  if (row.type === "slot_ocr") {
-    return row.data?.imageFile ?? null;
-  }
-  if (row.type === "verify") {
-    return null; // Verify event has no own image; show neighbor if any
-  }
+  if (row.type === "verify") return null;
   return null;
 }
 

@@ -6,7 +6,7 @@ import type { RecipeInfo } from "../../../tools/UiFastControl";
 export type ActionDeps = {
   client: OpenAI;
   model: string;
-  recordDebug?: (kind: string, payload: unknown) => Promise<void> | void;
+  recordDebug?: (kind: string, payload: unknown, imageBase64?: string, imageExt?: "png" | "jpg") => Promise<void> | void;
 };
 
 export type ActionInput = {
@@ -193,12 +193,9 @@ export async function runAction(deps: ActionDeps, input: ActionInput): Promise<C
       const pathMod = require("node:path") as typeof import("node:path");
       const promptText = `[fastui-action ${seq}]\nSYSTEM:\n${SYS}\n\nUSER:\n${userText}\n`;
       fs.writeFileSync(pathMod.join(debugDir, `fastui_action_${seq}_prompt.txt`), promptText);
-      if (input.obsBase64) {
-        const m = input.obsBase64.match(/^data:image\/([a-z]+);base64,(.+)$/);
-        const ext = m ? m[1] : "jpg";
-        const raw = m ? m[2] : input.obsBase64;
-        fs.writeFileSync(pathMod.join(debugDir, `fastui_action_${seq}_input.${ext}`), Buffer.from(raw, "base64"));
-      }
+      // Image is saved by DebugRecorder via recordDebug() with the
+      // global event seq prefix — keeps file ordering consistent
+      // with the events.jsonl chronology.
     } catch (e) {
       console.warn(`[fastui-action ${seq}] debug dump failed: ${e instanceof Error ? e.message : String(e)}`);
     }
@@ -238,9 +235,17 @@ export async function runAction(deps: ActionDeps, input: ActionInput): Promise<C
   }
   console.log(`[fastui-action] subtask=${input.subtask.kind} -> ${parsed.action}${parsed.from!==undefined?` from=${parsed.from}`:""}${parsed.to!==undefined?` to=${parsed.to}`:""}${parsed.slot!==undefined?` slot=${parsed.slot}`:""}`);
   try {
+    // Pass the marked obs through recordDebug so DebugRecorder writes
+    // the image with the GLOBAL event seq prefix — files sort
+    // chronologically alongside probe/verify/ocr events. The legacy
+    // local fastui_action_NNNNN_input.png save is now redundant; the
+    // global-seq file is the source of truth.
+    const m = input.obsBase64?.match(/^data:image\/([a-z]+);base64,(.+)$/);
+    const ext: "png" | "jpg" = m && m[1] === "png" ? "png" : "jpg";
+    const raw = m ? m[2] : input.obsBase64;
     await deps.recordDebug?.("fastui_action_call", {
       seq, subtask: input.subtask, output: parsed,
-    });
+    }, raw, ext);
   } catch { /* swallow */ }
   return parsed as CraftAction;
 }

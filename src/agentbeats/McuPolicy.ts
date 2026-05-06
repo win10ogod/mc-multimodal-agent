@@ -577,7 +577,7 @@ export class McuVisualPolicy {
       defaultHoldSteps: this.config.agentbeats.defaultHoldSteps,
       modelEveryNSteps: this.config.agentbeats.modelEveryNSteps,
       debugDir: recorder.getDir(),
-      recordDebug: async (kind: string, p: unknown) => { recorder.record({ type: kind, data: p as Record<string, unknown> }); },
+      recordDebug: async (kind: string, p: unknown, imageBase64?: string, imageExt?: "png" | "jpg") => { recorder.record({ type: kind, data: p as Record<string, unknown> }, imageBase64, imageExt); },
       modelDecision: (ctx: McuContextState, s: number) => this.modelDecision(ctx, s),
     };
 

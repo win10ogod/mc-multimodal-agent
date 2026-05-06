@@ -24,7 +24,7 @@ export type ClosedLoopDeps = {
   defaultHoldSteps: number;
   modelEveryNSteps: number;
   debugDir: string | null;
-  recordDebug: (kind: string, payload: unknown) => Promise<void>;
+  recordDebug: (kind: string, payload: unknown, imageBase64?: string, imageExt?: "png" | "jpg") => Promise<void>;
   modelDecision: (context: McuContextState, step: number) => Promise<McuPolicyDecision>;
 };
 

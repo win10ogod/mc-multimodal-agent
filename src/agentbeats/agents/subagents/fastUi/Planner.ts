@@ -5,7 +5,7 @@ import type { RecipeInfo } from "../../../tools/UiFastControl";
 export type PlannerDeps = {
   client: OpenAI;
   model: string;
-  recordDebug?: (kind: string, payload: unknown) => Promise<void> | void;
+  recordDebug?: (kind: string, payload: unknown, imageBase64?: string, imageExt?: "png" | "jpg") => Promise<void> | void;
 };
 
 export type PlannerInput = {
@@ -258,12 +258,7 @@ export async function runPlanner(deps: PlannerDeps, input: PlannerInput): Promis
       const pathMod = require("node:path") as typeof import("node:path");
       const promptText = `[fastui-planner ${seq}]\nSYSTEM:\n${sys}\n\nUSER:\n${userText}\n`;
       fs.writeFileSync(pathMod.join(debugDir, `fastui_planner_${seq}_prompt.txt`), promptText);
-      if (input.obsBase64) {
-        const m = input.obsBase64.match(/^data:image\/([a-z]+);base64,(.+)$/);
-        const ext = m ? m[1] : "jpg";
-        const raw = m ? m[2] : input.obsBase64;
-        fs.writeFileSync(pathMod.join(debugDir, `fastui_planner_${seq}_input.${ext}`), Buffer.from(raw, "base64"));
-      }
+      // Image saved by DebugRecorder via recordDebug() with global seq.
     } catch (e) {
       console.warn(`[fastui-planner ${seq}] debug dump failed: ${e instanceof Error ? e.message : String(e)}`);
     }
@@ -306,11 +301,15 @@ export async function runPlanner(deps: PlannerDeps, input: PlannerInput): Promis
   }
   console.log(`[fastui-planner] trigger=${input.trigger} all_done=${parsed.all_done} next_idx=${parsed.next_idx} checklist=[${parsed.checklist.map((c) => `${c.done ? "x" : " "}${c.id} task.kind=${(c.task as any)?.kind ?? "MISSING"}`).join(", ")}]`);
   try {
+    // Pass the marked obs through recordDebug for global-seq filename.
+    const m = input.obsBase64?.match(/^data:image\/([a-z]+);base64,(.+)$/);
+    const ext: "png" | "jpg" = m && m[1] === "png" ? "png" : "jpg";
+    const raw = m ? m[2] : input.obsBase64;
     await deps.recordDebug?.("fastui_planner_call", {
       seq, trigger: input.trigger,
       input: userPayload,
       output: { all_done: parsed.all_done, next_idx: parsed.next_idx, checklist: parsed.checklist },
-    });
+    }, raw, ext);
   } catch { /* swallow */ }
   if (parsed.all_done) return { kind: "all_done", checklist: parsed.checklist };
   return { kind: "continue", checklist: parsed.checklist, nextIdx: parsed.next_idx };
