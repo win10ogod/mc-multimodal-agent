@@ -82,31 +82,72 @@ const SCHEMA = {
   },
 } as const;
 
-// Static role/contract for the Planner LLM. Per-call data (known_slots,
-// cursor_holding, recipe, history, etc.) is rendered into the USER message
-// — this prompt is identical across calls so it stays cache-friendly.
-const SYS = `You plan a checklist of PRIMITIVE subtasks for a Minecraft GUI subagent (crafting, smelting, brewing, chest, anvil, etc.). Each subtask maps to ONE primitive click; the runtime executes and auto-ticks done on confirmed verify.
+/** Build the Planner system prompt. Static contract + few-shot
+ *  examples are domain-specific (crafting now; can extend with
+ *  smelting/brewing/chest blocks later). */
+function buildSystemPrompt(opts: { taskCategory?: "crafting" | "smelting" | "brewing" | "chest" }): string {
+  const category = opts.taskCategory ?? "crafting";
+  const baseRules = `You plan a checklist of PRIMITIVE subtasks for a Minecraft GUI subagent. Each subtask maps to ONE primitive click; the runtime executes and auto-ticks done on confirmed verify.
 
 Subtask kinds (with explicit slot indices):
 - verify_items_visible { items }: hover & OCR up to 3 candidate slots to confirm named items exist.
 - pickup { sourceSlot, expectedItem }: left-click sourceSlot. Cursor MUST be empty before; will hold expectedItem after.
-- place_one { destSlot, expectedItem }: right-click destSlot to drop ONE item. Cursor MUST hold expectedItem; cursor still holds (stack-1).
+- place_one { destSlot, expectedItem }: right-click destSlot to drop ONE item. Cursor MUST hold expectedItem; cursor still holds (stack-1) after.
 - place_all { destSlot, expectedItem }: left-click destSlot to drop the whole stack. Cursor MUST hold expectedItem; cursor empty after.
-- take_result { expectedItem }: left-click result slot, then place_all to a free hotbar/main_inv slot.
-- wait_for_output { expectedItem }: wait N ticks for furnace/brewing output.
+- take_result { expectedItem }: pickup from the result slot to take the crafted output (runtime resolves the destination).
+- wait_for_output { expectedItem }: wait for furnace/brewing output.
 - verify_state { condition }: confirm a non-action condition holds.
 
-CURSOR INVARIANT: before pickup, cursor must be empty. Before place_*, cursor must hold the expected item. If state diverges, insert the necessary intermediate primitive (e.g. place_all to dump a wrong-item cursor before the right pickup).
+CURSOR INVARIANT: before pickup, cursor must be empty. Before place_*, cursor must hold the expected item. If state diverges (cursor holds wrong item, slot empty when expected, etc.) insert the recovery primitive (place_all to dump, pickup again, etc.) and re-plan from there.
 
-For a shaped crafting recipe with N ingredient slots, emit:
-  pickup ingredient → (place_one repeated for each cell of that ingredient) → next ingredient pickup → ... → take_result.
-Use the Placement plan (see USER block) to pick destSlot for each place_one.
-
-On post_action calls: the runtime has already auto-ticked any subtask whose primitive was confirmed by verify. Read current_checklist to see what's already done. RE-PLAN only when state diverged from expectation (e.g. cursor holds wrong item, slot drift, etc.). Insert recovery steps and adjust next_idx. Preserve done flags and attempts. Never decrement attempts.
+On post_action calls: runtime has already auto-ticked subtasks whose primitive was confirmed. Read current_checklist for what's done. RE-PLAN only when state diverged. Preserve done flags and attempts; never decrement attempts.
 
 Output strict JSON:
   { "all_done": bool, "next_idx": int (-1 if all_done), "checklist": [...] }
-Each item: { id, text, task, done, attempts }. PRESERVE done flags from current_checklist.`;
+Each item: { id, text, task, done, attempts }.`;
+
+  const fewShotCrafting = `
+
+EXAMPLE — task "craft oak_planks". Recipe: 1x oak_log → 4x oak_planks (shapeless, single cell). Suppose Known says slot 38(hotbar_0)=oak_log; placement plan: 1. oak_log at slot 2.
+
+Optimal first checklist:
+  step1: pickup { sourceSlot: 38, expectedItem: "oak_log" }
+  step2: place_all { destSlot: 2, expectedItem: "oak_log" }    // shapeless single-cell → place_all (whole stack into the cell, MC consumes 1 per craft cycle and the rest stays as input)
+  step3: take_result { expectedItem: "oak_planks" }
+next_idx: 0
+
+EXAMPLE — task "craft diorite". Recipe: 2x cobblestone + 2x quartz, shaped inShape=[[cobble,quartz],[quartz,cobble]] → cobble at cell(0,0)=slot 2, quartz at cell(0,1)=slot 3, quartz at cell(1,0)=slot 5, cobble at cell(1,1)=slot 6. Suppose slot 38=cobblestone, slot 39=nether_quartz.
+
+Optimal first checklist:
+  step1: pickup { sourceSlot: 38, expectedItem: "cobblestone" }
+  step2: place_one { destSlot: 2, expectedItem: "cobblestone" }
+  step3: place_one { destSlot: 6, expectedItem: "cobblestone" }
+  step4: place_all { destSlot: 38, expectedItem: "cobblestone" }    // return cobble remainder to source so cursor is empty
+  step5: pickup { sourceSlot: 39, expectedItem: "nether_quartz" }
+  step6: place_one { destSlot: 3, expectedItem: "nether_quartz" }
+  step7: place_one { destSlot: 5, expectedItem: "nether_quartz" }
+  step8: place_all { destSlot: 39, expectedItem: "nether_quartz" }    // return quartz remainder
+  step9: take_result { expectedItem: "diorite" }
+next_idx: 0
+
+GENERAL RULE: for each ingredient with multiple target cells, emit pickup → K×place_one → place_all back to source. For a single-cell shapeless recipe, pickup → place_all into the cell. Always end with take_result.`;
+
+  return baseRules + (category === "crafting" ? fewShotCrafting : "");
+}
+
+/** Detect task category from the dispatch text. The crafting few-shot
+ *  block only loads when the GoalPlanner asked for a crafting subgoal
+ *  (taskText starts with "craft" or recipe is provided). Other GUI
+ *  categories (smelting/brewing/chest) fall back to the rules-only
+ *  prompt — extend buildSystemPrompt with their own examples later. */
+function detectTaskCategory(taskText: string, recipePresent: boolean): "crafting" | "smelting" | "brewing" | "chest" | undefined {
+  const t = taskText.toLowerCase();
+  if (recipePresent || /\bcraft\b|\bcrafting\b/.test(t)) return "crafting";
+  if (/\bsmelt\b|\bfurnace\b|\bcook\b/.test(t)) return "smelting";
+  if (/\bbrew\b|\bpotion\b/.test(t)) return "brewing";
+  if (/\bchest\b|\bdeposit\b|\bwithdraw\b/.test(t)) return "chest";
+  return undefined;
+}
 
 function buildPlacementPlan(input: PlannerInput): string {
   if (!input.recipeInfo) return "";
@@ -181,6 +222,7 @@ export async function runPlanner(deps: PlannerDeps, input: PlannerInput): Promis
   };
 
   const userText = buildUserText(input, userPayload);
+  const sys = buildSystemPrompt({ taskCategory: detectTaskCategory(input.taskText, !!input.recipeInfo) });
   const seq = String(++PLANNER_CALL_SEQ).padStart(5, "0");
   const debugDir = process.env.AGENTBEATS_DEBUG_DIR;
   if (debugDir) {
@@ -189,7 +231,7 @@ export async function runPlanner(deps: PlannerDeps, input: PlannerInput): Promis
       const fs = require("node:fs") as typeof import("node:fs");
       // eslint-disable-next-line @typescript-eslint/no-require-imports
       const pathMod = require("node:path") as typeof import("node:path");
-      const promptText = `[fastui-planner ${seq}]\nSYSTEM:\n${SYS}\n\nUSER:\n${userText}\n`;
+      const promptText = `[fastui-planner ${seq}]\nSYSTEM:\n${sys}\n\nUSER:\n${userText}\n`;
       fs.writeFileSync(pathMod.join(debugDir, `fastui_planner_${seq}_prompt.txt`), promptText);
       if (input.obsBase64) {
         const m = input.obsBase64.match(/^data:image\/([a-z]+);base64,(.+)$/);
@@ -210,7 +252,7 @@ export async function runPlanner(deps: PlannerDeps, input: PlannerInput): Promis
     temperature: 0,
     max_completion_tokens: 800,
     messages: [
-      { role: "system", content: SYS },
+      { role: "system", content: sys },
       {
         role: "user",
         content: [
