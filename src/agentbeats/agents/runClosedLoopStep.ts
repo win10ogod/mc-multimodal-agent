@@ -236,10 +236,13 @@ export async function runClosedLoopStep(
         if (plan.pendingClick === null && plan.pendingChain.length === 0 && !plan.pendingOcrBatch) {
           pt.tickAfterIdle += 1;
           // Wait a couple of probe ticks between phases so park
-          // baseline / patch captures settle.
+          // baseline / patch captures settle. Don't early-return —
+          // we need the closed-loop probe block (which contains the
+          // cursorHolding IIFE that runs cursor-diff-id) to execute
+          // each tick. Just don't advance the phase yet.
           if (pt.tickAfterIdle < 2) {
-            return { kind: "act", action: defaultMcuAction(), holdSteps: 1 };
-          }
+            // fall through; phase stays the same
+          } else {
           pt.tickAfterIdle = 0;
           if (pt.phase === "park0") {
             console.log(`[pickup-test] phase park0 done; parkEmptyCursorPatch=${plan.parkEmptyCursorPatch ? "captured" : "MISSING"}`);
@@ -306,6 +309,7 @@ export async function runClosedLoopStep(
             state.earlyStop = true;
             return { kind: "subgoal_done", summary: "pickup-test complete" };
           }
+          } // end else (tickAfterIdle >= 2)
         }
       }
       if (process.env.AGENTBEATS_SERVO_TEST === "1") {
