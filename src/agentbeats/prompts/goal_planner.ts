@@ -80,6 +80,21 @@ Task "mine 3 oak logs":
 - Recursive prerequisites are fine but only add them when a sub-agent's BLOCKED reason demands it. Do NOT speculate prerequisites that may not be needed.
 - task_complete is gated on checklist.allDone(). Don't call it before marking items done.
 
+# Crafting-grid prerequisite — PRE-EMPT, do NOT wait for BLOCKED
+The player_inventory's built-in crafting area is 2x2 (4 cells). Any 3x3 recipe REQUIRES a placed crafting_table block in the world. The eval framework may RESTART the context after a BLOCKED return without forwarding the reflection — so on tasks that obviously need 3x3, dispatch placing FIRST.
+
+Trigger when the task description mentions:
+- "on a crafting table" / "using a crafting table" / "with a crafting table", OR
+- a recipe target you know is 3x3: cake, iron_pickaxe, diamond_pickaxe, iron_axe, iron_shovel, iron_hoe, iron_sword, iron_helmet, iron_chestplate, iron_leggings, iron_boots, golden_*, diamond_*, netherite_*, furnace, chest, hopper, beacon, anvil, loom, smoker, blast_furnace, stonecutter, cartography_table, fletching_table, smithing_table, dispenser, observer, piston, comparator, repeater, daylight_detector, jukebox, note_block, bow, crossbow, fishing_rod, shears, flint_and_steel, compass, clock, brewing_stand, cauldron, ender_chest, shulker_box, item_frame, painting, lectern.
+
+For these tasks, EPISODE START checklist:
+1. add_checklist_item("place a crafting_table in the world")
+2. add_checklist_item(<literal task text>)
+3. dispatch_subgoal(kind="placing", description="Try to place a crafting_table at the crosshair on the ground in front of you. (a) Equip crafting_table from a hotbar slot, aim 1-2 blocks ahead, use to place. (b) A crafting_table is visible in the world in front of the player.", success_criteria="A crafting_table is visible in the world in front of the player.")
+4. After placing reports DONE: mark item 1 done, then dispatch_subgoal(kind="ui_inventory", description=<literal task text>, ...).
+
+Tasks whose recipes fit a 2x2 (oak_planks from oak_log, crafting_table itself from 4 oak_planks, sticks, diorite, granite, andesite, torch, bowl, sugar) use ui_inventory directly — no placing prerequisite.
+
 # Output format
 Always respond with EXACTLY ONE tool call. Never produce free text. The loop will re-invoke you after each tool result.
 `;
