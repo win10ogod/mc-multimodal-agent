@@ -119,9 +119,22 @@ const baseCx = cursorRelative && baselineCursor ? baselineCursor.x + HELD_OFF : 
 const baseCy = cursorRelative && baselineCursor ? baselineCursor.y + HELD_OFF : PARK_Y + HELD_OFF;
 const baselinePatch = samplePatch(baselineImg, baseCx, baseCy);
 
-let truePos = 0, trueNeg = 0, falsePos = 0;
+// Ground truth provided by user for the latest eval (planner inputs 1-12):
+//   planner_00001-00003: cursor empty
+//   planner_00004-00010: cursor holds cobblestone
+//   planner_00011-00012: cursor holds nether_quartz
+function expectedFor(filename) {
+  const m = filename.match(/planner_(\d{5})_input\.png$/);
+  if (!m) return null;
+  const n = parseInt(m[1], 10);
+  if (n <= 3) return "empty";
+  if (n <= 10) return "cobble";
+  return "quartz";
+}
+
+let correct = 0, wrong = 0, untested = 0;
 console.log("");
-console.log("frame                              cursor           pixelDiffFg  bgMasked  spriteShifts  holding");
+console.log("frame                              cursor           pixelDiffFg  expected  detected   verdict");
 console.log("-".repeat(105));
 for (const f of files) {
   const img = loadRGBA(path.join(debugDir, f));
@@ -130,11 +143,15 @@ for (const f of files) {
   const cy = cursorRelative && cur ? cur.y + HELD_OFF : PARK_Y + HELD_OFF;
   const live = samplePatch(img, cx, cy);
   const r = detect(baselinePatch, live);
-  const tag = r.holding ? "HOLDING" : "empty";
-  // Ground truth: empty (eval bailed before any pickup)
-  if (r.holding) falsePos++; else trueNeg++;
+  const detected = r.holding ? "HOLDING" : "empty";
+  const exp = expectedFor(f);
+  let verdict = "—";
+  if (exp === null) untested++;
+  else if (exp === "empty" && !r.holding) { verdict = "OK"; correct++; }
+  else if (exp !== "empty" && r.holding) { verdict = "OK"; correct++; }
+  else { verdict = `WRONG (expected ${exp})`; wrong++; }
   const curStr = cur ? `(${cur.x},${cur.y})` : "no-cursor";
-  console.log(`${f.padEnd(36)} ${curStr.padEnd(14)}  ${String(r.pixelDiffFg).padStart(4)}        ${String(r.bgMasked).padStart(3)}      ${String(r.spriteShifts).padStart(3)}          ${tag}`);
+  console.log(`${f.padEnd(36)} ${curStr.padEnd(14)}  ${String(r.pixelDiffFg).padStart(4)}        ${(exp ?? "n/a").padEnd(8)}  ${detected.padEnd(8)}   ${verdict}`);
 }
 console.log("");
-console.log(`SUMMARY: ${trueNeg}/${files.length} correct (empty), ${falsePos}/${files.length} false-positive (holding)`);
+console.log(`SUMMARY: ${correct} correct, ${wrong} wrong, ${untested} untested (no ground truth)`);

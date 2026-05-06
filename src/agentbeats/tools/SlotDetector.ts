@@ -683,6 +683,30 @@ export function patchSimilarity(
   return Math.max(0, 1 - rms / 255);
 }
 
+/** Raw-RGBA RMS distance between two same-shape patches sampled at
+ *  the same pixel position. Used to detect whether a slot's contents
+ *  changed between two park-state snapshots: same position before
+ *  and after, no need to mask BG (empty pixels match empty pixels,
+ *  contributing 0 to the sum). Returns the per-pixel RMS in
+ *  RGB-distance units; threshold ~25 reliably separates "no change"
+ *  (sub-noise) from "item appeared/disappeared/swapped." */
+export function patchPixelRms(
+  a: { w: number; h: number; rgba: Uint8Array },
+  b: { w: number; h: number; rgba: Uint8Array },
+): number {
+  if (a.w !== b.w || a.h !== b.h) return Infinity;
+  const n = a.w * a.h;
+  let ssd = 0;
+  for (let i = 0; i < n; i += 1) {
+    const off = i * 4;
+    const dr = a.rgba[off] - b.rgba[off];
+    const dg = a.rgba[off + 1] - b.rgba[off + 1];
+    const db = a.rgba[off + 2] - b.rgba[off + 2];
+    ssd += dr * dr + dg * dg + db * db;
+  }
+  return Math.sqrt(ssd / (n * 3));
+}
+
 /** Debug variant: return ALL plausible cursor components (useful for
  *  triaging false positives during calibration). */
 export function detectCursorCandidates(

@@ -50,7 +50,14 @@ for (const e of events) {
     default: rows.push({ t, seq, type: e.type, data: e.data ?? {}, imageFile: e.imageFile });
   }
 }
-rows.sort((a, b) => (a.seq && b.seq) ? String(a.seq).localeCompare(String(b.seq)) : 0);
+// Sort by event seq (chronological monotone counter from events.jsonl).
+// Fall back to timestamp. NEVER lexicographic — "10" < "9" alphabetically.
+rows.sort((a, b) => {
+  const sa = Number(a.seq), sb = Number(b.seq);
+  if (Number.isFinite(sa) && Number.isFinite(sb) && sa !== sb) return sa - sb;
+  if (a.t && b.t) return String(a.t).localeCompare(String(b.t));
+  return 0;
+});
 
 // Map each row to its likely associated image: probe → 0000N_probe_input.png,
 // action → fastui_action_NNNNN_input.png, ocr → 200NNN_slot_ocr.png, etc.
@@ -124,13 +131,21 @@ function summarize(row) {
       };
     }
     case "verify": {
+      // The verify event payload is {type, step, data:{slotName,
+      // slotIndex, intent, outcome, slotChanges, cursorChange, retries,
+      // cursor}}. The summarizer's `d` is the outer e.data — drill in.
+      const v = d.data ?? d;
+      const ok = v.outcome === "confirmed" || v.outcome === "drifted";
+      const slotChangesStr = Array.isArray(v.slotChanges)
+        ? v.slotChanges.map(([i, ch]) => `${i}:${ch}`).join(", ") || "(none)"
+        : "(unknown)";
       return {
-        title: `[verify] slot ${d.slotName ?? d.slotIndex ?? ""} ${d.actionKind ?? d.kind ?? ""} expect=${d.expectAfter} → ${d.matched ? "OK" : "MISMATCH"}`,
+        title: `[verify] slot ${v.slotName ?? v.slotIndex ?? ""} ${v.intent ?? ""} → ${v.outcome ?? "(unknown)"} ${ok ? "OK" : ""}`,
         body: [
-          `prePatch: ${d.prePatch ? `mean=(${d.prePatch.meanR.toFixed(0)},${d.prePatch.meanG.toFixed(0)},${d.prePatch.meanB.toFixed(0)}) stddev=${d.prePatch.stddev.toFixed(1)}` : "n/a"}`,
-          `postPatch: mean=(${d.postPatch?.meanR?.toFixed(0)},${d.postPatch?.meanG?.toFixed(0)},${d.postPatch?.meanB?.toFixed(0)}) stddev=${d.postPatch?.stddev?.toFixed(1)}`,
-          `cursor: (${d.cursor?.x},${d.cursor?.y})`,
-          `retries: ${d.retries}`,
+          `slot changes: ${slotChangesStr}`,
+          `cursor change: ${v.cursorChange ?? "(unknown)"}`,
+          `cursor: (${v.cursor?.x},${v.cursor?.y})`,
+          `retries: ${v.retries ?? 0}`,
         ],
       };
     }
@@ -213,10 +228,10 @@ const html = `<!doctype html>
 ${dashboardRows.map((r) => {
   const cls = r.type === "fastui_action_call" ? "action_call"
     : r.type === "fastui_planner_call" ? "planner_call"
-    : r.type === "verify" ? (r.summary.title.includes("OK") ? "verify_match" : "verify_mismatch")
+    : r.type === "verify" ? (/→ (confirmed|drifted)/.test(r.summary.title) ? "verify_match" : "verify_mismatch")
     : r.type === "slot_ocr" ? "ocr"
     : r.type;
-  const verifyClass = r.type === "verify" ? (r.summary.title.includes("OK") ? "verify" : "verify verify_mismatch") : "";
+  const verifyClass = r.type === "verify" ? (/→ (confirmed|drifted)/.test(r.summary.title) ? "verify" : "verify verify_mismatch") : "";
   const dataAttrs = `data-cls="${cls}" data-vmm="${verifyClass.includes("mismatch") ? "1" : "0"}"`;
   return `<div class="row ${cls}" ${dataAttrs}>
     <div>

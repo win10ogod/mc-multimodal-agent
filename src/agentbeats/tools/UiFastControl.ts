@@ -590,6 +590,14 @@ export type ClosedLoopCraftPlan = {
    *  This is what makes cursor-matching actually work — without a
    *  clean empty baseline, you can't tell GUI bg from held icon. */
   parkEmptyCursorPatch: { w: number; h: number; rgba: Uint8Array } | null;
+  /** Most recent park-state snapshot of every slot in the active
+   *  layout + the cursor-area patch. Captured when the cursor is at
+   *  park (outside the GUI, no sprite over slots). Reused as the
+   *  pre-state for the next primitive click and updated to the
+   *  post-state once the click completes. Replaces the per-click
+   *  slot-center stddev verify gate.
+   *  Spec: docs/superpowers/specs/2026-05-07-park-snapshot-action-verify-design.md */
+  lastParkSnapshot: import("./SnapshotDiff").LayoutSnapshot | null;
   /** Last observed cursor position at probe time. Used to gate baseline
    *  capture on cursor STABILITY: if the cursor hasn't been within 2 px
    *  of itself for 2 consecutive probes, it's still settling and the
@@ -793,6 +801,7 @@ export function planClosedLoopCraft(taskText: string): ClosedLoopCraftPlan {
     pendingOcrBatch: null,
     parkEmptyBaseline: null,
     parkEmptyCursorPatch: null,
+    lastParkSnapshot: null,
     lastProbeCursor: null,
     recentMatchedPickup: false,
     initialSlotBaselines: new Map(),

@@ -84,10 +84,15 @@ export class DebugRecorder {
           }
           const w = decoded.width, h = decoded.height;
           const data = Buffer.from(decoded.data);
-          for (let i = 0; i < data.length; i += 4) {
-            const r = data[i];
-            data[i] = data[i + 2];
-            data[i + 2] = r;
+          // R↔B swap only for JPEG inputs (jpeg-js returns BGR-as-RGBA
+          // bytes despite formatAsRGBA). PNG inputs are already in
+          // correct RGBA byte order — swapping them inverts the colors.
+          if (imageExt === "jpg") {
+            for (let i = 0; i < data.length; i += 4) {
+              const r = data[i];
+              data[i] = data[i + 2];
+              data[i + 2] = r;
+            }
           }
           const outPng = new PNG({ width: w, height: h });
           data.copy(outPng.data);

@@ -11,7 +11,7 @@ import {
   lookupRecipe,
   makeServoIntegrator,
 } from "../tools/UiFastControl";
-import { probeNextCraftAction, vlmVerifySlotState } from "../tools/InventoryProbe";
+import { probeNextCraftAction } from "../tools/InventoryProbe";
 import { detectCursorWithExpectation, detectGuiLayout, samplePatchFingerprint, samplePatchPixels, patchSimilarity } from "../tools/SlotDetector";
 import { repairDecisionForTask, shouldUseModelOnStep } from "../McuPolicyUtils";
 import type { UiFastControlFrame } from "../tools/UiFastControl";
@@ -399,6 +399,20 @@ export async function runClosedLoopStep(
               // Cursor just finished parking; batch complete.
               console.log(`[agentbeats] verify_slots batch complete (parked)`);
               plan.pendingOcrBatch = null;
+              // Refresh the park snapshot now that cursor is at park
+              // and slot patches are clean (OCR pass mutated nothing,
+              // but slot baselines may have been re-captured during
+              // probe). Spec: 2026-05-07-park-snapshot-action-verify-design.md
+              if (cursor && plan.sessionLayout) {
+                const { takeLayoutSnapshot } = await import("../tools/SnapshotDiff");
+                {
+                  const sl = plan.sessionLayout as import("../tools/SlotDetector").GuiLayout;
+                  // Fallback to last-known cursor position when current
+                  // detection failed (held item can occlude the sprite).
+                  // Last-known is closer to baseline-cursor than parkSpot.
+                  plan.lastParkSnapshot = takeLayoutSnapshot(payload.obs, sl, cursor, plan.iteration, plan.parkEmptyCursorPatch, plan.lastProbeCursor);
+                }
+              }
               // Arm Planner re-judge: a verify_slots subtask just
               // finished and Known got fresh entries. Without this,
               // Planner never re-evaluates and the Action agent keeps
@@ -529,18 +543,21 @@ export async function runClosedLoopStep(
           // same position in baseline + live, so any diff is real
           // held-icon pixels.
           if (!cursor) return null;
+          // Sample CURSOR-RELATIVE: the held-icon renders at a fixed
+          // offset from the cursor sprite. Cursor-relative sampling
+          // means baseline and live patches always cover the same
+          // logical region (the held-icon area). Snapshot diff matches
+          // by also sampling cursor-relative (with last-known cursor
+          // fallback when template detection fails).
           const SAMPLE_X = cursor.x + HELD_OFF_X;
           const SAMPLE_Y = cursor.y + HELD_OFF_Y;
           const live = samplePatchFingerprint(payload.obs, SAMPLE_X, SAMPLE_Y, 6);
           if (!live) return null;
           if (plan.parkEmptyBaseline === null) {
-            // Stability gate: only capture baseline once cursor has been
-            // within 2 px of itself for two consecutive probes. The
-            // cursorAtPark gate (14 px tolerance) lets in mid-settle
-            // frames where cursor.x/y is stale from in-flight motion;
-            // sampling there produces a baseline patch shifted vs every
-            // future stable-cursor sample, causing systematic false-
-            // positive cursorHolding.
+            // Stability gate: cursor must have been at park for two
+            // consecutive probes (template detected, position within
+            // 2 px of itself). Avoids capturing baseline mid-servo
+            // when the cursor sprite is still slewing.
             const last = plan.lastProbeCursor;
             const stable = last !== null && Math.abs(last.x - cursor.x) <= 2 && Math.abs(last.y - cursor.y) <= 2;
             plan.lastProbeCursor = { x: cursor.x, y: cursor.y };
@@ -652,15 +669,11 @@ export async function runClosedLoopStep(
           if (emptyByPixel || (!plan.parkEmptyCursorPatch && meanDist < 8)) return false;
           return null;
         })();
-        // Reconcile cursorItemSignature with CV: place_one can empty
-        // the cursor when the held stack reached 1 item, but only the
-        // place_all path clears the signature on click verify. If CV
-        // now reports the cursor empty, drop the stale signature so
-        // the agent context says Cursor: (empty).
-        if (cursorHolding === false && plan.cursorItemSignature) {
-          console.log(`[agentbeats] cursor CV-empty; clearing stale cursorItemSignature='${plan.cursorItemSignature.item ?? "?"}'`);
-          plan.cursorItemSignature = null;
-        }
+        // Cursor reconcile is now done inside the snapshot-diff verify
+        // phase (which uses the BG-masked baseline-relative detector
+        // — proven correct against ground-truth eval frames). No
+        // separate ad-hoc cursorHolding-false clear here; that path
+        // used the legacy IIFE which still false-clears on grey items.
         try {
           // Build slot-memory snapshot keyed to current raster indices so
           // the probe sees "slot 1 = cobblestone (read 4 iters ago)" etc.
@@ -824,6 +837,22 @@ export async function runClosedLoopStep(
               if (fp) plan.initialSlotBaselines.set(`${Math.round(s.cx)},${Math.round(s.cy)}`, fp);
             }
             console.log(`[agentbeats] captured initial slot baselines for ${plan.initialSlotBaselines.size} slots`);
+          }
+          // Park-state snapshot: every slot's RGBA patch + cursor-area
+          // patch, taken with cursor parked outside the GUI. Acts as
+          // the pre-state for the next primitive click; the verify
+          // phase replaces it with the post-snapshot. Refresh on
+          // every park-frame WHEN no click is pending and the empty-
+          // cursor baseline already exists — without the baseline the
+          // cursor-state in the snapshot would be null, and the next
+          // verify diff couldn't classify cursorChange.
+          // Spec: docs/superpowers/specs/2026-05-07-park-snapshot-action-verify-design.md
+          if (cursorAtPark && plan.parkEmptyCursorPatch && !plan.pendingClick) {
+            const { takeLayoutSnapshot } = await import("../tools/SnapshotDiff");
+            plan.lastParkSnapshot = takeLayoutSnapshot(payload.obs, layoutForProbe, cursor, plan.iteration, plan.parkEmptyCursorPatch, plan.lastProbeCursor);
+            if (plan.iteration < 3) {
+              console.log(`[agentbeats] park snapshot refreshed: ${plan.lastParkSnapshot.slots.size} slots, cursorHolding=${plan.lastParkSnapshot.cursorHolding}`);
+            }
           }
           // Track transitions to notify the agent of slot updates.
           const slotUpdates: string[] = [];
@@ -1439,28 +1468,10 @@ export async function runClosedLoopStep(
           return { cx: 0, cy: 0 };
         };
         const slotCenter = resolveSlot();
-        // If the click already fired at a measured cursor pixel,
-        // resolve the slot that ACTUALLY contains that pixel. Falls
-        // back to the intended slot when no clickedAt was recorded
-        // (e.g. before fire). The verify, slotMemory write, and
-        // cursorItemSignature update all use this actualSlot so
-        // context reflects what was really clicked even when the
-        // servo missed by a slot.
-        type LayoutSlot = { index: number; name?: string; role?: string; cx: number; cy: number };
-        const actualSlot: LayoutSlot | undefined = (() => {
-          const slots = layout!.slots as LayoutSlot[];
-          const intended = slots[pc.rasterIndex];
-          if (!pc.clickedAt) return intended;
-          let best: LayoutSlot | undefined = undefined;
-          let bestD = Infinity;
-          for (const sx of slots) {
-            const d = Math.hypot(sx.cx - pc.clickedAt.x, sx.cy - pc.clickedAt.y);
-            if (d < bestD) { bestD = d; best = sx; }
-          }
-          return best ?? intended;
-        })();
-        const actualCenter = actualSlot ? { cx: actualSlot.cx, cy: actualSlot.cy } : slotCenter;
-
+        // Note: drift handling now derives "actual clicked slot" from
+        // the snapshot diff in the verify phase (outcome.actualSlot
+        // when kind === "drifted"). No need to compute it here from
+        // pc.clickedAt + layout proximity.
         // Verify-park spot: route the cursor to the SAME park spot
         // used for held-icon detection (outside the GUI, top-right of
         // the window). Reasons:
@@ -1772,165 +1783,130 @@ export async function runClosedLoopStep(
           return emit(defaultMcuAction());
         }
 
-        // === Phase: verify === sample target slot patch, decide
+        // === Phase: verify === park-state snapshot diff
+        // Cursor is already at park (moveAway target = park spot).
+        // Take a fresh snapshot of every slot + cursor area, diff
+        // against plan.lastParkSnapshot, classify the outcome.
+        // Spec: docs/superpowers/specs/2026-05-07-park-snapshot-action-verify-design.md
         if (pc.phase === "verify") {
-          const post = samplePatchFingerprint(payload.obs, slotCenter.cx, slotCenter.cy);
-          if (!post) {
-            console.warn(`[agentbeats] verify: could not sample patch; assuming success`);
+          const { takeLayoutSnapshot, diffSnapshots, classifyOutcome, identifyChangedSlot } = await import("../tools/SnapshotDiff");
+          const postSnap = takeLayoutSnapshot(payload.obs, layout!, cursor, plan.iteration, plan.parkEmptyCursorPatch, plan.lastProbeCursor);
+          const preSnap = plan.lastParkSnapshot;
+          if (!preSnap) {
+            console.warn(`[agentbeats] verify: no pre-snapshot available — accepting click and capturing post as new baseline`);
+            plan.lastParkSnapshot = postSnap;
             plan.pendingClick = null;
             return { kind: "act", action: defaultMcuAction(), holdSteps: 1 };
           }
-          // Strict before/after delta gate. The slot must demonstrably
-          // transition from its pre-click state to the expected post
-          // state — absolute thresholds alone false-positive when the
-          // click missed (slot unchanged, post still looks "filled" so
-          // expectAfter=should_fill matched even though no item moved).
-          // Required: prePatch present + visible delta in stddev + RGB
-          // shift consistent with the expected transition.
-          const meanShift = pc.prePatch
-            ? Math.sqrt(
-                (post.meanR - pc.prePatch.meanR) ** 2
-                + (post.meanG - pc.prePatch.meanG) ** 2
-                + (post.meanB - pc.prePatch.meanB) ** 2,
-              )
-            : 0;
-          const stddevDrop = pc.prePatch ? pc.prePatch.stddev - post.stddev : 0;
-          const stddevRise = pc.prePatch ? post.stddev - pc.prePatch.stddev : 0;
-          // pickup OK: was filled (pre.stddev>35), now empty (post.stddev<30),
-          //            stddev clearly dropped, and RGB mean shifted.
-          const pickupConfirmed = !!pc.prePatch
-            && pc.prePatch.stddev > 35
-            && post.stddev < 30
-            && stddevDrop > 15
-            && meanShift > 15;
-          // place OK: was empty (pre.stddev<30), now filled (post.stddev>35),
-          //           stddev clearly rose, and RGB mean shifted.
-          const placeConfirmed = !!pc.prePatch
-            && pc.prePatch.stddev < 30
-            && post.stddev > 35
-            && stddevRise > 15
-            && meanShift > 15;
-          // Without a pre-patch, refuse to confirm — caller would
-          // otherwise be flying blind on whether anything happened.
-          const matched = pc.expectAfter === "should_empty" ? pickupConfirmed : placeConfirmed;
-          // A successful click mutated the slot's contents — the slot
-          // memory entry (if any) for this absolute pos is now stale.
-          // Forget it; the agent will re-discover via hover if needed.
-          // A successful click mutated the slot. Invalidate the slot's
-          // memory entry; subsequent perception will re-OCR if the
-          // agent decides to verify_slots that slot. We do NOT
-          // speculatively write the cursor's item into the
-          // destination -- per the user's "perception only" rule,
-          // memory only contains entries confirmed by OCR.
-          // Do NOT invalidate slotMemory on matched click. The
-          // per-probe disappear/appear scan handles state changes
-          // from CV evidence -- if we invalidate here, the scan
-          // never sees the "had item X, slot now empty" transition
-          // and the appeared-item match (which depends on knowing
-          // what disappeared) loses its identity link.
-          console.log(
-            `[agentbeats] verify ${pc.slotName ?? pc.rasterIndex}: post.stddev=${post.stddev.toFixed(1)} expect=${pc.expectAfter} -> ${matched ? "OK" : "MISMATCH"} (retry ${pc.retries}/${MAX_RETRIES})`,
-          );
+          const intentKind: "pickup" | "place_one" | "place_all" =
+            pc.actionKind === "place_one" ? "place_one"
+            : pc.actionKind === "place_all" ? "place_all"
+            : "pickup"; // "take" treated as pickup
+          const diff = diffSnapshots(preSnap, postSnap);
+          const outcome = classifyOutcome({ kind: intentKind, targetSlot: pc.rasterIndex }, diff);
+          const slotChangesStr = Array.from(diff.slotChanges.entries()).map(([i, c]) => `${i}:${c}`).join(",") || "(none)";
+          console.log(`[agentbeats] verify ${pc.slotName ?? pc.rasterIndex} ${intentKind}: outcome=${outcome.kind} slotChanges=[${slotChangesStr}] cursor=${diff.cursorChange}`);
           if (deps.debugDir) {
             void deps.recordDebug("verify", {
               type: "verify",
               step,
               data: {
                 slotName: pc.slotName, slotIndex: pc.rasterIndex,
-                slotCenter: { cx: slotCenter.cx, cy: slotCenter.cy },
-                expectAfter: pc.expectAfter,
-                prePatch: pc.prePatch ? { meanR: pc.prePatch.meanR, meanG: pc.prePatch.meanG, meanB: pc.prePatch.meanB, stddev: pc.prePatch.stddev } : null,
-                postPatch: { meanR: post.meanR, meanG: post.meanG, meanB: post.meanB, stddev: post.stddev },
-                matched, retries: pc.retries,
+                intent: intentKind,
+                outcome: outcome.kind,
+                slotChanges: Array.from(diff.slotChanges.entries()),
+                cursorChange: diff.cursorChange,
+                retries: pc.retries,
                 cursor: plan.cursor,
-                actionKind: pc.actionKind, kind: pc.kind,
               },
             });
           }
+          const matched = outcome.kind === "confirmed" || outcome.kind === "drifted";
           if (matched) {
-            state.closedLoopHistory.unshift(`${pc.actionKind ?? pc.kind ?? "click"} slot=${pc.rasterIndex}${pc.slotName ? `(${pc.slotName})` : ""} OK`);
+            // Identity propagation from snapshot diff. The outcome
+            // tells us which slot actually changed (target or drifted
+            // neighbour); update slotMemory + cursorItemSignature
+            // accordingly.
+            //   1. Cursor was holding X, slot newly filled → that
+            //      slot is X (logical certainty, no pixel match).
+            //   2. Slot newly filled with no held context → match
+            //      against known item patches (sim ≥ 0.85), else
+            //      mark unknown.
+            //   3. Slot newly emptied → drop slotMemory entry; if
+            //      pickup intent, that item is now on the cursor.
+            const changedSlotIdx = outcome.kind === "drifted" ? outcome.actualSlot : pc.rasterIndex;
+            const changedSlotLayout = layout!.slots[changedSlotIdx];
+            const drifted = outcome.kind === "drifted";
+            const slotLabel = drifted
+              ? `slot=${changedSlotIdx}(${changedSlotLayout?.name ?? "?"}) [intended ${pc.rasterIndex}(${pc.slotName ?? "?"}) — DRIFTED]`
+              : `slot=${pc.rasterIndex}(${pc.slotName ?? "?"})`;
+            state.closedLoopHistory.unshift(`${pc.actionKind ?? pc.kind ?? "click"} ${slotLabel} OK${drifted ? "" : ""}`);
             state.closedLoopHistory = state.closedLoopHistory.slice(0, 5);
-            // CV-based placement tracking. The matched-verify check
-            // (post.stddev > 35) only confirms the slot LOOKS filled;
-            // it doesn't confirm the placed ITEM is what we wanted.
-            // Compare destination's post-fill RGB to the source's
-            // recorded fingerprint — only if they match within tight
-            // tolerance can we say the placement actually transferred
-            // the intended item. This catches:
-            //   - cursor empty when click fired (no actual placement)
-            //   - cursor swapped with neighbor's item before placing
-            //   - destination already had a different item (swap)
-            if (
-              (pc.actionKind === "place_one" || pc.actionKind === "place_all")
-              && pc.placedItemName
-              && post.stddev > 35
-            ) {
-              // Sample dest fp at the ACTUAL clicked slot center, not
-              // the intended center. If servo missed by a slot,
-              // actualCenter points at the neighbor MC really clicked.
-              const dstFp = samplePatchFingerprint(payload.obs, actualCenter.cx, actualCenter.cy, 6);
-              const fpDist = (a: { meanR: number; meanG: number; meanB: number }, b: { meanR: number; meanG: number; meanB: number }) =>
-                Math.hypot(a.meanR - b.meanR, a.meanG - b.meanG, a.meanB - b.meanB);
-              const stddevRatio = pc.sourceFp && dstFp && pc.sourceFp.stddev > 0
-                ? Math.abs(dstFp.stddev - pc.sourceFp.stddev) / pc.sourceFp.stddev
-                : 1;
-              const cvConfirmed = !!(pc.sourceFp && dstFp && fpDist(dstFp, pc.sourceFp) < 35 && stddevRatio < 0.4);
-              const slotLabel = actualSlot
-                ? `slot=${actualSlot.index}(${actualSlot.name ?? "?"})${actualSlot.index !== pc.rasterIndex ? ` [intended ${pc.rasterIndex}(${pc.slotName ?? "?"}) — DRIFTED]` : ""}`
-                : `slot=${pc.rasterIndex}(${pc.slotName ?? "?"})`;
-              if (cvConfirmed) {
-                plan.slotMemory.record(actualCenter.cx, actualCenter.cy, pc.placedItemName, plan.iteration, dstFp);
-                console.log(`[agentbeats] CV-confirmed placement: ${slotLabel} item=${pc.placedItemName} dst-fp matches source-fp`);
-              } else if (pc.sourceFp && dstFp) {
-                const fd = fpDist(dstFp, pc.sourceFp);
-                console.warn(`[agentbeats] PLACEMENT FP MISMATCH at ${slotLabel}: expected '${pc.placedItemName}' (src.stddev=${pc.sourceFp.stddev.toFixed(1)}) but dst.stddev=${post.stddev.toFixed(1)} fp_dist=${fd.toFixed(1)}; click hit wrong slot or didn't transfer — NOT recording in slotMemory; cursor likely still holds the item`);
-              } else {
-                plan.slotMemory.record(actualCenter.cx, actualCenter.cy, pc.placedItemName, plan.iteration, dstFp ?? undefined);
-                console.log(`[agentbeats] slotMemory write (no sourceFp to compare): ${slotLabel} item=${pc.placedItemName}`);
+            const change = outcome.kind === "drifted" ? outcome.change : (outcome as { change: typeof outcome extends { change: infer C } ? C : never }).change;
+            if (change === "filled→empty") {
+              // Slot emptied. Drop its slotMemory entry. Pickup intent
+              // → cursor now carries that slot's item.
+              if (changedSlotLayout) {
+                const sourceMem = plan.slotMemory.lookup(changedSlotLayout.cx, changedSlotLayout.cy);
+                plan.slotMemory.invalidate(changedSlotLayout.cx, changedSlotLayout.cy);
+                if (intentKind === "pickup") {
+                  plan.cursorItemSignature = sourceMem?.item && sourceMem.item !== "empty" && sourceMem.item !== "unknown"
+                    ? { meanR: 0, meanG: 0, meanB: 0, item: sourceMem.item }
+                    : { meanR: 0, meanG: 0, meanB: 0 };
+                  console.log(`[agentbeats] pickup confirmed: ${slotLabel} cursor now holds '${plan.cursorItemSignature.item ?? "?"}'`);
+                }
               }
-            } else if ((pc.actionKind === "place_one" || pc.actionKind === "place_all") && pc.placedItemName) {
-              console.warn(`[agentbeats] place verify matched but stddev=${post.stddev.toFixed(1)} too low to confirm fill — skipping slotMemory write for slot=${pc.rasterIndex}(${pc.slotName ?? "?"})`);
-            }
-            // Record / clear cursorItemSignature based on this click,
-            // gated by CV-evidence:
-            //   pickup OK   -> cursor now carries the item; capture
-            //                  source's prePatch RGB as the signature.
-            //   place_all / auto_return OK + CV-confirmed dst-fp ≈
-            //   src-fp -> cursor is now empty (placement transferred).
-            //   place_all / auto_return OK but CV-MISMATCH -> click
-            //   verified post.stddev change but the item didn't
-            //   actually transfer; keep cursorItemSignature so the
-            //   agent knows it's still holding (e.g. accidentally
-            //   swapped with neighbor mid-chain).
-            if (pc.actionKind === "pickup" && pc.prePatch) {
-              // Cursor now holds whatever was at the ACTUAL clicked
-              // slot — not the intended slot. If servo drifted into a
-              // neighbor, the cursor picked up the neighbor's item.
-              // Use actualCenter to look up which item went on cursor.
-              const sourceMem = plan.slotMemory.lookup(actualCenter.cx, actualCenter.cy);
-              plan.cursorItemSignature = {
-                meanR: pc.prePatch.meanR,
-                meanG: pc.prePatch.meanG,
-                meanB: pc.prePatch.meanB,
-                item: sourceMem?.item && sourceMem.item !== "empty" && sourceMem.item !== "unknown" ? sourceMem.item : undefined,
-              };
-              const drifted = actualSlot && actualSlot.index !== pc.rasterIndex;
-              console.log(`[agentbeats] cursorItemSignature set from pickup ${actualSlot?.name ?? pc.slotName ?? pc.rasterIndex}: item=${plan.cursorItemSignature.item ?? "?"} rgb=(${pc.prePatch.meanR.toFixed(0)},${pc.prePatch.meanG.toFixed(0)},${pc.prePatch.meanB.toFixed(0)})${drifted ? ` [DRIFTED from intended ${pc.slotName ?? pc.rasterIndex}]` : ""}`);
-              // The actual clicked slot is now empty (we picked from
-              // it). Invalidate its slotMemory entry so context
-              // reflects reality.
-              plan.slotMemory.invalidate(actualCenter.cx, actualCenter.cy);
-            } else if (pc.actionKind === "place_all" || pc.kind === "auto_return") {
-              // CV-verify the placement before clearing cursor signature.
-              const dstFp = samplePatchFingerprint(payload.obs, slotCenter.cx, slotCenter.cy, 6);
-              const fpDist = (a: { meanR: number; meanG: number; meanB: number }, b: { meanR: number; meanG: number; meanB: number }) =>
-                Math.hypot(a.meanR - b.meanR, a.meanG - b.meanG, a.meanB - b.meanB);
-              const cvConfirmed = !!(pc.sourceFp && dstFp && fpDist(dstFp, pc.sourceFp) < 35
-                && (pc.sourceFp.stddev === 0 || Math.abs(dstFp.stddev - pc.sourceFp.stddev) / pc.sourceFp.stddev < 0.4));
-              if (cvConfirmed || !pc.sourceFp) {
+            } else if (change === "empty→filled" || change === "swapped") {
+              // Slot filled. Identity from cursor first, else pixel match.
+              const newPatch = postSnap.slots.get(changedSlotIdx);
+              let placedItem: string | undefined = undefined;
+              if (intentKind === "place_one" || intentKind === "place_all") {
+                placedItem = plan.cursorItemSignature?.item ?? pc.placedItemName ?? undefined;
+              }
+              if (!placedItem && newPatch) {
+                const known: Array<{ item: string; patch?: typeof newPatch }> = [];
+                for (const e of plan.slotMemory.snapshot()) if (e.patch) known.push({ item: e.item, patch: e.patch });
+                const id = identifyChangedSlot(newPatch, known);
+                if (id) placedItem = id.item;
+              }
+              if (changedSlotLayout) {
+                if (placedItem) {
+                  const fp = samplePatchFingerprint(payload.obs, changedSlotLayout.cx, changedSlotLayout.cy, 6) ?? undefined;
+                  plan.slotMemory.record(changedSlotLayout.cx, changedSlotLayout.cy, placedItem, plan.iteration, fp, newPatch ?? undefined);
+                  console.log(`[agentbeats] place confirmed: ${slotLabel} item=${placedItem}`);
+                } else {
+                  console.warn(`[agentbeats] place confirmed but identity unknown: ${slotLabel}`);
+                }
+              }
+              // Cursor delta: place_all / final place_one → cursor empties.
+              if (diff.cursorChange === "holding→empty") {
                 plan.cursorItemSignature = null;
-              } else {
-                console.warn(`[agentbeats] cursor still HOLDING after place verify: dst-fp at slot ${pc.rasterIndex} doesn't match source-fp; keeping cursorItemSignature so Planner sees holding state`);
+                console.log(`[agentbeats] cursor empty after place`);
+              }
+            }
+            // Update lastParkSnapshot to the new post-snapshot so the
+            // next click's diff has the correct pre-state.
+            plan.lastParkSnapshot = postSnap;
+            // Auto-tick the active FastUI checklist item when verify
+            // confirms the action it dispatched. The Planner LLM is
+            // unreliable at marking primitive-click subtasks done from
+            // recent_history alone — runtime has authoritative info
+            // (intent + slot delta), so resolve the bookkeeping here
+            // rather than ask the LLM to infer it.
+            if (plan.activeChecklistIdx >= 0
+                && plan.activeChecklistIdx < plan.checklist.length
+                && !plan.checklist[plan.activeChecklistIdx].done) {
+              const active = plan.checklist[plan.activeChecklistIdx];
+              const taskKind = (active.task as { kind?: string })?.kind;
+              const placedHere = (intentKind === "place_one" || intentKind === "place_all")
+                && (change === "empty→filled" || change === "swapped");
+              const pickedHere = intentKind === "pickup" && change === "filled→empty";
+              if (taskKind === "place_in_craft_grid" && placedHere) {
+                active.done = true;
+                console.log(`[agentbeats] auto-tick checklist[${plan.activeChecklistIdx}] (${active.id}) done — place confirmed`);
+              } else if (taskKind === "take_result" && pickedHere) {
+                active.done = true;
+                console.log(`[agentbeats] auto-tick checklist[${plan.activeChecklistIdx}] (${active.id}) done — take confirmed`);
               }
             }
             // Arm Planner re-judge after the LAST click in a chain
@@ -1955,142 +1931,53 @@ export async function runClosedLoopStep(
             }
             return { kind: "act", action: defaultMcuAction(), holdSteps: 1 };
           }
-          // Mismatch path: CV said the click did not produce the
-          // expected slot state. CV is fooled by rendering noise
-          // around freshly-emptied slots and ambiguous icon variance.
-          // On the FIRST mismatch only, ask the VLM for a second
-          // opinion before burning a retry. If the VLM agrees the
-          // expected state holds, accept as success and advance the
-          // chain. (Cheap: at most one extra VLM call per click.)
-          if (pc.retries === 0 && deps.apiKey) {
-            try {
-              const vlmOk = await vlmVerifySlotState({
-                client: deps.client,
-                model: deps.model,
-                obsBase64: payload.obs,
-                slot: { cx: slotCenter.cx, cy: slotCenter.cy, name: pc.slotName },
-                expectAfter: pc.expectAfter,
-                taskTarget: plan.taskText,
-              });
-              if (vlmOk === true) {
-                console.log(`[agentbeats] VLM sub-verify says ${pc.expectAfter} HOLDS for ${pc.slotName ?? pc.rasterIndex} (CV was fooled, post.stddev=${post.stddev.toFixed(1)}); accepting as success`);
-                state.closedLoopHistory.unshift(`${pc.actionKind ?? pc.kind ?? "click"} slot=${pc.rasterIndex}${pc.slotName ? `(${pc.slotName})` : ""} OK (VLM-verified)`);
-                state.closedLoopHistory = state.closedLoopHistory.slice(0, 5);
-                const next = plan.pendingChain.shift();
-                if (next) {
-                  next.phase = "servo";
-                  next.retries = 0;
-                  next.prePatch = undefined;
-                  plan.pendingClick = next;
-                  plan.servoSteps = 0;
-                  console.log(`[agentbeats] chain advance -> ${next.actionKind ?? next.kind} slot=${next.rasterIndex}(${next.slotName ?? "?"}) (${plan.pendingChain.length} more queued)`);
-                } else {
-                  plan.pendingClick = null;
+          // Mismatch path: outcome was no_op or anomaly.
+          //  - no_op: nothing changed → click missed → retry up to MAX_RETRIES.
+          //  - anomaly: unexpected pattern → log, accept observed
+          //    changes (so context reflects reality), advance.
+          if (outcome.kind === "anomaly") {
+            console.warn(`[agentbeats] anomaly: ${outcome.reason} — accepting observed changes and advancing`);
+            // Accept all observed slot changes into slotMemory.
+            for (const [idx, ch] of diff.slotChanges) {
+              const sl = layout!.slots[idx];
+              if (!sl) continue;
+              if (ch === "filled→empty") {
+                plan.slotMemory.invalidate(sl.cx, sl.cy);
+              } else {
+                const newPatch = postSnap.slots.get(idx);
+                let item: string | undefined = plan.cursorItemSignature?.item;
+                if (!item && newPatch) {
+                  const known: Array<{ item: string; patch?: typeof newPatch }> = [];
+                  for (const e of plan.slotMemory.snapshot()) if (e.patch) known.push({ item: e.item, patch: e.patch });
+                  const id = identifyChangedSlot(newPatch, known);
+                  if (id) item = id.item;
                 }
-                return { kind: "act", action: defaultMcuAction(), holdSteps: 1 };
-              }
-            } catch (e) {
-              console.warn(`[agentbeats] VLM sub-verify call failed: ${e instanceof Error ? e.message : String(e)}; falling through to retry`);
-            }
-          }
-          // Auto-return rescue: when the auto_return click MISMATCHES
-          // (source slot still empty / wrong content after the click),
-          // the cursor still holds the leftover stack — but the click
-          // didn't drop. Often this happens because the click landed
-          // on a neighboring slot with a different item, which would
-          // SWAP and corrupt state. Redirect the cursor to ANY empty
-          // slot in the same row (or a nearby empty hotbar/main_inv
-          // slot) so the cursor ends up empty without poisoning a
-          // tracked source. Keep the cursor's-arm-empty invariant.
-          if (pc.kind === "auto_return" && payload.obs) {
-            type LayoutSlot = { index: number; name?: string; role?: string; cx: number; cy: number };
-            const layoutSnap = (plan.sessionLayout as { slots: LayoutSlot[] } | null)?.slots ?? [];
-            const obsForRescue = payload.obs;
-            // Neighbor-corruption sweep: the click may have landed on
-            // an adjacent slot (servo error / cursor-tip offset) and
-            // swapped whatever was there onto the cursor. Any tracked
-            // slot within ~14 px of the click target whose live patch
-            // significantly differs from its OCR baseline is suspect
-            // — invalidate its slotMemory entry so downstream code
-            // doesn't trust a stale identity.
-            for (const s of layoutSnap) {
-              if (s.role !== "hotbar" && s.role !== "main_inv") continue;
-              if (Math.hypot(s.cx - slotCenter.cx, s.cy - slotCenter.cy) > 14) continue;
-              if (s.index === pc.rasterIndex) continue;
-              const mem = plan.slotMemory.lookup(s.cx, s.cy);
-              if (!mem || !mem.fingerprint || mem.item === "empty" || mem.item === "unknown") continue;
-              const live = samplePatchFingerprint(obsForRescue, s.cx, s.cy, 6);
-              if (!live) continue;
-              const dr = live.meanR - mem.fingerprint.meanR;
-              const dg = live.meanG - mem.fingerprint.meanG;
-              const db = live.meanB - mem.fingerprint.meanB;
-              const dist = Math.sqrt(dr * dr + dg * dg + db * db);
-              if (dist > 35) {
-                plan.slotMemory.invalidate(s.cx, s.cy);
-                console.warn(`[agentbeats] auto_return neighbor-corruption: slot ${s.index}(${s.name ?? "?"}) drifted ${dist.toFixed(0)} from baseline; invalidating slotMemory entry (may have been accidentally swapped)`);
+                if (item) {
+                  const fp = samplePatchFingerprint(payload.obs, sl.cx, sl.cy, 6) ?? undefined;
+                  plan.slotMemory.record(sl.cx, sl.cy, item, plan.iteration, fp, newPatch ?? undefined);
+                }
               }
             }
-            // STRICT rescue criterion: dump the cursor's contents at
-            // ANY empty hotbar/main_inv slot that's NOT in slotMemory,
-            // NOT in the corrupted-neighbor radius, and CV-confirmed
-            // empty (stddev < 25). Prefer same-row slots, then any
-            // safe slot anywhere. This keeps the cursor empty even
-            // when the original auto_return target is unsafe.
-            const isEmptyAndUntracked = (s: LayoutSlot): boolean => {
-              if (s.index === pc.rasterIndex) return false;
-              if (s.role !== "hotbar" && s.role !== "main_inv") return false;
-              if (Math.hypot(s.cx - slotCenter.cx, s.cy - slotCenter.cy) <= 14) return false;
-              const mem = plan.slotMemory.lookup(s.cx, s.cy);
-              if (mem && mem.item !== "empty" && mem.item !== "unknown") return false;
-              const patch = samplePatchFingerprint(obsForRescue, s.cx, s.cy, 12);
-              return !!patch && patch.stddev < 25;
-            };
-            const sameRowEmpty: LayoutSlot | undefined =
-              layoutSnap.find((s) => isEmptyAndUntracked(s) && Math.abs(s.cy - slotCenter.cy) <= 6)
-              ?? layoutSnap.find(isEmptyAndUntracked);
-            if (sameRowEmpty) {
-              const rescueName = sameRowEmpty.name ?? `slot${sameRowEmpty.index}`;
-              console.warn(`[agentbeats] auto_return MISMATCH at slot ${pc.rasterIndex}; redirecting cursor dump to empty slot ${sameRowEmpty.index}(${rescueName})`);
-              state.closedLoopHistory.unshift(`auto_return rescue -> ${rescueName}`);
-              state.closedLoopHistory = state.closedLoopHistory.slice(0, 5);
-              plan.pendingClick = {
-                rasterIndex: sameRowEmpty.index,
-                slotName: sameRowEmpty.name,
-                slotRole: sameRowEmpty.role,
-                frozenTarget: { x: sameRowEmpty.cx, y: sameRowEmpty.cy },
-                button: "attack",
-                shift: false,
-                expectAfter: "should_fill",
-                phase: "servo",
-                retries: 0,
-                kind: "auto_return",
-                actionKind: "place_all",
-              };
-              plan.servoSteps = 0;
-              return { kind: "act", action: defaultMcuAction(), holdSteps: 1 };
-            }
+            if (diff.cursorChange === "holding→empty") plan.cursorItemSignature = null;
+            plan.lastParkSnapshot = postSnap;
+            plan.pendingClick = null;
+            plan.pendingChain = [];
+            return { kind: "act", action: defaultMcuAction(), holdSteps: 1 };
           }
-          // FastUI Action-agent path: NO IBVS retries — any mismatch
-          // immediately ends the chain and hands control back to the
-          // Planner. The Planner will observe the current state and
-          // either tick the subtask done (if observation supports it),
-          // re-dispatch, or replace it. Legacy probe path keeps the
-          // retry loop for backwards compat.
+          // no_op: retry up to MAX_RETRIES, then abort.
           const inActionAgentMode = plan.checklist.length > 0 && plan.activeChecklistIdx >= 0;
           if (!inActionAgentMode && pc.retries < MAX_RETRIES) {
             pc.retries += 1;
             pc.phase = "servo";
             plan.servoSteps = 0;
-            console.log(`[agentbeats] RETRY click on ${pc.slotName ?? pc.rasterIndex} (attempt ${pc.retries + 1}/${MAX_RETRIES + 1})`);
+            console.log(`[agentbeats] RETRY click on ${pc.slotName ?? pc.rasterIndex} (attempt ${pc.retries + 1}/${MAX_RETRIES + 1}) — no observable change`);
             return { kind: "act", action: defaultMcuAction(), holdSteps: 1 };
           }
-          // Retries exhausted OR action-agent mode (no retries). Surface
-          // back to VLM/Planner — drop the rest of the chain too so the
-          // next layer can replan from current observed state.
-          const failureLabel = `${pc.actionKind ?? pc.kind ?? "click"} slot=${pc.rasterIndex}${pc.slotName ? `(${pc.slotName})` : ""} FAILED post.stddev=${post.stddev.toFixed(0)}`;
+          const failureLabel = `${pc.actionKind ?? pc.kind ?? "click"} slot=${pc.rasterIndex}${pc.slotName ? `(${pc.slotName})` : ""} FAILED (no observable change)`;
           state.closedLoopHistory.unshift(`${failureLabel} (chain aborted; ${plan.pendingChain.length} dropped)`);
           state.closedLoopHistory = state.closedLoopHistory.slice(0, 5);
           console.warn(`[agentbeats] ${failureLabel}; retries exhausted; clearing chain (${plan.pendingChain.length} dropped) and returning to VLM`);
+          plan.lastParkSnapshot = postSnap;
           plan.pendingClick = null;
           plan.pendingChain = [];
           return { kind: "act", action: defaultMcuAction(), holdSteps: 1 };

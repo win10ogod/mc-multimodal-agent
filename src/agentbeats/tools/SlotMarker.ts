@@ -174,10 +174,12 @@ export function markInventoryFrame(jpegBase64: string, sessionLayout?: GuiLayout
   const h = decoded.height;
   const px = Buffer.from(decoded.data.buffer, decoded.data.byteOffset, decoded.data.byteLength);
 
-  // The MC sim's JPEGs come out of jpeg-js in BGRA byte order despite
-  // formatAsRGBA. Swap R<->B once HERE so subsequent mark drawing can
-  // use ordinary RGB color literals like [255,255,0] for yellow, and
-  // the PNG write at the end is a straight copy.
+  // jpeg-js with formatAsRGBA returns BGR byte order despite the
+  // option name. We swap R↔B once HERE so the resulting PNG file is
+  // in correct RGBA byte order — the LLMs see Steve's shirt as cyan
+  // (not yellow), and downstream consumers (Action/Planner debug
+  // dumps that save the PNG directly) get true-color images.
+  // DebugRecorder skips the swap for PNG inputs to avoid double-swap.
   for (let i = 0; i < px.length; i += 4) {
     const r = px[i];
     px[i] = px[i + 2];
