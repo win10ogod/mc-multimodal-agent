@@ -1389,6 +1389,27 @@ export async function runClosedLoopStep(
           return { cx: 0, cy: 0 };
         };
         const slotCenter = resolveSlot();
+        // If the click already fired at a measured cursor pixel,
+        // resolve the slot that ACTUALLY contains that pixel. Falls
+        // back to the intended slot when no clickedAt was recorded
+        // (e.g. before fire). The verify, slotMemory write, and
+        // cursorItemSignature update all use this actualSlot so
+        // context reflects what was really clicked even when the
+        // servo missed by a slot.
+        type LayoutSlot = { index: number; name?: string; role?: string; cx: number; cy: number };
+        const actualSlot: LayoutSlot | undefined = (() => {
+          const slots = layout!.slots as LayoutSlot[];
+          const intended = slots[pc.rasterIndex];
+          if (!pc.clickedAt) return intended;
+          let best: LayoutSlot | undefined = undefined;
+          let bestD = Infinity;
+          for (const sx of slots) {
+            const d = Math.hypot(sx.cx - pc.clickedAt.x, sx.cy - pc.clickedAt.y);
+            if (d < bestD) { bestD = d; best = sx; }
+          }
+          return best ?? intended;
+        })();
+        const actualCenter = actualSlot ? { cx: actualSlot.cx, cy: actualSlot.cy } : slotCenter;
 
         // Safe spot to move cursor to for verification: somewhere
         // inside the inventory window away from the just-clicked slot.
@@ -1616,7 +1637,25 @@ export async function runClosedLoopStep(
             if (pc.shift) action.sneak = 1;
             pc.phase = "fired";
             plan.servoSteps = 0;
-            console.log(`[agentbeats] click ${pc.slotName ?? pc.rasterIndex} (${pc.button}${pc.shift ? "+sneak" : ""}) prePatch.stddev=${pc.prePatch?.stddev.toFixed(1) ?? "?"}`);
+            // Record the cursor's ACTUAL pixel position at the moment
+            // the click fired — MC interprets the click at this pixel,
+            // not at the intended slot center. The verify path uses
+            // this to find which layout slot CONTAINS that pixel
+            // (the slot MC actually clicked). All slotMemory and
+            // cursor-state updates downstream key off the actual slot,
+            // so context reflects reality even when servo lands a few
+            // pixels off and clicks a NEIGHBOR slot instead.
+            if (cursor) {
+              pc.clickedAt = { x: cursor.x, y: cursor.y };
+              const intendedSlot = layout!.slots[pc.rasterIndex];
+              if (intendedSlot) {
+                const drift = Math.hypot(cursor.x - intendedSlot.cx, cursor.y - intendedSlot.cy);
+                if (drift > 6) {
+                  console.warn(`[agentbeats] click landed off intended slot ${pc.rasterIndex}(${pc.slotName ?? "?"}) by ${drift.toFixed(1)}px — actual click pixel (${cursor.x},${cursor.y}); verify will resolve to actual slot from layout`);
+                }
+              }
+            }
+            console.log(`[agentbeats] click ${pc.slotName ?? pc.rasterIndex} (${pc.button}${pc.shift ? "+sneak" : ""}) at cursor=(${cursor?.x},${cursor?.y}) prePatch.stddev=${pc.prePatch?.stddev.toFixed(1) ?? "?"}`);
             return emit(action);
           }
           if (stepResult) {
@@ -1749,23 +1788,28 @@ export async function runClosedLoopStep(
               && pc.placedItemName
               && post.stddev > 35
             ) {
-              const dstFp = samplePatchFingerprint(payload.obs, slotCenter.cx, slotCenter.cy, 6);
+              // Sample dest fp at the ACTUAL clicked slot center, not
+              // the intended center. If servo missed by a slot,
+              // actualCenter points at the neighbor MC really clicked.
+              const dstFp = samplePatchFingerprint(payload.obs, actualCenter.cx, actualCenter.cy, 6);
               const fpDist = (a: { meanR: number; meanG: number; meanB: number }, b: { meanR: number; meanG: number; meanB: number }) =>
                 Math.hypot(a.meanR - b.meanR, a.meanG - b.meanG, a.meanB - b.meanB);
               const stddevRatio = pc.sourceFp && dstFp && pc.sourceFp.stddev > 0
                 ? Math.abs(dstFp.stddev - pc.sourceFp.stddev) / pc.sourceFp.stddev
                 : 1;
               const cvConfirmed = !!(pc.sourceFp && dstFp && fpDist(dstFp, pc.sourceFp) < 35 && stddevRatio < 0.4);
+              const slotLabel = actualSlot
+                ? `slot=${actualSlot.index}(${actualSlot.name ?? "?"})${actualSlot.index !== pc.rasterIndex ? ` [intended ${pc.rasterIndex}(${pc.slotName ?? "?"}) — DRIFTED]` : ""}`
+                : `slot=${pc.rasterIndex}(${pc.slotName ?? "?"})`;
               if (cvConfirmed) {
-                plan.slotMemory.record(slotCenter.cx, slotCenter.cy, pc.placedItemName, plan.iteration, dstFp);
-                console.log(`[agentbeats] CV-confirmed placement: slot=${pc.rasterIndex}(${pc.slotName ?? "?"}) item=${pc.placedItemName} dst-fp matches source-fp`);
+                plan.slotMemory.record(actualCenter.cx, actualCenter.cy, pc.placedItemName, plan.iteration, dstFp);
+                console.log(`[agentbeats] CV-confirmed placement: ${slotLabel} item=${pc.placedItemName} dst-fp matches source-fp`);
               } else if (pc.sourceFp && dstFp) {
                 const fd = fpDist(dstFp, pc.sourceFp);
-                console.warn(`[agentbeats] PLACEMENT FP MISMATCH at slot=${pc.rasterIndex}(${pc.slotName ?? "?"}): expected '${pc.placedItemName}' (src.stddev=${pc.sourceFp.stddev.toFixed(1)}) but dst.stddev=${post.stddev.toFixed(1)} fp_dist=${fd.toFixed(1)}; click hit wrong slot or didn't transfer — NOT recording in slotMemory; cursor likely still holds the item`);
+                console.warn(`[agentbeats] PLACEMENT FP MISMATCH at ${slotLabel}: expected '${pc.placedItemName}' (src.stddev=${pc.sourceFp.stddev.toFixed(1)}) but dst.stddev=${post.stddev.toFixed(1)} fp_dist=${fd.toFixed(1)}; click hit wrong slot or didn't transfer — NOT recording in slotMemory; cursor likely still holds the item`);
               } else {
-                // No source fp available — fall back to plain placedItemName write.
-                plan.slotMemory.record(slotCenter.cx, slotCenter.cy, pc.placedItemName, plan.iteration, dstFp ?? undefined);
-                console.log(`[agentbeats] slotMemory write (no sourceFp to compare): slot=${pc.rasterIndex}(${pc.slotName ?? "?"}) item=${pc.placedItemName}`);
+                plan.slotMemory.record(actualCenter.cx, actualCenter.cy, pc.placedItemName, plan.iteration, dstFp ?? undefined);
+                console.log(`[agentbeats] slotMemory write (no sourceFp to compare): ${slotLabel} item=${pc.placedItemName}`);
               }
             } else if ((pc.actionKind === "place_one" || pc.actionKind === "place_all") && pc.placedItemName) {
               console.warn(`[agentbeats] place verify matched but stddev=${post.stddev.toFixed(1)} too low to confirm fill — skipping slotMemory write for slot=${pc.rasterIndex}(${pc.slotName ?? "?"})`);
@@ -1782,18 +1826,23 @@ export async function runClosedLoopStep(
             //   agent knows it's still holding (e.g. accidentally
             //   swapped with neighbor mid-chain).
             if (pc.actionKind === "pickup" && pc.prePatch) {
-              // What item is on the cursor? Look up the source slot
-              // in slotMemory — the item that was THERE before pickup
-              // is now on the cursor. Far more reliable than trying
-              // to identify the held-item icon pixels directly.
-              const sourceMem = plan.slotMemory.lookup(slotCenter.cx, slotCenter.cy);
+              // Cursor now holds whatever was at the ACTUAL clicked
+              // slot — not the intended slot. If servo drifted into a
+              // neighbor, the cursor picked up the neighbor's item.
+              // Use actualCenter to look up which item went on cursor.
+              const sourceMem = plan.slotMemory.lookup(actualCenter.cx, actualCenter.cy);
               plan.cursorItemSignature = {
                 meanR: pc.prePatch.meanR,
                 meanG: pc.prePatch.meanG,
                 meanB: pc.prePatch.meanB,
                 item: sourceMem?.item && sourceMem.item !== "empty" && sourceMem.item !== "unknown" ? sourceMem.item : undefined,
               };
-              console.log(`[agentbeats] cursorItemSignature set from pickup ${pc.slotName ?? pc.rasterIndex}: item=${plan.cursorItemSignature.item ?? "?"} rgb=(${pc.prePatch.meanR.toFixed(0)},${pc.prePatch.meanG.toFixed(0)},${pc.prePatch.meanB.toFixed(0)})`);
+              const drifted = actualSlot && actualSlot.index !== pc.rasterIndex;
+              console.log(`[agentbeats] cursorItemSignature set from pickup ${actualSlot?.name ?? pc.slotName ?? pc.rasterIndex}: item=${plan.cursorItemSignature.item ?? "?"} rgb=(${pc.prePatch.meanR.toFixed(0)},${pc.prePatch.meanG.toFixed(0)},${pc.prePatch.meanB.toFixed(0)})${drifted ? ` [DRIFTED from intended ${pc.slotName ?? pc.rasterIndex}]` : ""}`);
+              // The actual clicked slot is now empty (we picked from
+              // it). Invalidate its slotMemory entry so context
+              // reflects reality.
+              plan.slotMemory.invalidate(actualCenter.cx, actualCenter.cy);
             } else if (pc.actionKind === "place_all" || pc.kind === "auto_return") {
               // CV-verify the placement before clearing cursor signature.
               const dstFp = samplePatchFingerprint(payload.obs, slotCenter.cx, slotCenter.cy, 6);

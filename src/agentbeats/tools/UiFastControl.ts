@@ -483,6 +483,16 @@ export type PendingClick = {
    *  dissimilar, the click missed/swapped — log + do NOT record (and
    *  keep cursorItemSignature so the agent knows it still holds). */
   sourceFp?: { meanR: number; meanG: number; meanB: number; stddev: number };
+  /** Cursor's actual pixel position at the moment the click fired.
+   *  May differ from the intended slot center (servo precision is
+   *  finite). The verify step looks up which layout slot CONTAINS
+   *  this pixel — that's the slot MC actually applied the click to.
+   *  All slotMemory + cursor-state updates use this ACTUAL slot, so
+   *  context reflects what really happened, not what was intended.
+   *  E.g., if cursor was at (303, 247) when click fired but pc
+   *  targeted slot 38 at (260, 247), MC actually clicked slot 41 —
+   *  Pickup metadata gets associated with slot 41, not 38. */
+  clickedAt?: { x: number; y: number };
 };
 
 export type ClosedLoopCraftPlan = {
