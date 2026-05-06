@@ -1408,6 +1408,15 @@ export async function runClosedLoopStep(
               }
               const expectAfter: "should_empty" | "should_fill" =
                 (probed.action === "place_one" || probed.action === "place_all") ? "should_fill" : "should_empty";
+              // Record what item the cursor is about to drop. Verify
+              // uses this to write slotMemory[dest] = item on confirmed
+              // placement — without it, the place verify can't identify
+              // the placed item and slotMemory loses the destination
+              // entry, leaving the next planner call blind to a slot
+              // we just deterministically filled.
+              const placedItemName = (probed.action === "place_one" || probed.action === "place_all")
+                ? plan.cursorItemSignature?.item
+                : undefined;
               plan.pendingClick = {
                 rasterIndex: probed.slot,
                 slotName: probedSlot.name,
@@ -1420,6 +1429,7 @@ export async function runClosedLoopStep(
                 retries: 0,
                 kind: "click",
                 actionKind: probed.action as "pickup" | "place_one" | "place_all" | "take",
+                ...(placedItemName ? { placedItemName } : {}),
               };
               plan.servoSteps = 0;
               state.closedLoopHistory.unshift(`${probed.action} slot=${probed.slot}${probedSlot.name ? `(${probedSlot.name})` : ""}`);
@@ -1870,13 +1880,14 @@ export async function runClosedLoopStep(
                 if (id) placedItem = id.item;
               }
               if (changedSlotLayout) {
-                if (placedItem) {
-                  const fp = samplePatchFingerprint(payload.obs, changedSlotLayout.cx, changedSlotLayout.cy, 6) ?? undefined;
-                  plan.slotMemory.record(changedSlotLayout.cx, changedSlotLayout.cy, placedItem, plan.iteration, fp, newPatch ?? undefined);
-                  console.log(`[agentbeats] place confirmed: ${slotLabel} item=${placedItem}`);
-                } else {
-                  console.warn(`[agentbeats] place confirmed but identity unknown: ${slotLabel}`);
-                }
+                // ALWAYS record — the slot is deterministically filled
+                // per the verify outcome. If we don't know the item,
+                // fall back to "unknown"; the next planner call sees
+                // the slot is occupied and won't re-place there.
+                const itemToRecord = placedItem ?? "unknown";
+                const fp = samplePatchFingerprint(payload.obs, changedSlotLayout.cx, changedSlotLayout.cy, 6) ?? undefined;
+                plan.slotMemory.record(changedSlotLayout.cx, changedSlotLayout.cy, itemToRecord, plan.iteration, fp, newPatch ?? undefined);
+                console.log(`[agentbeats] place confirmed: ${slotLabel} item=${itemToRecord}`);
               }
               // Cursor delta: place_all / final place_one → cursor empties.
               if (diff.cursorChange === "holding→empty") {
