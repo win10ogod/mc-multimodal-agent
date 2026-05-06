@@ -1010,6 +1010,18 @@ export async function runClosedLoopStep(
               state.closedLoopHistory.unshift(`recipe_lookup '${probed.item}' -> ${r.target} (${ingStr})`);
               state.closedLoopHistory = state.closedLoopHistory.slice(0, 5);
               console.log(`[agentbeats] recipe_lookup '${probed.item}' resolved: ingredients=${ingStr} inShape=${r.inShape ? "yes" : "no"}`);
+              // Hard prerequisite check: a 3x3-shaped recipe (or
+              // shapeless with > 4 unique cells needed) cannot be
+              // crafted in the player_inventory's 2x2 grid. Report
+              // BLOCKED so the GoalPlanner places a crafting_table
+              // and re-dispatches inventory after.
+              const craftCells = layoutForProbe.slots.filter((s) => s.role === "craft_2x2" || s.role === "craft_3x3").length;
+              const need3x3 = (r.inShape && (r.inShape.length > 2 || r.inShape.some((row) => row.length > 2)))
+                || (!r.inShape && r.ingredients.reduce((sum, it) => sum + it.count, 0) > 4);
+              if (need3x3 && craftCells <= 4) {
+                console.warn(`[agentbeats] ${r.target} needs a 3x3 grid but the open GUI only has ${craftCells} craft cells (player_inventory 2x2). Reporting BLOCKED.`);
+                return { kind: "subgoal_failed", reason: `BLOCKED: need a crafting_table 3x3 GUI to craft ${r.target}` };
+              }
               try {
                 const knownSlotsForPlanner = plan.slotMemory.snapshot()
                   .filter((e) => e.item && e.item !== "empty")
