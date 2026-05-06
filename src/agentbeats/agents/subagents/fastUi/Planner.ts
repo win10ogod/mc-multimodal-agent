@@ -99,9 +99,16 @@ Subtask kinds (with explicit slot indices):
 - wait_for_output { expectedItem }: wait for furnace/brewing output.
 - verify_state { condition }: confirm a non-action condition holds.
 
-CURSOR INVARIANT: before pickup, cursor must be empty. Before place_*, cursor must hold the expected item. If state diverges (cursor holds wrong item, slot empty when expected, etc.) insert the recovery primitive (place_all to dump, pickup again, etc.) and re-plan from there.
+CURSOR INVARIANT: before pickup, cursor must be empty. Before place_*, cursor must hold the expected item.
 
-On post_action calls: runtime has already auto-ticked subtasks whose primitive was confirmed. Read current_checklist for what's done. RE-PLAN only when state diverged. Preserve done flags and attempts; never decrement attempts.
+RE-PLAN MANDATE — read this every post_action call. If ANY of the following holds, you MUST modify the checklist (insert / replace / re-order steps); do NOT just preserve the prior list and bump next_idx:
+  1. Cursor holds an item that the next pending subtask doesn't expect (e.g. next is pickup but cursor non-empty; next is place_one cobblestone but cursor holds quartz). Insert a recovery primitive (place_all to dump cursor into a known-empty slot, then re-pickup the right item) BEFORE the original next step.
+  2. A pending pickup's sourceSlot doesn't actually hold the expected item per Known (drifted, swapped, or never was). Update sourceSlot to a slot that DOES hold the expected item, OR insert a verify_items_visible to find one.
+  3. A pending place_*'s destSlot already holds a different item (would swap and corrupt). Pick a different empty destSlot, OR insert a recovery to clear the dest first.
+  4. Recent_history shows a primitive failed (no observable change after retries). Replace that step with a verify_items_visible to refresh tracking, or pick a different sourceSlot/destSlot.
+  5. Known shows the recipe target item is already in a regular slot (task already complete). Set all_done=true, next_idx=-1.
+
+Preserve done flags from current_checklist (the runtime ticked them). Preserve or increment attempts; never decrement.
 
 Output strict JSON:
   { "all_done": bool, "next_idx": int (-1 if all_done), "checklist": [...] }
