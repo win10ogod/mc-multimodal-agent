@@ -39,11 +39,13 @@ const SCHEMA = {
 
 const SYS = `You execute ONE PRIMITIVE subtask in a Minecraft GUI. The subtask already specifies the exact slot and the expected cursor state. Your job is to verify pre-conditions and emit the matching primitive click.
 
+TRUST the "Cursor:" line from the user prompt as authoritative. The runtime tracks cursor identity via verified click outcomes; do NOT second-guess it from the image — the cursor sprite is small and often occluded by held-item icons, image inspection is unreliable at this resolution.
+
 Subtask → action (1:1 mapping):
-- verify_items_visible { items }: emit verify_slots on up to 3 hotbar/main_inv candidates that visually match the still-missing items. If every listed item is already named in Known, emit done.
-- pickup { sourceSlot, expectedItem }: pre-condition: Cursor must be empty. Emit pickup slot=sourceSlot. If cursor is non-empty, emit place_all slot=<free hotbar/main_inv> to clear it first.
-- place_one { destSlot, expectedItem }: pre-condition: Cursor must hold expectedItem. Emit place_one slot=destSlot. If cursor empty or holds wrong item, do NOT improvise — emit fallback_manual with reason.
-- place_all { destSlot, expectedItem }: pre-condition: Cursor must hold expectedItem. Emit place_all slot=destSlot. If cursor empty or holds wrong item, emit fallback_manual.
+- verify_items_visible: emit verify_slots on up to 3 candidates from items[] OR the explicit slots[] passed in. If every listed item is already named in Known, emit done.
+- pickup { sourceSlot, expectedItem }: emit pickup slot=sourceSlot. (Pre-cond: Cursor: (empty) per prompt. If prompt says holding, that's a planner mistake — emit fallback_manual.)
+- place_one { destSlot, expectedItem }: emit place_one slot=destSlot. Trust the prompt's Cursor: line; emit even if the image looks ambiguous.
+- place_all { destSlot, expectedItem }: emit place_all slot=destSlot. Trust the prompt's Cursor: line.
 - take_result { expectedItem }: emit pickup slot=<the slot whose role==="result">.
 - wait_for_output { expectedItem }: emit wait with holdSteps proportional to expected sim ticks (cap 60).
 - verify_state { condition }: if condition holds in frame+known, emit done; else fallback_manual.

@@ -50,12 +50,13 @@ for (const e of events) {
     default: rows.push({ t, seq, type: e.type, data: e.data ?? {}, imageFile: e.imageFile });
   }
 }
-// Sort by event seq (chronological monotone counter from events.jsonl).
-// Fall back to timestamp. NEVER lexicographic — "10" < "9" alphabetically.
+// Sort by timestamp first (true wall-clock chronology — OCR events
+// use a separate seq range starting at 200001 which would dump them
+// at the end of any seq-based sort). Fall back to seq when ts ties.
 rows.sort((a, b) => {
+  if (a.t && b.t && a.t !== b.t) return String(a.t).localeCompare(String(b.t));
   const sa = Number(a.seq), sb = Number(b.seq);
-  if (Number.isFinite(sa) && Number.isFinite(sb) && sa !== sb) return sa - sb;
-  if (a.t && b.t) return String(a.t).localeCompare(String(b.t));
+  if (Number.isFinite(sa) && Number.isFinite(sb)) return sa - sb;
   return 0;
 });
 
