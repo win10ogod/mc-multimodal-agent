@@ -1302,13 +1302,14 @@ export async function runClosedLoopStep(
             }
           } else if (probed.action === "verify_slots") {
             // Guard: MC suppresses slot tooltips while the cursor
-            // holds an item (the held-item label is shown instead),
-            // so OCR would return "empty" for every slot. Refuse the
-            // batch and tell the agent to clear the cursor first.
-            if (cursorHolding === true) {
-              state.closedLoopHistory.unshift(`verify_slots refused: cursor is holding an item; clear cursor first`);
+            // holds an item. Trust the runtime-tracked
+            // cursorItemSignature (set on confirmed pickup, cleared
+            // on confirmed place_all) — NOT the legacy CV cursorHolding
+            // IIFE, which false-positives on grey items / animated bg.
+            if (plan.cursorItemSignature?.item) {
+              state.closedLoopHistory.unshift(`verify_slots refused: cursor holding ${plan.cursorItemSignature.item}; clear cursor first`);
               state.closedLoopHistory = state.closedLoopHistory.slice(0, 5);
-              console.warn(`[agentbeats] verify_slots refused: cursor is holding an item (CV); tooltips are suppressed`);
+              console.warn(`[agentbeats] verify_slots refused: cursor holding ${plan.cursorItemSignature.item} (per tracked state)`);
               return { kind: "act", action: defaultMcuAction(), holdSteps: 1 };
             }
             // verify_slots: hover cursor on each requested slot in
