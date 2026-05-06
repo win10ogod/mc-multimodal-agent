@@ -37,15 +37,14 @@ const SCHEMA = {
   },
 } as const;
 
-const SYS = `You execute ONE symbolic subtask in a Minecraft GUI. You receive the subtask, tracked_items (slot index → OCR-confirmed item name), slots_by_role (which slot indices belong to each role: craft_2x2, craft_3x3, result, hotbar, main_inv, armor, offhand), recipe (if any), cursor_holding, and the frame with YELLOW NUMBERED BADGES on every slot. Slots NOT in tracked_items are either empty or not yet inspected — use verify_slots to disambiguate.
+const SYS = `You execute ONE PRIMITIVE subtask in a Minecraft GUI. The subtask already specifies the exact slot and the expected cursor state. Your job is to verify pre-conditions and emit the matching primitive click.
 
-Subtask → action mapping:
-- verify_items_visible { items }: FIRST check Known slot contents — if EVERY listed item is already named in Known (treat naming variants as the same: e.g. "quartz" == "nether_quartz"), the subtask is satisfied → emit done. Otherwise emit verify_slots on up to 3 hotbar/main_inv slots that VISUALLY look like one of the still-missing items. Do NOT verify slots already named in Known. Only emit fallback_manual when you can't pick any confident candidate AND items remain unverified.
-- place_in_craft_grid { item }: Resolve dest slot (lowest-numbered Placement plan step not yet filled with the requested ingredient; or first empty craft cell in raster order). Then by Cursor:
-  * Cursor holds the requested ingredient (handle quartz↔nether_quartz): emit place_one slot=destSlot.
-  * Cursor empty: pick a hotbar/main_inv source from Known holding the ingredient. Emit pickup slot=source. If no source in Known, emit verify_slots on up to 3 visually-matching slots.
-  * Cursor holds the WRONG item: emit place_all slot=<empty hotbar/main_inv slot> to dump it.
-- take_result { expectedItem }: Cursor empty → emit pickup slot=<result slot>. Cursor holds the result → emit place_all slot=<free hotbar/main_inv slot>.
+Subtask → action (1:1 mapping):
+- verify_items_visible { items }: emit verify_slots on up to 3 hotbar/main_inv candidates that visually match the still-missing items. If every listed item is already named in Known, emit done.
+- pickup { sourceSlot, expectedItem }: pre-condition: Cursor must be empty. Emit pickup slot=sourceSlot. If cursor is non-empty, emit place_all slot=<free hotbar/main_inv> to clear it first.
+- place_one { destSlot, expectedItem }: pre-condition: Cursor must hold expectedItem. Emit place_one slot=destSlot. If cursor empty or holds wrong item, do NOT improvise — emit fallback_manual with reason.
+- place_all { destSlot, expectedItem }: pre-condition: Cursor must hold expectedItem. Emit place_all slot=destSlot. If cursor empty or holds wrong item, emit fallback_manual.
+- take_result { expectedItem }: emit pickup slot=<the slot whose role==="result">.
 - wait_for_output { expectedItem }: emit wait with holdSteps proportional to expected sim ticks (cap 60).
 - verify_state { condition }: if condition holds in frame+known, emit done; else fallback_manual.
 
@@ -102,7 +101,9 @@ function buildActionUserText(input: ActionInput): string {
   const subtaskLine = (() => {
     switch (subtask.kind) {
       case "verify_items_visible": return `verify_items_visible items=[${subtask.items.join(", ")}]`;
-      case "place_in_craft_grid":  return `place_in_craft_grid item=${subtask.item}`;
+      case "pickup":               return `pickup sourceSlot=${subtask.sourceSlot} expectedItem=${subtask.expectedItem}`;
+      case "place_one":            return `place_one destSlot=${subtask.destSlot} expectedItem=${subtask.expectedItem}`;
+      case "place_all":            return `place_all destSlot=${subtask.destSlot} expectedItem=${subtask.expectedItem}`;
       case "take_result":          return `take_result expectedItem=${subtask.expectedItem}`;
       case "wait_for_output":      return `wait_for_output expectedItem=${subtask.expectedItem}`;
       case "verify_state":         return `verify_state condition=${subtask.condition}`;

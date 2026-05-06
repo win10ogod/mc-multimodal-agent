@@ -1,25 +1,31 @@
-/** SYMBOLIC Fast-UI subtask. Strictly NUMBER-FREE — no slot indices,
- *  no row/col coordinates, no count fields. The Planner speaks only
- *  in semantic terms; the Action agent + runtime own all numeric
- *  resolution (which slot, which cell, how many) by combining the
- *  symbolic intent with the live layout, recipe, and Known state.
+/** Primitive Fast-UI subtask. Each subtask maps to exactly ONE
+ *  primitive click (or one OCR pass), so the runtime can auto-tick
+ *  the active checklist item from a single confirmed-verify outcome
+ *  without asking the Planner LLM to infer progress.
  *
- *  This isolation prevents "number pollution" — once the Planner
- *  emits a number, the Action agent tends to follow it blindly even
- *  when it points to the wrong slot in the current layout. */
+ *  Slots ARE numbered here (deliberate change from earlier symbolic
+ *  design). The Planner resolves slot indices using the recipe
+ *  Placement plan + Known. The Action subagent translates the
+ *  subtask into a click verbatim.
+ */
 export type Subtask =
   /** Confirm by OCR that named items exist in inventory. Action
    *  picks candidate slots itself. Skip when caller already trusts
    *  Known. */
   | { kind: "verify_items_visible"; items: string[] }
-  /** Place one unit of `item` into the recipe's craft grid. Action
-   *  computes which craft cell to use by looking at recipe.inShape
-   *  (for shaped) or row-major order (for shapeless) combined with
-   *  what's already been placed. */
-  | { kind: "place_in_craft_grid"; item: string }
-  /** Take the crafted result from the recipe result slot to a free
-   *  regular inventory slot. Action finds role==="result" and a free
-   *  hotbar/main_inv slot itself. */
+  /** Pick up (whole stack at) source slot — left-click. Cursor
+   *  becomes loaded with `expectedItem` so the runtime can record
+   *  cursor identity on confirmed pickup. */
+  | { kind: "pickup"; sourceSlot: number; expectedItem: string }
+  /** Right-click destination slot to drop EXACTLY ONE item. Cursor
+   *  must hold `expectedItem`. */
+  | { kind: "place_one"; destSlot: number; expectedItem: string }
+  /** Left-click destination slot to drop the WHOLE held stack
+   *  (or swap if dest non-empty with a different item). Cursor
+   *  must hold `expectedItem`. */
+  | { kind: "place_all"; destSlot: number; expectedItem: string }
+  /** Take the crafted result from the recipe result slot. Action
+   *  picks a free hotbar/main_inv destination. */
   | { kind: "take_result"; expectedItem: string }
   /** Wait for async output (smelting/brewing) to appear. */
   | { kind: "wait_for_output"; expectedItem: string }
@@ -27,9 +33,9 @@ export type Subtask =
    *  Known + frame. */
   | { kind: "verify_state"; condition: string };
 
-/** Subtask augmented with checkbox state. Planner ticks `done` based
- *  on observation; `attempts` counts Action dispatches against the
- *  item; Planner uses it to break stuck loops. */
+/** Subtask augmented with checkbox state. Runtime ticks `done` from
+ *  primitive verify outcomes; Planner only re-plans on stuck or
+ *  unexpected state. */
 export type ChecklistItem = {
   id: string;
   text: string;

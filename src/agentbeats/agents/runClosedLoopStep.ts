@@ -150,10 +150,12 @@ export async function runClosedLoopStep(
         : null;
       const { runPlanner } = await import("./subagents/fastUi/Planner");
       const markedObs = markedObsForLLMs ?? payload.obs;
+      const layoutSlotsForPlanner = (cp.sessionLayout as { slots: Array<{ index: number; name?: string; role?: string }> } | null)?.slots ?? [];
       const rj = await runPlanner({ client: deps.client, model: deps.model, recordDebug: deps.recordDebug }, {
         taskText: state.taskText,
         recipeInfo: cp.recipeOverride,
         knownSlots: knownSlotsForPlanner,
+        layoutSlots: layoutSlotsForPlanner,
         cursorHolding: cursorHoldingItem,
         currentChecklist: cp.checklist,
         trigger: "post_action",
@@ -1062,10 +1064,12 @@ export async function runClosedLoopStep(
               : null;
                 const { runPlanner } = await import("./subagents/fastUi/Planner");
                 const markedObs = markedObsForLLMs ?? payload.obs ?? "";
+                const layoutSlotsForPlanner = (plan.sessionLayout as { slots: Array<{ index: number; name?: string; role?: string }> } | null)?.slots ?? [];
                 const r0 = await runPlanner({ client: deps.client, model: deps.model, recordDebug: deps.recordDebug }, {
                   taskText: state.taskText,
                   recipeInfo: r,
                   knownSlots: knownSlotsForPlanner,
+                  layoutSlots: layoutSlotsForPlanner,
                   cursorHolding: cursorHoldingItem,
                   currentChecklist: [],
                   trigger: "first",
@@ -1914,15 +1918,15 @@ export async function runClosedLoopStep(
                 && !plan.checklist[plan.activeChecklistIdx].done) {
               const active = plan.checklist[plan.activeChecklistIdx];
               const taskKind = (active.task as { kind?: string })?.kind;
-              const placedHere = (intentKind === "place_one" || intentKind === "place_all")
-                && (change === "empty→filled" || change === "swapped");
-              const pickedHere = intentKind === "pickup" && change === "filled→empty";
-              if (taskKind === "place_in_craft_grid" && placedHere) {
+              // Primitive subtasks map 1:1 to verify outcomes.
+              const matched =
+                (taskKind === "pickup" && intentKind === "pickup" && change === "filled→empty")
+                || (taskKind === "place_one" && intentKind === "place_one" && (change === "empty→filled" || change === "swapped"))
+                || (taskKind === "place_all" && intentKind === "place_all" && (change === "empty→filled" || change === "swapped"))
+                || (taskKind === "take_result" && intentKind === "pickup" && change === "filled→empty");
+              if (matched) {
                 active.done = true;
-                console.log(`[agentbeats] auto-tick checklist[${plan.activeChecklistIdx}] (${active.id}) done — place confirmed`);
-              } else if (taskKind === "take_result" && pickedHere) {
-                active.done = true;
-                console.log(`[agentbeats] auto-tick checklist[${plan.activeChecklistIdx}] (${active.id}) done — take confirmed`);
+                console.log(`[agentbeats] auto-tick checklist[${plan.activeChecklistIdx}] (${active.id}, ${taskKind}) done — verify confirmed`);
               }
             }
             // Arm Planner re-judge after the LAST click in a chain

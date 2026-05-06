@@ -18,6 +18,10 @@ export type PlannerInput = {
    *  the perception so a slot index in either prompt unambiguously
    *  refers to the same SoM badge in the live frame. */
   knownSlots: Array<{ index: number; name?: string; item: string }>;
+  /** All slot indices + roles in the active layout. Used to render an
+   *  explicit Placement Plan (recipe cell → slot index) so the Planner
+   *  emits primitive subtasks with concrete slot indices. */
+  layoutSlots: Array<{ index: number; name?: string; role?: string }>;
   /** What the cursor is currently carrying, if anything. */
   cursorHolding: string | null;
   /** Empty on first invocation; otherwise the in-flight list. */
@@ -57,14 +61,17 @@ const SCHEMA = {
                 type: "string",
                 enum: [
                   "verify_items_visible",
-                  "place_in_craft_grid",
+                  "pickup",
+                  "place_one",
+                  "place_all",
                   "take_result",
                   "wait_for_output",
                   "verify_state",
                 ],
               },
               items: { type: "array", items: { type: "string" } },
-              item: { type: "string" },
+              sourceSlot: { type: "integer" },
+              destSlot: { type: "integer" },
               expectedItem: { type: "string" },
               condition: { type: "string" },
             },
@@ -78,41 +85,80 @@ const SCHEMA = {
 // Static role/contract for the Planner LLM. Per-call data (known_slots,
 // cursor_holding, recipe, history, etc.) is rendered into the USER message
 // — this prompt is identical across calls so it stays cache-friendly.
-const SYS = `You plan a checklist of symbolic subtasks for a Minecraft GUI subagent (any GUI: crafting, smelting, brewing, chest, anvil, etc.) and update progress after each Action report.
+const SYS = `You plan a checklist of PRIMITIVE subtasks for a Minecraft GUI subagent (crafting, smelting, brewing, chest, anvil, etc.). Each subtask maps to ONE primitive click; the runtime executes and auto-ticks done on confirmed verify.
 
-Subtask kinds (no numbers, no slot indices):
-- verify_items_visible { items }
-- place_in_craft_grid { item }
-- take_result { expectedItem }
-- wait_for_output { expectedItem }
-- verify_state { condition }
+Subtask kinds (with explicit slot indices):
+- verify_items_visible { items }: hover & OCR up to 3 candidate slots to confirm named items exist.
+- pickup { sourceSlot, expectedItem }: left-click sourceSlot. Cursor MUST be empty before; will hold expectedItem after.
+- place_one { destSlot, expectedItem }: right-click destSlot to drop ONE item. Cursor MUST hold expectedItem; cursor still holds (stack-1).
+- place_all { destSlot, expectedItem }: left-click destSlot to drop the whole stack. Cursor MUST hold expectedItem; cursor empty after.
+- take_result { expectedItem }: left-click result slot, then place_all to a free hotbar/main_inv slot.
+- wait_for_output { expectedItem }: wait N ticks for furnace/brewing output.
+- verify_state { condition }: confirm a non-action condition holds.
 
-The "Slot state" block lists every slot CV detected as having something in it. Each line is either "id N -> <item>" (OCR-confirmed) or "id N -> unknown item" (CV-detected but unidentified). Slots NOT listed are likely empty but may also contain items CV missed (e.g., low-contrast grey blocks); if a recipe ingredient is missing from the listing, prefer verify_items_visible to confirm rather than assuming the inventory lacks it.
+CURSOR INVARIANT: before pickup, cursor must be empty. Before place_*, cursor must hold the expected item. If state diverges, insert the necessary intermediate primitive (e.g. place_all to dump a wrong-item cursor before the right pickup).
 
-On the FIRST call for a crafting task: emit one place_in_craft_grid per ingredient unit (one slot is one item) → take_result { expectedItem }. Use verify_items_visible first only if the recipe ingredients aren't already named in slot_state.
+For a shaped crafting recipe with N ingredient slots, emit:
+  pickup ingredient → (place_one repeated for each cell of that ingredient) → next ingredient pickup → ... → take_result.
+Use the Placement plan (see USER block) to pick destSlot for each place_one.
 
-On post_action calls: VERIFY the Action's last report against the actual frame + tracked status before ticking done. Action sometimes falsely reports success — never trust its OK at face value. Confirm visually that the expected effect occurred. If the report says success but the frame disagrees, leave the item undone. Preserve item ids and order. Keep activeIdx for one more attempt only if observation shows partial progress; otherwise advance / replace / mark done. Never return same activeIdx with attempts >= 3 unchanged.
+On post_action calls: the runtime has already auto-ticked any subtask whose primitive was confirmed by verify. Read current_checklist to see what's already done. RE-PLAN only when state diverged from expectation (e.g. cursor holds wrong item, slot drift, etc.). Insert recovery steps and adjust next_idx. Preserve done flags and attempts. Never decrement attempts.
 
 Output strict JSON:
   { "all_done": bool, "next_idx": int (-1 if all_done), "checklist": [...] }
-Each item: { id, text, task, done, attempts }. PRESERVE attempts.`;
+Each item: { id, text, task, done, attempts }. PRESERVE done flags from current_checklist.`;
+
+function buildPlacementPlan(input: PlannerInput): string {
+  if (!input.recipeInfo) return "";
+  const craftCells = input.layoutSlots
+    .filter((s) => s.role === "craft_2x2" || s.role === "craft_3x3")
+    .sort((a, b) => a.index - b.index);
+  const gridSize = craftCells.length === 9 ? 3 : (craftCells.length === 4 ? 2 : 0);
+  if (gridSize === 0) return "";
+  const planSteps: string[] = [];
+  if (input.recipeInfo.inShape) {
+    const rows = input.recipeInfo.inShape;
+    let i = 1;
+    for (let r = 0; r < rows.length; r += 1) {
+      for (let c = 0; c < rows[r].length; c += 1) {
+        const ing = rows[r][c];
+        if (!ing) continue;
+        const cell = craftCells[r * gridSize + c];
+        if (cell) planSteps.push(`  ${i}. ${ing} at slot ${cell.index}`);
+        i += 1;
+      }
+    }
+  } else {
+    const queues = input.recipeInfo.ingredients.map((it) => ({ ingredient: it.name, remaining: it.count }));
+    let cellIdx = 0, i = 1, qi = 0;
+    while (queues.some((q) => q.remaining > 0) && cellIdx < gridSize * gridSize) {
+      const q = queues[qi % queues.length];
+      if (q.remaining > 0) {
+        const cell = craftCells[cellIdx];
+        if (cell) planSteps.push(`  ${i}. ${q.ingredient} at slot ${cell.index}`);
+        i += 1;
+        q.remaining -= 1;
+        cellIdx += 1;
+      }
+      qi += 1;
+    }
+  }
+  return `Placement plan (recipe cell → slot index):\n${planSteps.join("\n")}\n`;
+}
 
 function buildUserText(input: PlannerInput, userPayload: Record<string, unknown>): string {
-  // Use the SAME phrasing the baseline closed-loop probe used so the
-  // LLM treats this listing the same way it was trained to interpret
-  // probe-style "Known slot contents". Probe Pass A/B owns slotMemory
-  // mutation; the LLM gets the authoritative list here.
   const lines = input.knownSlots
     .slice()
     .sort((a, b) => a.index - b.index)
     .map((s) => `  slot ${s.index}${s.name ? `(${s.name})` : ""} -> ${s.item}`);
   const slotBlock = lines.length > 0 ? lines.join("\n") : "  (none yet)";
   const cursorBlock = input.cursorHolding ?? "(empty)";
+  const placement = buildPlacementPlan(input);
   return `Known slot contents (if the image contradicts Known, dispatch a verify subtask to refresh tracking):
 ${slotBlock}
 Cursor: ${cursorBlock}
 
-${JSON.stringify(userPayload)}`;
+${placement}${JSON.stringify(userPayload)}`;
 }
 
 let PLANNER_CALL_SEQ = 0;
