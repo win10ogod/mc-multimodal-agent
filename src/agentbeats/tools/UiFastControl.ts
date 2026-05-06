@@ -574,13 +574,6 @@ export type ClosedLoopCraftPlan = {
    *  populated by tooltip OCR after each hover. Surfaced to the probe in
    *  the next prompt so the VLM doesn't re-hover the same slot. */
   slotMemory: SlotMemory;
-  /** RGB-mean fingerprint of the park-position patch when the cursor
-   *  is known empty (captured the first time cursor parks at session
-   *  start). On every subsequent probe, comparing the live park-patch
-   *  to this baseline is the most reliable cursor-holding signal: a
-   *  significant L2 distance means an item icon is overlaid on the
-   *  cursor sprite at park, so the cursor is holding. */
-  parkEmptyBaseline: { meanR: number; meanG: number; meanB: number; stddev: number } | null;
   /** Pixel-level empty-cursor reference: a 14×14 RGBA patch captured
    *  at park position the FIRST time the cursor verifies empty.
    *  Used as the diff reference for later cursor-identification:
@@ -799,7 +792,6 @@ export function planClosedLoopCraft(taskText: string): ClosedLoopCraftPlan {
     slotMemory: new SlotMemory(),
     pendingTooltipRead: null,
     pendingOcrBatch: null,
-    parkEmptyBaseline: null,
     parkEmptyCursorPatch: null,
     lastParkSnapshot: null,
     lastProbeCursor: null,

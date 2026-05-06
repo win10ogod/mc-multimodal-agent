@@ -551,159 +551,35 @@ export async function runClosedLoopStep(
         // gate -- park rarely lands within 6 px because cam moves
         // are quantized.
         const cursorAtPark = !!cursor && Math.hypot(cursor.x - PARK_X, cursor.y - PARK_Y) < 14;
-        const cursorHolding: boolean | null = (() => {
-          // Detection happens ONLY when cursor is at park (outside
-          // the GUI). Anywhere else we cannot tell whether a high-
-          // stddev patch is the held-item icon or an underlying slot.
-          if (!cursorAtPark) return null;
-          // Held-item icon renders DOWN-RIGHT of the cursor tip (the
-          // tip is the cursor sprite's top-left pixel from template
-          // detection; held icon center is at +8,+8 from there).
-          // Earlier code sampled NW which is the dimmed world view —
-          // no held icon ever appears there, so dist stayed small
-          // and cursorHolding never fired even when cursor was full.
+        // Park-empty baseline capture. The legacy CV cursorHolding
+        // signal that used to live here was UNRELIABLE (false-positive
+        // on grey items + animated dimmed bg) and has been removed.
+        // Cursor state is now exclusively tracked via plan.cursorItemSignature
+        // (set on confirmed pickup, cleared on confirmed place_all).
+        // We still need to capture parkEmptyCursorPatch — the SnapshotDiff
+        // verify path uses it as the baseline reference.
+        if (plan.parkEmptyCursorPatch === null && cursorAtPark && cursor) {
           const HELD_OFF_X = 8, HELD_OFF_Y = 8;
-          // Sample relative to the LIVE cursor sprite, not the fixed
-          // PARK target. Cursor template-match settles within a few px
-          // of PARK but rarely exactly there; fixed-offset sampling
-          // shifts the cursor sprite within the patch frame-to-frame,
-          // and the white+black sprite pixels then dominate pixelDiffFg
-          // (false-positive cursorHolding=true blocks OCR/verify_slots).
-          // Sampling relative to cursor.x/y keeps the sprite at the
-          // same position in baseline + live, so any diff is real
-          // held-icon pixels.
-          if (!cursor) return null;
-          // Sample CURSOR-RELATIVE: the held-icon renders at a fixed
-          // offset from the cursor sprite. Cursor-relative sampling
-          // means baseline and live patches always cover the same
-          // logical region (the held-icon area). Snapshot diff matches
-          // by also sampling cursor-relative (with last-known cursor
-          // fallback when template detection fails).
-          const SAMPLE_X = cursor.x + HELD_OFF_X;
-          const SAMPLE_Y = cursor.y + HELD_OFF_Y;
-          const live = samplePatchFingerprint(payload.obs, SAMPLE_X, SAMPLE_Y, 6);
-          if (!live) return null;
-          if (plan.parkEmptyBaseline === null) {
-            // Stability gate: cursor must have been at park for two
-            // consecutive probes (template detected, position within
-            // 2 px of itself). Avoids capturing baseline mid-servo
-            // when the cursor sprite is still slewing.
-            const last = plan.lastProbeCursor;
-            const stable = last !== null && Math.abs(last.x - cursor.x) <= 2 && Math.abs(last.y - cursor.y) <= 2;
-            plan.lastProbeCursor = { x: cursor.x, y: cursor.y };
-            if (!stable) {
-              console.log(`[agentbeats] park baseline deferred: cursor=(${cursor.x},${cursor.y}) ${last ? `prev=(${last.x},${last.y})` : "no prev"} — waiting for stable frame`);
-              return null;
-            }
-            plan.parkEmptyBaseline = live;
+          // Stability gate: cursor must have been at park for two
+          // consecutive probes (within 2 px) — avoids capturing the
+          // baseline mid-servo when the cursor sprite is still slewing.
+          const last = plan.lastProbeCursor;
+          const stable = last !== null && Math.abs(last.x - cursor.x) <= 2 && Math.abs(last.y - cursor.y) <= 2;
+          plan.lastProbeCursor = { x: cursor.x, y: cursor.y };
+          if (stable) {
+            const SAMPLE_X = cursor.x + HELD_OFF_X;
+            const SAMPLE_Y = cursor.y + HELD_OFF_Y;
             const livePatch = samplePatchPixels(payload.obs, SAMPLE_X, SAMPLE_Y, 14);
             if (livePatch) {
               plan.parkEmptyCursorPatch = { w: livePatch.w, h: livePatch.h, rgba: livePatch.rgba };
-              console.log(`[agentbeats] park baseline captured: cursor=(${cursor.x},${cursor.y}) meanR=${live.meanR.toFixed(0)} G=${live.meanG.toFixed(0)} B=${live.meanB.toFixed(0)} stddev=${live.stddev.toFixed(1)} + 14x14 cursor patch`);
-            } else {
-              console.log(`[agentbeats] park baseline captured (fp only): cursor=(${cursor.x},${cursor.y}) meanR=${live.meanR.toFixed(0)} G=${live.meanG.toFixed(0)} B=${live.meanB.toFixed(0)} stddev=${live.stddev.toFixed(1)}`);
+              console.log(`[agentbeats] park baseline captured: cursor=(${cursor.x},${cursor.y}) + 14x14 cursor patch`);
             }
-            return false;
+          } else {
+            console.log(`[agentbeats] park baseline deferred: cursor=(${cursor.x},${cursor.y}) ${last ? `prev=(${last.x},${last.y})` : "no prev"} — waiting for stable frame`);
           }
+        } else if (cursor) {
           plan.lastProbeCursor = { x: cursor.x, y: cursor.y };
-          const bl = plan.parkEmptyBaseline;
-          // Pixel-DIFF gate (authoritative): compare the live cursor
-          // patch to parkEmptyCursorPatch pixel-by-pixel; count pixels
-          // that changed by > 24 RGB-distance. This bypasses the
-          // mean-RGB fingerprint dist (which fails when held item is
-          // grey-ish, similar to the cursor sprite + GUI background
-          // mean). Many diff pixels = held; few = empty.
-          // Background mask: dimmed-world pixels behind the cursor are
-          // animated (sky/mobs/particles through the dim overlay) and
-          // produce false-positive diffs. Mask any pixel where EITHER
-          // baseline or live is dark (lum < BG_LUM_MAX) — only the
-          // cursor sprite (white arrow + black outline) and an opaque
-          // held-icon push pixels above this floor.
-          const BG_LUM_MAX = 60;
-          const lumOf = (rgba: Uint8Array, off: number) =>
-            0.299 * rgba[off] + 0.587 * rgba[off + 1] + 0.114 * rgba[off + 2];
-          let pixelDiffFg = 0;
-          let livePatch: ReturnType<typeof samplePatchPixels> = null;
-          if (plan.parkEmptyCursorPatch) {
-            livePatch = samplePatchPixels(payload.obs, PARK_X + HELD_OFF_X, PARK_Y + HELD_OFF_Y, 14);
-            if (livePatch && livePatch.w === plan.parkEmptyCursorPatch.w && livePatch.h === plan.parkEmptyCursorPatch.h) {
-              const n = livePatch.w * livePatch.h;
-              for (let i = 0; i < n; i += 1) {
-                const off = i * 4;
-                const lumLive = lumOf(livePatch.rgba, off);
-                const lumBase = lumOf(plan.parkEmptyCursorPatch.rgba, off);
-                if (lumLive < BG_LUM_MAX && lumBase < BG_LUM_MAX) continue;
-                const dr2 = livePatch.rgba[off] - plan.parkEmptyCursorPatch.rgba[off];
-                const dg2 = livePatch.rgba[off + 1] - plan.parkEmptyCursorPatch.rgba[off + 1];
-                const db2 = livePatch.rgba[off + 2] - plan.parkEmptyCursorPatch.rgba[off + 2];
-                const pxDist = Math.sqrt(dr2 * dr2 + dg2 * dg2 + db2 * db2);
-                if (pxDist > 24) pixelDiffFg += 1;
-              }
-            }
-          }
-          // Mean-RGB fp dist as a fallback signal when patch isn't
-          // captured yet.
-          const dr = live.meanR - bl.meanR, dg = live.meanG - bl.meanG, db = live.meanB - bl.meanB;
-          const meanDist = Math.sqrt(dr * dr + dg * dg + db * db);
-          // Holding decision: many pixel-diffs OR (no patch + big
-          // mean shift). Empty: few pixel-diffs OR small mean shift.
-          // Thresholds calibrated from logs: empty-cursor noise floor
-          // (sprite anti-aliasing jitter even with stable cursor.x/y)
-          // sits at pixelDiffFg ~40-43. Real held items push to 65-83+.
-          // Use 50 as the holding threshold to clear the noise floor;
-          // empty must be < 30 (anything in 30..50 is ambiguous → null).
-          const holdingByPixel = pixelDiffFg > 50;
-          const holdingByMean = meanDist > 18;
-          const emptyByPixel = plan.parkEmptyCursorPatch !== null && pixelDiffFg < 30;
-          if (holdingByPixel || (!plan.parkEmptyCursorPatch && holdingByMean)) {
-            console.log(`[agentbeats] cursorHolding=true (pixelDiffFg=${pixelDiffFg} meanDist=${meanDist.toFixed(1)})`);
-            // Identify the held item via diff-extraction: pixels that
-            // changed from empty-baseline are the held-icon pixels;
-            // match that synthetic patch against every known-item
-            // slot.patch via patchSimilarity. Refines an existing
-            // cursorItemSignature (set by pickup verify or Pass A
-            // disappearance inference); does not create from scratch.
-            if (livePatch && plan.parkEmptyCursorPatch && plan.cursorItemSignature) {
-              const w = livePatch.w, h = livePatch.h, n = w * h;
-              const diffMask = new Uint8Array(n);
-              for (let i = 0; i < n; i += 1) {
-                const off = i * 4;
-                const lumLive = lumOf(livePatch.rgba, off);
-                const lumBase = lumOf(plan.parkEmptyCursorPatch.rgba, off);
-                if (lumLive < BG_LUM_MAX && lumBase < BG_LUM_MAX) continue;
-                const dr2 = livePatch.rgba[off] - plan.parkEmptyCursorPatch.rgba[off];
-                const dg2 = livePatch.rgba[off + 1] - plan.parkEmptyCursorPatch.rgba[off + 1];
-                const db2 = livePatch.rgba[off + 2] - plan.parkEmptyCursorPatch.rgba[off + 2];
-                const pxDist = Math.sqrt(dr2 * dr2 + dg2 * dg2 + db2 * db2);
-                if (pxDist > 24) diffMask[i] = 1;
-              }
-              const heldPatch = { w, h, rgba: livePatch.rgba, mask: diffMask };
-              let bestItem: string | null = null;
-              let bestSim = 0.65;
-              for (const e of plan.slotMemory.snapshot()) {
-                if (!e.patch || e.item === "empty" || e.item === "unknown") continue;
-                const sim = patchSimilarity(e.patch, heldPatch);
-                if (sim > bestSim) { bestSim = sim; bestItem = e.item; }
-              }
-              if (bestItem && plan.cursorItemSignature.item !== bestItem) {
-                console.warn(`[agentbeats] cursor-diff-id: cursor holds '${bestItem}' (sim=${bestSim.toFixed(2)} fg=${pixelDiffFg}); prior was '${plan.cursorItemSignature.item ?? "?"}' — updating`);
-                plan.cursorItemSignature.item = bestItem;
-              } else if (bestItem) {
-                console.log(`[agentbeats] cursor-diff-id: confirmed '${bestItem}' (sim=${bestSim.toFixed(2)} fg=${pixelDiffFg})`);
-              } else {
-                console.log(`[agentbeats] cursor-diff-id: holding but no known-item patch matched (fg=${pixelDiffFg}); keeping prior '${plan.cursorItemSignature.item ?? "?"}'`);
-              }
-            }
-            return true;
-          }
-          if (emptyByPixel || (!plan.parkEmptyCursorPatch && meanDist < 8)) return false;
-          return null;
-        })();
-        // Cursor reconcile is now done inside the snapshot-diff verify
-        // phase (which uses the BG-masked baseline-relative detector
-        // — proven correct against ground-truth eval frames). No
-        // separate ad-hoc cursorHolding-false clear here; that path
-        // used the legacy IIFE which still false-clears on grey items.
+        }
         try {
           // Build slot-memory snapshot keyed to current raster indices so
           // the probe sees "slot 1 = cobblestone (read 4 iters ago)" etc.
@@ -979,7 +855,7 @@ export async function runClosedLoopStep(
               iteration: plan.iteration,
               sessionLayout: layoutForProbe, // freshly redetected for each probe
               recentActions: state.closedLoopHistory,
-              cursorHolding,
+              cursorHolding: plan.cursorItemSignature?.item ? true : null,
               pickupSourceSlot: plan.pickupSourceSlot ?? null,
               disappearedItems,
               slotUpdates,
@@ -1409,7 +1285,7 @@ export async function runClosedLoopStep(
               if (probed.action === "take"
                   && plan.pickupSourceSlot
                   && plan.pickupSourceSlot.name
-                  && cursorHolding !== false) {
+                  && plan.cursorItemSignature?.item) {
                 const ret = layoutForProbe.slots.find((s) => s.name === plan.pickupSourceSlot!.name);
                 if (ret) {
                   console.log(`[agentbeats] PRE-TAKE AUTO_RETURN: scheduling place_all back to ${ret.name} (raster=${ret.index}) before take`);
