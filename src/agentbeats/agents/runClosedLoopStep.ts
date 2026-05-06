@@ -1018,8 +1018,12 @@ export async function runClosedLoopStep(
               const craftCells = layoutForProbe.slots.filter((s) => s.role === "craft_2x2" || s.role === "craft_3x3").length;
               const need3x3 = (r.inShape && (r.inShape.length > 2 || r.inShape.some((row) => row.length > 2)))
                 || (!r.inShape && r.ingredients.reduce((sum, it) => sum + it.count, 0) > 4);
-              if (need3x3 && craftCells <= 4) {
-                console.warn(`[agentbeats] ${r.target} needs a 3x3 grid but the open GUI only has ${craftCells} craft cells (player_inventory 2x2). Reporting BLOCKED.`);
+              // Only fire when the open GUI has a 2x2 craft area (4 cells)
+              // — that's the player_inventory case where a 3x3 recipe
+              // can't fit. Other GUIs (chest=0, furnace=0, etc.) leave
+              // craftCells at 0 and we don't gate them with this check.
+              if (need3x3 && craftCells === 4) {
+                console.warn(`[agentbeats] ${r.target} needs a 3x3 grid but the open GUI is player_inventory (2x2). Reporting BLOCKED.`);
                 return { kind: "subgoal_failed", reason: `BLOCKED: need a crafting_table 3x3 GUI to craft ${r.target}` };
               }
               try {
