@@ -813,6 +813,66 @@ export async function runClosedLoopStep(
             && plan.activeChecklistIdx < plan.checklist.length
             && !plan.checklist[plan.activeChecklistIdx].done;
 
+          // Plan auto-fixer: before dispatching the active subtask,
+          // check that the cursor state matches its precondition. If
+          // not, INSERT a recovery step (pickup or place_all) before
+          // the active item and adjust activeChecklistIdx so the
+          // recovery runs first. This catches planner LLM errors
+          // (e.g. emitted place_one when cursor is empty) without
+          // bouncing to GoalPlanner via fallback_manual.
+          if (useActionAgent) {
+            type SubtaskT = { kind: string; sourceSlot?: number; destSlot?: number; expectedItem?: string };
+            const active = plan.checklist[plan.activeChecklistIdx];
+            const t = active.task as SubtaskT;
+            const cursorItem = plan.cursorItemSignature?.item;
+            // Find a free hotbar/main_inv slot to dump the cursor when needed.
+            const findEmptyDump = (): number | null => {
+              for (const s of layoutForProbe.slots) {
+                if (s.role !== "hotbar" && s.role !== "main_inv") continue;
+                const mem = plan.slotMemory.lookup(s.cx, s.cy);
+                if (!mem || mem.item === "empty") return s.index;
+              }
+              return null;
+            };
+            // Find a slot in slotMemory holding an expected item.
+            const findSourceHolding = (item: string): number | null => {
+              for (const e of plan.slotMemory.snapshot()) {
+                if (e.item !== item) continue;
+                let bestIdx = -1, bestD = Infinity;
+                for (const s of layoutForProbe.slots) {
+                  const d = Math.hypot(s.cx - e.x, s.cy - e.y);
+                  if (d < bestD) { bestD = d; bestIdx = s.index; }
+                }
+                if (bestIdx >= 0) return bestIdx;
+              }
+              return null;
+            };
+            const insertBefore = (newTask: SubtaskT, label: string) => {
+              const id = `auto_${Date.now()}_${Math.floor(Math.random() * 1000)}`;
+              plan.checklist.splice(plan.activeChecklistIdx, 0, {
+                id, text: label, task: newTask as any, done: false, attempts: 0,
+              });
+              console.log(`[plan-fix] inserted ${newTask.kind} (${label}) at idx=${plan.activeChecklistIdx} before ${active.id}`);
+            };
+            if ((t.kind === "place_one" || t.kind === "place_all") && t.expectedItem) {
+              if (!cursorItem) {
+                // Cursor empty but plan wants place — insert pickup.
+                const src = findSourceHolding(t.expectedItem);
+                if (src !== null) insertBefore({ kind: "pickup", sourceSlot: src, expectedItem: t.expectedItem }, `auto-pickup ${t.expectedItem}`);
+                else console.warn(`[plan-fix] cursor empty + ${t.kind}(${t.expectedItem}) but no source slot known; will let Action emit fallback`);
+              } else if (cursorItem !== t.expectedItem) {
+                // Cursor holds wrong item — insert place_all to dump.
+                const dump = findEmptyDump();
+                if (dump !== null) insertBefore({ kind: "place_all", destSlot: dump, expectedItem: cursorItem }, `auto-dump ${cursorItem} to slot ${dump}`);
+                else console.warn(`[plan-fix] cursor holds wrong item (${cursorItem} vs ${t.expectedItem}) but no empty dump slot; Action will fallback`);
+              }
+            } else if (t.kind === "pickup" && cursorItem) {
+              // Cursor non-empty but plan wants pickup — dump first.
+              const dump = findEmptyDump();
+              if (dump !== null) insertBefore({ kind: "place_all", destSlot: dump, expectedItem: cursorItem }, `auto-dump ${cursorItem} to slot ${dump} (before pickup)`);
+            }
+          }
+
           let probed: import("../tools/InventoryProbe").CraftAction | null;
           if (useActionAgent) {
             const { runAction } = await import("./subagents/fastUi/Action");
