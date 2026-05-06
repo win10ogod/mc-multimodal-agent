@@ -1889,8 +1889,13 @@ export async function runClosedLoopStep(
                 plan.slotMemory.record(changedSlotLayout.cx, changedSlotLayout.cy, itemToRecord, plan.iteration, fp, newPatch ?? undefined);
                 console.log(`[agentbeats] place confirmed: ${slotLabel} item=${itemToRecord}`);
               }
-              // Cursor delta: place_all / final place_one → cursor empties.
-              if (diff.cursorChange === "holding→empty") {
+              // place_all deterministically empties the cursor (drops
+              // the whole stack). Don't gate on cursorChange detection —
+              // the BG-masked diff is too fragile to be load-bearing.
+              if (intentKind === "place_all") {
+                plan.cursorItemSignature = null;
+                console.log(`[agentbeats] place_all confirmed → cursor cleared`);
+              } else if (diff.cursorChange === "holding→empty") {
                 plan.cursorItemSignature = null;
                 console.log(`[agentbeats] cursor empty after place`);
               }
