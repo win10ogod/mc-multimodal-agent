@@ -33,7 +33,7 @@ const SCHEMA = {
   required: ["action"],
   additionalProperties: true,
   properties: {
-    action: { type: "string", enum: ["move", "put", "verify_slots", "wait", "done", "fallback_manual"] },
+    action: { type: "string", enum: ["pickup", "place_one", "place_all", "verify_slots", "wait", "done", "fallback_manual"] },
   },
 } as const;
 
@@ -41,18 +41,25 @@ const SYS = `You execute ONE symbolic subtask in a Minecraft GUI. You receive th
 
 Subtask → action mapping:
 - verify_items_visible { items }: FIRST check Known slot contents — if EVERY listed item is already named in Known (treat naming variants as the same: e.g. "quartz" == "nether_quartz"), the subtask is satisfied → emit done. Otherwise emit verify_slots on up to 3 hotbar/main_inv slots that VISUALLY look like one of the still-missing items. Do NOT verify slots already named in Known. Only emit fallback_manual when you can't pick any confident candidate AND items remain unverified.
-- place_in_craft_grid { item }: When a "Placement plan" block is present (recipe known), pick the LOWEST-numbered plan step whose destination slot is NOT yet shown in Known holding the requested ingredient — that step's slot is the destination. When no Placement plan is present (no recipe yet, or shapeless / unmapped GUI), pick any visually-empty cell with role craft_2x2_/craft_3x3_ in raster order. Resolve the source from Known slot contents — the source MUST have role hotbar OR main_inv (NEVER a craft cell or result slot). Among valid sources, pick the one whose item matches the requested ingredient (handle naming variants like "quartz" ↔ "nether_quartz"). If no hotbar/main_inv slot in Known holds the ingredient, emit verify_slots on up to 3 unlisted hotbar slots that visually match. Once source and dest are resolved, emit move from=source to=destSlot count="one".
-- take_result { expectedItem }: from = slot with role==="result"; to = free slot in known_slots; emit move count="all".
+- place_in_craft_grid { item }: Resolve dest slot (lowest-numbered Placement plan step not yet filled with the requested ingredient; or first empty craft cell in raster order). Then by Cursor:
+  * Cursor holds the requested ingredient (handle quartz↔nether_quartz): emit place_one slot=destSlot.
+  * Cursor empty: pick a hotbar/main_inv source from Known holding the ingredient. Emit pickup slot=source. If no source in Known, emit verify_slots on up to 3 visually-matching slots.
+  * Cursor holds the WRONG item: emit place_all slot=<empty hotbar/main_inv slot> to dump it.
+- take_result { expectedItem }: Cursor empty → emit pickup slot=<result slot>. Cursor holds the result → emit place_all slot=<free hotbar/main_inv slot>.
 - wait_for_output { expectedItem }: emit wait with holdSteps proportional to expected sim ticks (cap 60).
 - verify_state { condition }: if condition holds in frame+known, emit done; else fallback_manual.
 
 Rules:
 - Slot index = the YELLOW BADGE you read off the frame, validated against layout_slots.role for the expected role.
 - Never overwrite a different item in dest.
+- After a pickup or place, if the image shows a slot that contradicts Known, emit verify_slots on the affected slots.
+- If an expected ingredient is missing from Known, scan hotbar/main_inv visually and emit verify_slots on the 3 most likely slots — do NOT fallback_manual.
 - If anything is ambiguous, emit fallback_manual with reason.
 
 Output strict JSON, one action only:
-  { "action": "move", "from": A, "to": B, "count": "one"|"all" }
+  { "action": "pickup",     "slot": N }   // cursor empty: left-click slot N to grab whole stack
+  { "action": "place_one",  "slot": N }   // cursor holding: right-click slot N to drop EXACTLY ONE item; remainder stays on cursor
+  { "action": "place_all",  "slot": N }   // cursor holding: left-click slot N to drop the WHOLE held stack
   { "action": "verify_slots", "slots": [N,...] }
   { "action": "wait", "holdSteps": N }
   { "action": "done" }
@@ -159,7 +166,7 @@ function buildActionUserText(input: ActionInput): string {
     : "Recipe: (none)";
   return `Subtask: ${subtaskLine}
 
-Known slot contents (from prior tooltip reads -- TRUST these instead of guessing from image):
+Known slot contents (if the image contradicts Known, emit verify_slots on the mismatched slot to refresh tracking):
 ${slotBlock}
 Cursor: ${cursorBlock}
 
@@ -226,7 +233,7 @@ export async function runAction(deps: ActionDeps, input: ActionInput): Promise<C
     console.warn(`[fastui-action] failed to parse JSON: ${text.slice(0, 200)}`);
     return { action: "fallback_manual", reason: "action LLM returned unparseable JSON" } as CraftAction;
   }
-  console.log(`[fastui-action] subtask=${input.subtask.kind} -> ${parsed.action}${parsed.from!==undefined?` from=${parsed.from}`:""}${parsed.to!==undefined?` to=${parsed.to}`:""}`);
+  console.log(`[fastui-action] subtask=${input.subtask.kind} -> ${parsed.action}${parsed.from!==undefined?` from=${parsed.from}`:""}${parsed.to!==undefined?` to=${parsed.to}`:""}${parsed.slot!==undefined?` slot=${parsed.slot}`:""}`);
   try {
     await deps.recordDebug?.("fastui_action_call", {
       seq, subtask: input.subtask, output: parsed,

@@ -652,6 +652,15 @@ export async function runClosedLoopStep(
           if (emptyByPixel || (!plan.parkEmptyCursorPatch && meanDist < 8)) return false;
           return null;
         })();
+        // Reconcile cursorItemSignature with CV: place_one can empty
+        // the cursor when the held stack reached 1 item, but only the
+        // place_all path clears the signature on click verify. If CV
+        // now reports the cursor empty, drop the stale signature so
+        // the agent context says Cursor: (empty).
+        if (cursorHolding === false && plan.cursorItemSignature) {
+          console.log(`[agentbeats] cursor CV-empty; clearing stale cursorItemSignature='${plan.cursorItemSignature.item ?? "?"}'`);
+          plan.cursorItemSignature = null;
+        }
         try {
           // Build slot-memory snapshot keyed to current raster indices so
           // the probe sees "slot 1 = cobblestone (read 4 iters ago)" etc.
@@ -1452,14 +1461,20 @@ export async function runClosedLoopStep(
         })();
         const actualCenter = actualSlot ? { cx: actualSlot.cx, cy: actualSlot.cy } : slotCenter;
 
-        // Safe spot to move cursor to for verification: somewhere
-        // inside the inventory window away from the just-clicked slot.
-        // Use a corner of the window opposite to the slot.
+        // Verify-park spot: route the cursor to the SAME park spot
+        // used for held-icon detection (outside the GUI, top-right of
+        // the window). Reasons:
+        //   1. Cursor sprite is fully off the slot pixels we'll
+        //      sample — no sprite contamination of post-patch.
+        //   2. Forces a real cursor motion after the click: if the
+        //      cursor was already at the slot when click fired (bad
+        //      starting position, servo never landed), the move-to-
+        //      park step will run and the verify will see the true
+        //      slot state instead of a frame still showing cursor
+        //      over the slot.
         const safeSpot = {
-          x: slotCenter.cx > layout!.windowX + layout!.windowW / 2
-            ? layout!.windowX + 8
-            : layout!.windowX + layout!.windowW - 8,
-          y: layout!.windowY + layout!.windowH - 8,
+          x: Math.min(632, layout!.windowX + layout!.windowW + 16),
+          y: layout!.windowY + 8,
         };
 
         // Strict thresholds: looser values caused clicks to land 13-17
@@ -1519,6 +1534,15 @@ export async function runClosedLoopStep(
           // converges; reset on a fresh click target.
           if (!(pc as any).servoIntegrator) {
             (pc as any).servoIntegrator = makeServoIntegrator();
+          }
+          // Capture the slot's pre-state ONCE at servo start, when
+          // the cursor is still at its previous position (park or
+          // prior slot) — far from this target slot. Sampling at
+          // click-time pollutes the patch with cursor-sprite pixels
+          // (cursor is over the slot at that moment), which makes
+          // post.stddev ≈ pre.stddev and breaks the rise/drop gate.
+          if (!pc.prePatch && plan.servoSteps === 0) {
+            pc.prePatch = samplePatchFingerprint(payload.obs, slotCenter.cx, slotCenter.cy) ?? undefined;
           }
           const stepResult = servoCursorStep({
             cursor,
@@ -1602,14 +1626,15 @@ export async function runClosedLoopStep(
           // best-case landing precision to ±yawDeadzone/2 (~8.5 px
           // x) / ±pitchDeadzone/2 (~10 px y). Tightening below that
           // leaves the cursor permanently outside the click region.
-          // Use round(w/2) + 2 (~10 px for a 16 px slot) which
-          // matches the deadzone-imposed precision. Slots are 18 px
-          // apart so this still keeps clicks inside the intended
-          // slot (cursor at +10 px from center is at the slot's
-          // edge, not the neighbor's interior).
+          // Click bbox = MC's actual slot hit-region with a safety
+          // margin INWARD from the edge. Cursor tip at the slot's
+          // top edge (dy = -slotH/2) renders the cursor body inside
+          // the slot visually but MC's click point is the TIP —
+          // outside its hit region — and the click misses. Require
+          // tip well inside the slot interior to guarantee a hit.
           const slotForBox = layout!.slots[pc.rasterIndex];
-          const slotHalfW = Math.max(8, Math.round((slotForBox?.w ?? 16) / 2) + 2);
-          const slotHalfH = Math.max(8, Math.round((slotForBox?.h ?? 16) / 2) + 2);
+          const slotHalfW = Math.max(4, Math.round((slotForBox?.w ?? 16) / 2) - 2);
+          const slotHalfH = Math.max(4, Math.round((slotForBox?.h ?? 16) / 2) - 2);
           const cursorInsideSlot = !!cursor
             && Math.abs(cursor.x - slotCenter.cx) <= slotHalfW
             && Math.abs(cursor.y - slotCenter.cy) <= slotHalfH;
@@ -1652,8 +1677,12 @@ export async function runClosedLoopStep(
               plan.layoutHint = null;
               return emit(defaultMcuAction());
             }
-            // shouldClickNow already required cursor inside slot bbox.
-            pc.prePatch = samplePatchFingerprint(payload.obs, slotCenter.cx, slotCenter.cy) ?? undefined;
+            // prePatch was captured at servo-start (cursor far from
+            // slot, no sprite contamination); keep it for verify.
+            // Fallback only if it was somehow missed.
+            if (!pc.prePatch) {
+              pc.prePatch = samplePatchFingerprint(payload.obs, slotCenter.cx, slotCenter.cy) ?? undefined;
+            }
             // Pre-condition for "should_empty" actions (pickup/take):
             // source slot MUST currently have an item. Use the same
             // stricter fingerprint -- low stddev AND mean in the
@@ -1751,19 +1780,13 @@ export async function runClosedLoopStep(
             plan.pendingClick = null;
             return { kind: "act", action: defaultMcuAction(), holdSteps: 1 };
           }
-          // Empty/filled determination using a stricter fingerprint:
-          //   - Empty slot has mid-gray RGB mean (band ~120-160)
-          //     AND low stddev (uniform). A pale item like nether
-          //     quartz has stddev close to empty BUT its mean is
-          //     much brighter (~190+) so the brightness check
-          //     keeps it from being misclassified as empty.
-          //   - Filled = high stddev OR mean outside the empty
-          //     band (very bright OR very dark).
-          //   - Cross-check against pre-click patch: a meaningful
-          //     RGB-mean shift (>20) in the expected direction
-          //     also confirms the transition.
-          const lum = (post.meanR + post.meanG + post.meanB) / 3;
-          const inEmptyBand = lum > 120 && lum < 160;
+          // Strict before/after delta gate. The slot must demonstrably
+          // transition from its pre-click state to the expected post
+          // state — absolute thresholds alone false-positive when the
+          // click missed (slot unchanged, post still looks "filled" so
+          // expectAfter=should_fill matched even though no item moved).
+          // Required: prePatch present + visible delta in stddev + RGB
+          // shift consistent with the expected transition.
           const meanShift = pc.prePatch
             ? Math.sqrt(
                 (post.meanR - pc.prePatch.meanR) ** 2
@@ -1771,12 +1794,25 @@ export async function runClosedLoopStep(
                 + (post.meanB - pc.prePatch.meanB) ** 2,
               )
             : 0;
-          const isEmpty = (post.stddev < 25 && inEmptyBand)
-            || (pc.expectAfter === "should_empty" && meanShift > 20);
-          const isFilled = post.stddev > 35
-            || !inEmptyBand
-            || (pc.expectAfter === "should_fill" && meanShift > 20);
-          const matched = pc.expectAfter === "should_empty" ? isEmpty : isFilled;
+          const stddevDrop = pc.prePatch ? pc.prePatch.stddev - post.stddev : 0;
+          const stddevRise = pc.prePatch ? post.stddev - pc.prePatch.stddev : 0;
+          // pickup OK: was filled (pre.stddev>35), now empty (post.stddev<30),
+          //            stddev clearly dropped, and RGB mean shifted.
+          const pickupConfirmed = !!pc.prePatch
+            && pc.prePatch.stddev > 35
+            && post.stddev < 30
+            && stddevDrop > 15
+            && meanShift > 15;
+          // place OK: was empty (pre.stddev<30), now filled (post.stddev>35),
+          //           stddev clearly rose, and RGB mean shifted.
+          const placeConfirmed = !!pc.prePatch
+            && pc.prePatch.stddev < 30
+            && post.stddev > 35
+            && stddevRise > 15
+            && meanShift > 15;
+          // Without a pre-patch, refuse to confirm — caller would
+          // otherwise be flying blind on whether anything happened.
+          const matched = pc.expectAfter === "should_empty" ? pickupConfirmed : placeConfirmed;
           // A successful click mutated the slot's contents — the slot
           // memory entry (if any) for this absolute pos is now stale.
           // Forget it; the agent will re-discover via hover if needed.

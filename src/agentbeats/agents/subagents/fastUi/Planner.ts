@@ -108,7 +108,7 @@ function buildUserText(input: PlannerInput, userPayload: Record<string, unknown>
     .map((s) => `  slot ${s.index}${s.name ? `(${s.name})` : ""} -> ${s.item}`);
   const slotBlock = lines.length > 0 ? lines.join("\n") : "  (none yet)";
   const cursorBlock = input.cursorHolding ?? "(empty)";
-  return `Known slot contents (from prior tooltip reads -- TRUST these instead of guessing from image):
+  return `Known slot contents (if the image contradicts Known, dispatch a verify subtask to refresh tracking):
 ${slotBlock}
 Cursor: ${cursorBlock}
 
