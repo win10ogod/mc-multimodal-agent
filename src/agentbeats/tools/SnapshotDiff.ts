@@ -210,7 +210,14 @@ export function classifyOutcome(intent: ActionIntent, diff: SnapshotDiff): Outco
     return slotDelta === "empty→filled" || slotDelta === "swapped";
   };
 
-  if (matchesIntent(targetChange) && totalSlotChanges === 1) {
+  // Confirmed when the target slot has the expected change. Additional
+  // slot changes are common and benign:
+  //   - place into the last empty craft cell auto-fills the result slot
+  //   - placement near the cursor parking position can ripple through
+  //   - the next-frame snapshot may catch a stack-count animation
+  // We accept these as bonus information; the caller (runtime) writes
+  // each observed change into slotMemory regardless.
+  if (matchesIntent(targetChange)) {
     return { kind: "confirmed", targetSlot: intent.targetSlot, change: targetChange!, cursorChange };
   }
   // Drift: target unchanged but a different slot shows the matching pattern.

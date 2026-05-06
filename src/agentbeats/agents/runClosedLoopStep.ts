@@ -1810,6 +1810,35 @@ export async function runClosedLoopStep(
                 console.log(`[agentbeats] cursor empty after place`);
               }
             }
+            // Bonus side-effect changes (e.g. result slot auto-fills
+            // when the last ingredient is placed and the recipe
+            // completes). Write them to slotMemory too so the planner
+            // sees the result item appear in Known.
+            for (const [idx, ch] of diff.slotChanges) {
+              if (idx === changedSlotIdx) continue; // already handled
+              const sl = layout!.slots[idx];
+              if (!sl) continue;
+              if (ch === "filled→empty") {
+                plan.slotMemory.record(sl.cx, sl.cy, "empty", plan.iteration);
+                console.log(`[agentbeats] side-effect: slot ${idx}(${sl.name ?? "?"}) emptied`);
+              } else {
+                const newPatch = postSnap.slots.get(idx);
+                // For result slot specifically, identify item via recipe.target.
+                let item: string | undefined =
+                  sl.role === "result" && plan.recipeOverride
+                    ? plan.recipeOverride.target
+                    : undefined;
+                if (!item && newPatch) {
+                  const known: Array<{ item: string; patch?: typeof newPatch }> = [];
+                  for (const e of plan.slotMemory.snapshot()) if (e.patch) known.push({ item: e.item, patch: e.patch });
+                  const id = identifyChangedSlot(newPatch, known);
+                  if (id) item = id.item;
+                }
+                const fp = samplePatchFingerprint(payload.obs, sl.cx, sl.cy, 6) ?? undefined;
+                plan.slotMemory.record(sl.cx, sl.cy, item ?? "unknown", plan.iteration, fp, newPatch ?? undefined);
+                console.log(`[agentbeats] side-effect: slot ${idx}(${sl.name ?? "?"}) filled with ${item ?? "unknown"}`);
+              }
+            }
             // Update lastParkSnapshot to the new post-snapshot so the
             // next click's diff has the correct pre-state.
             plan.lastParkSnapshot = postSnap;
