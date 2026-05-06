@@ -169,6 +169,34 @@ export async function runClosedLoopStep(
         return { kind: "subgoal_done", summary: `FastUI Planner all_done` };
       }
       cp.activeChecklistIdx = rj.nextIdx;
+      // CURSOR INVARIANT GUARD: if cursor holds an item but the next
+      // not-done step is pickup/take_result/verify_items_visible, the
+      // planner LLM violated the cursor invariant. Auto-insert a
+      // place_all recovery step so the runtime doesn't proceed to a
+      // step that would swap or fail. Without this, a bad plan can
+      // permanently corrupt slot state.
+      if (cp.cursorItemSignature?.item) {
+        const heldItem = cp.cursorItemSignature.item;
+        const nextStep = cp.checklist.find((s, i) => i >= cp.activeChecklistIdx && !s.done);
+        const nextKind = (nextStep?.task as { kind?: string } | undefined)?.kind;
+        if (nextStep && (nextKind === "pickup" || nextKind === "take_result" || nextKind === "verify_items_visible")) {
+          // Find an empty deposit slot — any slot index 11..36 not in known_slots, or fall back to 11.
+          const occupied = new Set(knownSlotsForPlanner.map((k) => k.index));
+          let dumpSlot = 11;
+          for (let s = 11; s <= 36; s += 1) { if (!occupied.has(s)) { dumpSlot = s; break; } }
+          const recovery = {
+            id: `auto_recovery_${Date.now()}`,
+            text: `AUTO: dump cursor (${heldItem}) into empty slot ${dumpSlot} before ${nextKind}`,
+            task: { kind: "place_all" as const, destSlot: dumpSlot, expectedItem: heldItem },
+            done: false,
+            attempts: 0,
+          };
+          const insertAt = cp.checklist.indexOf(nextStep);
+          cp.checklist.splice(insertAt, 0, recovery);
+          cp.activeChecklistIdx = insertAt;
+          console.warn(`[fastui-planner] CURSOR INVARIANT GUARD: planner returned ${nextKind} as next step while cursor holds ${heldItem}; auto-inserted place_all dest=${dumpSlot} recovery at idx ${insertAt}`);
+        }
+      }
     } catch (e) {
       console.warn(`[fastui-planner] post_action re-judge failed: ${e instanceof Error ? e.message : String(e)}`);
     }
