@@ -590,6 +590,12 @@ export type ClosedLoopCraftPlan = {
    *  This is what makes cursor-matching actually work — without a
    *  clean empty baseline, you can't tell GUI bg from held icon. */
   parkEmptyCursorPatch: { w: number; h: number; rgba: Uint8Array } | null;
+  /** Last observed cursor position at probe time. Used to gate baseline
+   *  capture on cursor STABILITY: if the cursor hasn't been within 2 px
+   *  of itself for 2 consecutive probes, it's still settling and the
+   *  baseline patch would be sampled at a stale position, mismatching
+   *  every later live sample. Cleared whenever we issue any cam motion. */
+  lastProbeCursor: { x: number; y: number } | null;
   /** Per-slot pixel fingerprint captured at the FIRST probe of the
    *  session (cursor at park, slots in their natural starting state).
    *  Pass B uses this as the per-slot "is this slot at its initial
@@ -787,6 +793,7 @@ export function planClosedLoopCraft(taskText: string): ClosedLoopCraftPlan {
     pendingOcrBatch: null,
     parkEmptyBaseline: null,
     parkEmptyCursorPatch: null,
+    lastProbeCursor: null,
     recentMatchedPickup: false,
     initialSlotBaselines: new Map(),
     recipeOverride: null,

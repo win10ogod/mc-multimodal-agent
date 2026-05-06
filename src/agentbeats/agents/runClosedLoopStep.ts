@@ -519,25 +519,46 @@ export async function runClosedLoopStep(
           // no held icon ever appears there, so dist stayed small
           // and cursorHolding never fired even when cursor was full.
           const HELD_OFF_X = 8, HELD_OFF_Y = 8;
-          const live = samplePatchFingerprint(payload.obs, PARK_X + HELD_OFF_X, PARK_Y + HELD_OFF_Y, 6);
+          // Sample relative to the LIVE cursor sprite, not the fixed
+          // PARK target. Cursor template-match settles within a few px
+          // of PARK but rarely exactly there; fixed-offset sampling
+          // shifts the cursor sprite within the patch frame-to-frame,
+          // and the white+black sprite pixels then dominate pixelDiffFg
+          // (false-positive cursorHolding=true blocks OCR/verify_slots).
+          // Sampling relative to cursor.x/y keeps the sprite at the
+          // same position in baseline + live, so any diff is real
+          // held-icon pixels.
+          if (!cursor) return null;
+          const SAMPLE_X = cursor.x + HELD_OFF_X;
+          const SAMPLE_Y = cursor.y + HELD_OFF_Y;
+          const live = samplePatchFingerprint(payload.obs, SAMPLE_X, SAMPLE_Y, 6);
           if (!live) return null;
-          // Baseline capture: first time cursor is at park, cursor is
-          // empty by construction (session start, no prior pickup).
-          // Also capture a full-pixel patch (parkEmptyCursorPatch) so
-          // later cursor-id can DIFF held vs empty to extract just
-          // the held-item pixels — without an empty baseline, GUI
-          // background pollutes any cursor-area sample.
           if (plan.parkEmptyBaseline === null) {
+            // Stability gate: only capture baseline once cursor has been
+            // within 2 px of itself for two consecutive probes. The
+            // cursorAtPark gate (14 px tolerance) lets in mid-settle
+            // frames where cursor.x/y is stale from in-flight motion;
+            // sampling there produces a baseline patch shifted vs every
+            // future stable-cursor sample, causing systematic false-
+            // positive cursorHolding.
+            const last = plan.lastProbeCursor;
+            const stable = last !== null && Math.abs(last.x - cursor.x) <= 2 && Math.abs(last.y - cursor.y) <= 2;
+            plan.lastProbeCursor = { x: cursor.x, y: cursor.y };
+            if (!stable) {
+              console.log(`[agentbeats] park baseline deferred: cursor=(${cursor.x},${cursor.y}) ${last ? `prev=(${last.x},${last.y})` : "no prev"} — waiting for stable frame`);
+              return null;
+            }
             plan.parkEmptyBaseline = live;
-            const livePatch = samplePatchPixels(payload.obs, PARK_X + HELD_OFF_X, PARK_Y + HELD_OFF_Y, 14);
+            const livePatch = samplePatchPixels(payload.obs, SAMPLE_X, SAMPLE_Y, 14);
             if (livePatch) {
               plan.parkEmptyCursorPatch = { w: livePatch.w, h: livePatch.h, rgba: livePatch.rgba };
-              console.log(`[agentbeats] park baseline captured: meanR=${live.meanR.toFixed(0)} G=${live.meanG.toFixed(0)} B=${live.meanB.toFixed(0)} stddev=${live.stddev.toFixed(1)} + 14x14 cursor patch`);
+              console.log(`[agentbeats] park baseline captured: cursor=(${cursor.x},${cursor.y}) meanR=${live.meanR.toFixed(0)} G=${live.meanG.toFixed(0)} B=${live.meanB.toFixed(0)} stddev=${live.stddev.toFixed(1)} + 14x14 cursor patch`);
             } else {
-              console.log(`[agentbeats] park baseline captured (fp only): meanR=${live.meanR.toFixed(0)} G=${live.meanG.toFixed(0)} B=${live.meanB.toFixed(0)} stddev=${live.stddev.toFixed(1)}`);
+              console.log(`[agentbeats] park baseline captured (fp only): cursor=(${cursor.x},${cursor.y}) meanR=${live.meanR.toFixed(0)} G=${live.meanG.toFixed(0)} B=${live.meanB.toFixed(0)} stddev=${live.stddev.toFixed(1)}`);
             }
             return false;
           }
+          plan.lastProbeCursor = { x: cursor.x, y: cursor.y };
           const bl = plan.parkEmptyBaseline;
           // Pixel-DIFF gate (authoritative): compare the live cursor
           // patch to parkEmptyCursorPatch pixel-by-pixel; count pixels
@@ -545,6 +566,15 @@ export async function runClosedLoopStep(
           // mean-RGB fingerprint dist (which fails when held item is
           // grey-ish, similar to the cursor sprite + GUI background
           // mean). Many diff pixels = held; few = empty.
+          // Background mask: dimmed-world pixels behind the cursor are
+          // animated (sky/mobs/particles through the dim overlay) and
+          // produce false-positive diffs. Mask any pixel where EITHER
+          // baseline or live is dark (lum < BG_LUM_MAX) — only the
+          // cursor sprite (white arrow + black outline) and an opaque
+          // held-icon push pixels above this floor.
+          const BG_LUM_MAX = 60;
+          const lumOf = (rgba: Uint8Array, off: number) =>
+            0.299 * rgba[off] + 0.587 * rgba[off + 1] + 0.114 * rgba[off + 2];
           let pixelDiffFg = 0;
           let livePatch: ReturnType<typeof samplePatchPixels> = null;
           if (plan.parkEmptyCursorPatch) {
@@ -553,6 +583,9 @@ export async function runClosedLoopStep(
               const n = livePatch.w * livePatch.h;
               for (let i = 0; i < n; i += 1) {
                 const off = i * 4;
+                const lumLive = lumOf(livePatch.rgba, off);
+                const lumBase = lumOf(plan.parkEmptyCursorPatch.rgba, off);
+                if (lumLive < BG_LUM_MAX && lumBase < BG_LUM_MAX) continue;
                 const dr2 = livePatch.rgba[off] - plan.parkEmptyCursorPatch.rgba[off];
                 const dg2 = livePatch.rgba[off + 1] - plan.parkEmptyCursorPatch.rgba[off + 1];
                 const db2 = livePatch.rgba[off + 2] - plan.parkEmptyCursorPatch.rgba[off + 2];
@@ -567,9 +600,14 @@ export async function runClosedLoopStep(
           const meanDist = Math.sqrt(dr * dr + dg * dg + db * db);
           // Holding decision: many pixel-diffs OR (no patch + big
           // mean shift). Empty: few pixel-diffs OR small mean shift.
-          const holdingByPixel = pixelDiffFg > 30;
-          const holdingByMean = meanDist > 15;
-          const emptyByPixel = plan.parkEmptyCursorPatch !== null && pixelDiffFg < 8;
+          // Thresholds calibrated from logs: empty-cursor noise floor
+          // (sprite anti-aliasing jitter even with stable cursor.x/y)
+          // sits at pixelDiffFg ~40-43. Real held items push to 65-83+.
+          // Use 50 as the holding threshold to clear the noise floor;
+          // empty must be < 30 (anything in 30..50 is ambiguous → null).
+          const holdingByPixel = pixelDiffFg > 50;
+          const holdingByMean = meanDist > 18;
+          const emptyByPixel = plan.parkEmptyCursorPatch !== null && pixelDiffFg < 30;
           if (holdingByPixel || (!plan.parkEmptyCursorPatch && holdingByMean)) {
             console.log(`[agentbeats] cursorHolding=true (pixelDiffFg=${pixelDiffFg} meanDist=${meanDist.toFixed(1)})`);
             // Identify the held item via diff-extraction: pixels that
@@ -583,6 +621,9 @@ export async function runClosedLoopStep(
               const diffMask = new Uint8Array(n);
               for (let i = 0; i < n; i += 1) {
                 const off = i * 4;
+                const lumLive = lumOf(livePatch.rgba, off);
+                const lumBase = lumOf(plan.parkEmptyCursorPatch.rgba, off);
+                if (lumLive < BG_LUM_MAX && lumBase < BG_LUM_MAX) continue;
                 const dr2 = livePatch.rgba[off] - plan.parkEmptyCursorPatch.rgba[off];
                 const dg2 = livePatch.rgba[off + 1] - plan.parkEmptyCursorPatch.rgba[off + 1];
                 const db2 = livePatch.rgba[off + 2] - plan.parkEmptyCursorPatch.rgba[off + 2];
