@@ -114,7 +114,9 @@ RE-PLAN MANDATE — read this every post_action call. If ANY of the following ho
   4. Recent_history shows a primitive failed (no observable change after retries). Replace that step with a verify_items_visible to refresh tracking, or pick a different sourceSlot/destSlot.
   5. Known shows the recipe target item is already in a regular slot (task already complete). Set all_done=true, next_idx=-1.
 
-Preserve done flags from current_checklist (the runtime ticked them). Preserve or increment attempts; never decrement.
+DONE FLAGS ARE READ-ONLY — the runtime is the SOLE authority for marking primitive subtasks done (it auto-ticks after each confirmed click verify). Your output's done=true count MUST equal current_checklist's done=true count. NEVER promote a pending step to done, no matter what Known or recent_history suggests. If you think a step "should be" done but the runtime hasn't ticked it, leave it pending and verify with OCR or insert a recovery step instead. You may ADD steps, REMOVE pending steps, REORDER, or modify task fields (sourceSlot/destSlot) — just never flip done from false to true.
+
+Preserve or increment attempts; never decrement.
 
 Output strict JSON:
   { "all_done": bool, "next_idx": int (-1 if all_done), "checklist": [...] }
