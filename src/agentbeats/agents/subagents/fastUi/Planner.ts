@@ -94,7 +94,7 @@ Subtask kinds (with explicit slot indices):
 - pickup { sourceSlot, expectedItem }: left-click sourceSlot. Cursor MUST be empty before; will hold expectedItem after.
 - place_one { destSlot, expectedItem }: right-click destSlot to drop ONE item. Cursor MUST hold expectedItem; cursor still holds (stack-1) after.
 - place_all { destSlot, expectedItem }: left-click destSlot to drop the whole stack. Cursor MUST hold expectedItem; cursor empty after.
-- take_result { expectedItem }: pickup from the result slot to take the crafted output (runtime resolves the destination).
+- take_result { expectedItem }: left-click the result slot to take the crafted output. Cursor MUST be empty before; will hold expectedItem after. Follow with a place_all to a free hotbar/main_inv slot to deposit it.
 - wait_for_output { expectedItem }: wait for furnace/brewing output.
 - verify_state { condition }: confirm a non-action condition holds.
 
@@ -108,15 +108,16 @@ Each item: { id, text, task, done, attempts }.`;
 
   const fewShotCrafting = `
 
-EXAMPLE — task "craft oak_planks". Recipe: 1x oak_log → 4x oak_planks (shapeless, single cell). Suppose Known says slot 38(hotbar_0)=oak_log; placement plan: 1. oak_log at slot 2.
+EXAMPLE — task "craft oak_planks". Recipe: 1x oak_log → 4x oak_planks (shapeless, single cell). Suppose Known says slot 38(hotbar_0)=oak_log; placement plan: 1. oak_log at slot 2. Result slot: 7.
 
 Optimal first checklist:
   step1: pickup { sourceSlot: 38, expectedItem: "oak_log" }
-  step2: place_all { destSlot: 2, expectedItem: "oak_log" }    // shapeless single-cell → place_all (whole stack into the cell, MC consumes 1 per craft cycle and the rest stays as input)
-  step3: take_result { expectedItem: "oak_planks" }
+  step2: place_all { destSlot: 2, expectedItem: "oak_log" }    // shapeless single-cell → place_all (whole stack; MC consumes 1 per craft cycle)
+  step3: take_result { expectedItem: "oak_planks" }            // left-click result slot 7 → cursor now holds 4x oak_planks
+  step4: place_all { destSlot: 38, expectedItem: "oak_planks" }  // deposit into a free hotbar/main_inv slot (the just-emptied source 38 is fine)
 next_idx: 0
 
-EXAMPLE — task "craft diorite". Recipe: 2x cobblestone + 2x quartz, shaped inShape=[[cobble,quartz],[quartz,cobble]] → cobble at cell(0,0)=slot 2, quartz at cell(0,1)=slot 3, quartz at cell(1,0)=slot 5, cobble at cell(1,1)=slot 6. Suppose slot 38=cobblestone, slot 39=nether_quartz.
+EXAMPLE — task "craft diorite". Recipe: 2x cobblestone + 2x quartz, shaped inShape=[[cobble,quartz],[quartz,cobble]] → cobble at cell(0,0)=slot 2, quartz at cell(0,1)=slot 3, quartz at cell(1,0)=slot 5, cobble at cell(1,1)=slot 6. Result slot: 7. Suppose slot 38=cobblestone, slot 39=nether_quartz.
 
 Optimal first checklist:
   step1: pickup { sourceSlot: 38, expectedItem: "cobblestone" }
@@ -127,10 +128,11 @@ Optimal first checklist:
   step6: place_one { destSlot: 3, expectedItem: "nether_quartz" }
   step7: place_one { destSlot: 5, expectedItem: "nether_quartz" }
   step8: place_all { destSlot: 39, expectedItem: "nether_quartz" }    // return quartz remainder
-  step9: take_result { expectedItem: "diorite" }
+  step9: take_result { expectedItem: "diorite" }                       // cursor holds diorite
+  step10: place_all { destSlot: 38, expectedItem: "diorite" }          // deposit diorite to a free hotbar slot
 next_idx: 0
 
-GENERAL RULE: for each ingredient with multiple target cells, emit pickup → K×place_one → place_all back to source. For a single-cell shapeless recipe, pickup → place_all into the cell. Always end with take_result.`;
+GENERAL RULE: for each ingredient with multiple target cells, emit pickup → K×place_one → place_all back to source. For a single-cell shapeless recipe, pickup → place_all into the cell. Always end with take_result followed by place_all to deposit the crafted output into a free hotbar/main_inv slot.`;
 
   return baseRules + (category === "crafting" ? fewShotCrafting : "");
 }
