@@ -51,7 +51,9 @@ for (const e of events) {
     case "combat_call":
     case "combat_response":
     case "world_explore_call":
-    case "world_explore_response": {
+    case "world_explore_response":
+    case "hotbar_ocr":
+    case "hotbar_verifier_step": {
       rows.push({ t, seq, type: e.type, data: e.data ?? {}, imageFile: e.imageFile });
       break;
     }
@@ -193,6 +195,27 @@ function summarize(row) {
           `pressed: ${[...buttons, ...hotbar].join(", ") || "(none)"}`,
           `camera: ${JSON.stringify(a.camera ?? [0, 0])}`,
           d.rawText ? `rawText: ${(d.rawText || "").slice(0, 120)}` : "",
+        ].filter(Boolean),
+      };
+    }
+    case "hotbar_ocr": {
+      const parsed = d.parsed ?? {};
+      const observedTxt = parsed.observed === "" ? "(no banner)" : parsed.observed;
+      return {
+        title: `[hotbar_ocr] target=${d.target ?? "?"} candidate=${d.candidateLabel ?? "?"} match=${parsed.match ? "TRUE" : "false"}`,
+        body: [
+          `observed: ${observedTxt}`,
+          `raw: ${(d.raw ?? "").slice(0, 80)}`,
+        ],
+      };
+    }
+    case "hotbar_verifier_step": {
+      return {
+        title: `[verifier] phase=${d.innerPhase ?? "?"} cursor=${d.cursor ?? "?"} candidate=hotbar.${d.candidateSlot ?? "?"} target=${d.target ?? "?"}`,
+        body: [
+          `action: ${d.action ?? ""}`,
+          d.observed !== undefined ? `observed: ${d.observed} match: ${d.match}` : "",
+          `activeSlot: ${d.activeSlot ?? "(unknown)"}`,
         ].filter(Boolean),
       };
     }
