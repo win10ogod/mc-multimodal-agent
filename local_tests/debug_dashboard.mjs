@@ -60,15 +60,13 @@ for (const e of events) {
     default: rows.push({ t, seq, type: e.type, data: e.data ?? {}, imageFile: e.imageFile });
   }
 }
-// Sort by timestamp first (true wall-clock chronology — OCR events
-// use a separate seq range starting at 200001 which would dump them
-// at the end of any seq-based sort). Fall back to seq when ts ties.
-rows.sort((a, b) => {
-  if (a.t && b.t && a.t !== b.t) return String(a.t).localeCompare(String(b.t));
-  const sa = Number(a.seq), sb = Number(b.seq);
-  if (Number.isFinite(sa) && Number.isFinite(sb)) return sa - sb;
-  return 0;
-});
+// PRESERVE FILE ORDER — every recorder (DebugRecorder, SlotOcr, HotbarOcr,
+// WorldBlockOpener) appends to events.jsonl atomically as the event fires,
+// so the line order in the file IS the causal order. Sorting by timestamp
+// is unreliable (ms-resolution clashes, batched writes can land out of
+// order); sorting by seq is even worse because each module uses its own
+// seq range (recorder=1+, SlotOcr=200001+, HotbarOcr=210001+, WorldBlockOpener=220001+),
+// dumping OCR events at the end of a seq sort. File order has no such issues.
 
 // Map each row to its likely associated image: probe → 0000N_probe_input.png,
 // action → fastui_action_NNNNN_input.png, ocr → 200NNN_slot_ocr.png, etc.
