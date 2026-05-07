@@ -846,39 +846,57 @@ export function discoverSlots(jpegBase64: string): DiscoveredLayout | null {
   }
   if (candidates.length === 0) return null;
 
-  // Overlap dedup: when two bboxes overlap significantly (e.g. armor
-  // shield and chestplate icons being detected as separate components
-  // inside the same slot, or item-icon contours nested inside the
-  // slot frame), drop the SMALLER one and keep the OUTER. We score
-  // overlap by intersection-over-union of the bboxes; anything >0.5
-  // is a duplicate of the larger.
+  // Overlap union-merge: when two bboxes overlap significantly (e.g. a
+  // wide item icon like diamond_sword whose tip+handle pixels flood-fill
+  // into two separate components that each fall inside the slot, or
+  // armor pieces with internal gaps), MERGE them into a single bbox
+  // covering both. We score overlap by intersection-over-union; anything
+  // >0.3 is treated as belonging to the same slot and unioned.
+  //
+  // Previous behaviour DROPPED the smaller component, which lost the
+  // outer extent of icons that spanned past one component's bounds and
+  // mis-positioned the slot center for items with disjoint pixel groups.
   {
-    const bboxOf = (s: typeof candidates[0]) => ({ x0: s.x, y0: s.y, x1: s.x + s.w - 1, y1: s.y + s.h - 1, area: s.w * s.h });
-    const drop = new Set<number>();
-    for (let i = 0; i < candidates.length; i += 1) {
-      if (drop.has(i)) continue;
-      const a = bboxOf(candidates[i]);
-      for (let j = i + 1; j < candidates.length; j += 1) {
-        if (drop.has(j)) continue;
-        const b = bboxOf(candidates[j]);
-        const ix0 = Math.max(a.x0, b.x0), iy0 = Math.max(a.y0, b.y0);
-        const ix1 = Math.min(a.x1, b.x1), iy1 = Math.min(a.y1, b.y1);
-        if (ix1 < ix0 || iy1 < iy0) continue;
-        const inter = (ix1 - ix0 + 1) * (iy1 - iy0 + 1);
-        const union = a.area + b.area - inter;
-        const iou = inter / union;
-        if (iou > 0.5) {
-          // Drop the smaller area; keep the larger (outer) bbox.
-          if (a.area >= b.area) drop.add(j);
-          else { drop.add(i); break; }
+    let changed = true;
+    while (changed) {
+      changed = false;
+      outer: for (let i = 0; i < candidates.length; i += 1) {
+        const a = candidates[i];
+        const ax0 = a.x, ay0 = a.y, ax1 = a.x + a.w - 1, ay1 = a.y + a.h - 1;
+        const aArea = a.w * a.h;
+        for (let j = i + 1; j < candidates.length; j += 1) {
+          const b = candidates[j];
+          const bx0 = b.x, by0 = b.y, bx1 = b.x + b.w - 1, by1 = b.y + b.h - 1;
+          const bArea = b.w * b.h;
+          const ix0 = Math.max(ax0, bx0), iy0 = Math.max(ay0, by0);
+          const ix1 = Math.min(ax1, bx1), iy1 = Math.min(ay1, by1);
+          if (ix1 < ix0 || iy1 < iy0) continue;
+          const inter = (ix1 - ix0 + 1) * (iy1 - iy0 + 1);
+          const iou = inter / (aArea + bArea - inter);
+          if (iou > 0.3) {
+            const ux0 = Math.min(ax0, bx0);
+            const uy0 = Math.min(ay0, by0);
+            const ux1 = Math.max(ax1, bx1);
+            const uy1 = Math.max(ay1, by1);
+            const merged = {
+              index: 0,
+              x: ux0,
+              y: uy0,
+              w: ux1 - ux0 + 1,
+              h: uy1 - uy0 + 1,
+              cx: Math.round((ux0 + ux1) / 2),
+              cy: Math.round((uy0 + uy1) / 2),
+            };
+            // Reject merged box that exceeds the maxSide budget — that
+            // means we're combining two genuinely separate slots.
+            if (merged.w > maxSide || merged.h > maxSide) continue;
+            candidates[i] = merged;
+            candidates.splice(j, 1);
+            changed = true;
+            break outer;
+          }
         }
       }
-    }
-    if (drop.size > 0) {
-      const kept: typeof candidates = [];
-      for (let i = 0; i < candidates.length; i += 1) if (!drop.has(i)) kept.push(candidates[i]);
-      candidates.length = 0;
-      for (const k of kept) candidates.push(k);
     }
   }
 
