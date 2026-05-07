@@ -113,7 +113,7 @@ When a sub-agent returns a failure with structured "Report fields" attached, par
 
 - code: "target_ui_not_in_view" (with target, alignIter, consecutiveNotVisible):
   The ui_inventory dispatch had gui_target=<block> but the world-block-opener could not find the block in view after scanning. Either the placing didn't actually deposit it (despite reporting done), it got knocked away, or the agent rotated. Recovery:
-    1. dispatch_subgoal(kind="world_explore", description="Turn around and look for a placed <target> block on the ground; centre the camera on it.", success_criteria="<target> block is visible in front of the player.").
+    1. dispatch_subgoal(kind="world_explore", description="A <target> block was placed on the ground in front of the player. Confirm it is visible — if so report task_done=true immediately without rotating. Only if it is genuinely not on screen, look down or scan with small camera turns to find it.", success_criteria="<target> block is visible in front of the player.").
     2. After world_explore done, re-dispatch the original ui_inventory with the same gui_target.
     3. If world_explore also fails to find the block, treat <target> as missing — re-dispatch placing(<target>) (which will re-run hotbar verify; if hotbar_missing_item then collect/fetch as appropriate).
 
