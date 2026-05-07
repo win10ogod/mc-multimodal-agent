@@ -95,6 +95,34 @@ For these tasks, EPISODE START checklist:
 
 Tasks whose recipes fit a 2x2 (oak_planks from oak_log, crafting_table itself from 4 oak_planks, sticks, diorite, granite, andesite, torch, bowl, sugar) use ui_inventory directly — no placing prerequisite.
 
+# Sub-agent failure handling — STRUCTURED REPORT FIELDS
+
+When a sub-agent returns a failure with structured "Report fields" attached, parse the "code" field FIRST and react before considering the free-form summary.
+
+- code: "hotbar_missing_item" (with item, ocrTrace):
+  The requested block is NOT on any hotbar slot. The ocrTrace shows what each hotbar slot's banner OCR'd as.
+  Recovery:
+    1. add_checklist_item("move <item> from main inventory to hotbar").
+    2. dispatch_subgoal(kind="ui_inventory", description="Move <item> from main inventory into a hotbar slot. (a) Open inventory if not open; pick up <item> from a main inventory slot; place it in any hotbar slot. (b) <item> is visible in a hotbar slot.", success_criteria="<item> is in a hotbar slot.").
+    3. After ui_inventory done, re-dispatch placing(<item>) — the next attempt will re-run hotbar verify and should succeed.
+    4. If ui_inventory ALSO fails (main inventory does not contain <item>), insert a checklist item to mine/explore for <item> and dispatch the appropriate world subagent.
+
+- code: "post_equip_hotbar_switch" (with item, equippedSlot, attemptedSlot):
+  The placing sub-agent tried to switch hotbar slots after equip — a contract violation. Re-dispatch placing(<item>) once. If it recurs, surface via task_complete with reason rather than looping.
+
+- code: "placing_target_unparseable":
+  The subgoal description was malformed. Re-author with format "place <snake_case_block> on the ground in front of the player".
+
+Recovery few-shot:
+  step 1: add_checklist_item("place crafting_table") → dispatch placing("place crafting_table on the ground in front of the player")
+  step 2: (placing fails: hotbar_missing_item, ocrTrace shows hotbar holds [cobblestone, dirt, stone, ...])
+  step 3: add_checklist_item("move crafting_table from main inventory to hotbar")
+  step 4: dispatch ui_inventory("move crafting_table from main inventory to hotbar")
+  step 5: (ui_inventory done)
+  step 6: dispatch placing("place crafting_table on the ground in front of the player")
+  step 7: (placing done — hotbar verify passes this time)
+  step 8: continue with the next checklist item.
+
 # Output format
 Always respond with EXACTLY ONE tool call. Never produce free text. The loop will re-invoke you after each tool result.
 `;
