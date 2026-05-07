@@ -43,7 +43,15 @@ for (const e of events) {
     case "verify":
     case "pre_check_move":
     case "planner_assistant":
-    case "planner_dispatch": {
+    case "planner_dispatch":
+    case "placing_call":
+    case "placing_response":
+    case "mining_call":
+    case "mining_response":
+    case "combat_call":
+    case "combat_response":
+    case "world_explore_call":
+    case "world_explore_response": {
       rows.push({ t, seq, type: e.type, data: e.data ?? {}, imageFile: e.imageFile });
       break;
     }
@@ -155,6 +163,37 @@ function summarize(row) {
         body: [
           d.tool_calls?.length ? `tools: ${d.tool_calls.map((tc) => `${tc.function?.name}(${tc.function?.arguments?.slice(0, 80)})`).join(" | ")}` : `content: ${(d.content || "").slice(0, 200)}`,
         ],
+      };
+    }
+    case "placing_call":
+    case "mining_call":
+    case "combat_call":
+    case "world_explore_call": {
+      const sg = d.subgoal ?? {};
+      return {
+        title: `[${row.type.replace("_call", "")} iter=${d.iteration}] subgoal: ${sg.description ?? "?"}`,
+        body: [
+          `success: ${sg.success_criteria ?? "?"}`,
+          `recent_history: ${(d.history ?? []).slice(-3).join(" | ")}`,
+        ],
+      };
+    }
+    case "placing_response":
+    case "mining_response":
+    case "combat_response":
+    case "world_explore_response": {
+      const p = d.parsed ?? {};
+      const a = p.action ?? {};
+      const buttons = ["attack","use","forward","back","left","right","jump","sneak","sprint","drop","inventory"]
+        .filter((k) => a[k] === 1);
+      const hotbar = Object.keys(a).filter((k) => k.startsWith("hotbar.") && a[k] === 1);
+      return {
+        title: `[${row.type.replace("_response", "")}] iter=${d.iteration} ${p.task_done ? "task_done=TRUE" : ""}`,
+        body: [
+          `pressed: ${[...buttons, ...hotbar].join(", ") || "(none)"}`,
+          `camera: ${JSON.stringify(a.camera ?? [0, 0])}`,
+          d.rawText ? `rawText: ${(d.rawText || "").slice(0, 120)}` : "",
+        ].filter(Boolean),
       };
     }
     default:

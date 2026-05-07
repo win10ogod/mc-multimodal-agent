@@ -6,6 +6,6 @@ export function createMining(deps: WorldSubAgentDeps): SubAgent {
   return {
     kind: "mining",
     systemPrompt: MINING_SYSTEM_PROMPT,
-    step: (input) => callWorldVlm(deps, MINING_SYSTEM_PROMPT, input),
+    step: (input) => callWorldVlm(deps, MINING_SYSTEM_PROMPT, input, "mining"),
   };
 }

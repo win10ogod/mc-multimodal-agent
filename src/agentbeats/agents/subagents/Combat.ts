@@ -6,6 +6,6 @@ export function createCombat(deps: WorldSubAgentDeps): SubAgent {
   return {
     kind: "combat",
     systemPrompt: COMBAT_SYSTEM_PROMPT,
-    step: (input) => callWorldVlm(deps, COMBAT_SYSTEM_PROMPT, input),
+    step: (input) => callWorldVlm(deps, COMBAT_SYSTEM_PROMPT, input, "combat"),
   };
 }
