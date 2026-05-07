@@ -1,10 +1,23 @@
 import type { SubAgent, SubAgentStep, SubAgentStepInput } from "../SubAgent";
 import { PLACING_SYSTEM_PROMPT } from "../../prompts/subagents/placing";
-import { callWorldVlm, type WorldSubAgentDeps } from "./WorldExplorer";
+import { type WorldSubAgentDeps } from "./WorldExplorer";
 import { HotbarVerifier } from "../../tools/HotbarVerifier";
-import { defaultMcuAction, type McuButtonKey, type McuEnvAction } from "../../McuPrompt";
+import { defaultMcuAction, type McuEnvAction } from "../../McuPrompt";
 
-type PlacingPhase = "equip" | "post_equip";
+// Phase machine:
+//   equip    : runtime HotbarVerifier sweeps hotbar slots, OCR-confirms target
+//   aim_down : single hard camera tilt down so the crosshair lands on ground
+//   settle   : noop frame to let camera lerp finish before use
+//   place    : single use=1 frame
+//   post     : noop frame to let MC register the placement
+//   done     : returns subgoal_done; planner verifies via inspect_inventory/visual.
+//
+// We deliberately keep the LLM out of the place macro: in eval cake (run 3) the
+// LLM held the verified crafting_table for 54 frames and never committed to
+// use=1 — it kept emitting micro camera tilts. A deterministic 5-frame macro
+// guarantees a place attempt; if the world is genuinely obstructed the planner
+// will re-dispatch after seeing no crafting_table on its next inspect.
+type PlacingPhase = "equip" | "aim_down" | "settle" | "place" | "post" | "done";
 
 type PlacingState = {
   subgoalKey: string;
@@ -14,19 +27,24 @@ type PlacingState = {
   equippedSlot: number | null;
 };
 
-const HOTBAR_KEYS: ReadonlyArray<McuButtonKey> = [
-  "hotbar.1", "hotbar.2", "hotbar.3", "hotbar.4", "hotbar.5",
-  "hotbar.6", "hotbar.7", "hotbar.8", "hotbar.9",
-];
+// Hard tilt — measured from MC: pitch +45 deg from neutral horizon points the
+// crosshair at the ground tile ~1 block in front of the player on flat terrain.
+const PLACE_PITCH_DEG = 45;
 
-function emittedHotbarSlot(action: McuEnvAction): number | null {
-  for (let i = 0; i < HOTBAR_KEYS.length; i += 1) {
-    const k = HOTBAR_KEYS[i]!;
-    if ((action as Record<string, number | [number, number]>)[k] === 1) {
-      return i + 1;
-    }
-  }
-  return null;
+function camAction(yawDeg: number, pitchDeg: number): McuEnvAction {
+  const a = defaultMcuAction();
+  a.camera = [yawDeg, pitchDeg];
+  return a;
+}
+
+function useAction(): McuEnvAction {
+  const a = defaultMcuAction();
+  a.use = 1;
+  return a;
+}
+
+function noop(): McuEnvAction {
+  return defaultMcuAction();
 }
 
 /** Resolve the placing target. Prefer the structured subgoal.target field
@@ -92,30 +110,44 @@ export function createPlacing(deps: WorldSubAgentDeps): SubAgent {
           return { kind: "act", action: r.action, holdSteps: r.holdSteps };
         }
         if (r.kind === "done") {
-          state.phase = "post_equip";
+          state.phase = "aim_down";
           state.equippedSlot = r.equippedSlot;
-          return { kind: "act", action: defaultMcuAction(), holdSteps: 1 };
+          console.log(`[placing-macro] equip done → aim_down (target=${state.target}, slot=${r.equippedSlot})`);
+          return { kind: "act", action: noop(), holdSteps: 1 };
         }
         return { kind: "subgoal_failed", reason: r.reason, reportFields: r.reportFields };
       }
 
-      const llmStep = await callWorldVlm(deps, PLACING_SYSTEM_PROMPT, input, "placing");
-      if (llmStep.kind === "act") {
-        const slot = emittedHotbarSlot(llmStep.action);
-        if (slot !== null) {
-          return {
-            kind: "subgoal_failed",
-            reason: `post_equip_hotbar_switch: attempted hotbar.${slot} after equip on hotbar.${state.equippedSlot}`,
-            reportFields: {
-              code: "post_equip_hotbar_switch",
-              item: state.target,
-              equippedSlot: state.equippedSlot,
-              attemptedSlot: slot,
-            },
-          };
-        }
+      if (state.phase === "aim_down") {
+        state.phase = "settle";
+        console.log(`[placing-macro] aim_down → settle (camera=[0, +${PLACE_PITCH_DEG}])`);
+        return { kind: "act", action: camAction(0, PLACE_PITCH_DEG), holdSteps: 2 };
       }
-      return llmStep;
+
+      if (state.phase === "settle") {
+        state.phase = "place";
+        console.log(`[placing-macro] settle → place`);
+        return { kind: "act", action: noop(), holdSteps: 1 };
+      }
+
+      if (state.phase === "place") {
+        state.phase = "post";
+        console.log(`[placing-macro] place → post (use=1)`);
+        return { kind: "act", action: useAction(), holdSteps: 2 };
+      }
+
+      if (state.phase === "post") {
+        state.phase = "done";
+        console.log(`[placing-macro] post → done`);
+        return { kind: "act", action: noop(), holdSteps: 2 };
+      }
+
+      // phase === "done"
+      console.log(`[placing-macro] subgoal_done target=${state.target}`);
+      return {
+        kind: "subgoal_done",
+        summary: `placed ${state.target} via deterministic macro (equip hotbar.${state.equippedSlot} → tilt +${PLACE_PITCH_DEG} → use)`,
+      };
     },
   };
 }
