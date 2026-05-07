@@ -31,6 +31,11 @@ const DISPATCH_TOOL_DEF = {
           description:
             "Structured target identifier (snake_case Minecraft id, e.g. 'crafting_table'). REQUIRED when kind='placing' so the runtime can verify the equipped hotbar slot. Optional / ignored for other kinds.",
         },
+        gui_target: {
+          type: "string",
+          description:
+            "For kind='ui_inventory': which GUI to interact with. Omit or use 'player_inventory' for the default 2x2 inventory (opened with the inventory key). Use a block id (e.g. 'crafting_table', 'furnace', 'chest') when the recipe requires the placed block's GUI — the runtime will align the camera to centre that block on the crosshair and right-click it to open. The placed block MUST already be in front of the agent (a prior placing(<block>) dispatch is the typical setup); if not visible the subagent reports target_ui_not_in_view.",
+        },
       },
       required: ["kind", "description", "success_criteria"],
       additionalProperties: false,
