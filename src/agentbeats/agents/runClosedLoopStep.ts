@@ -1527,9 +1527,10 @@ export async function runClosedLoopStep(
           const matchesExpected = tooltipItem !== "empty" && tooltipItem !== "unknown" && tooltipItem === job.expectedItem;
           if (matchesExpected) {
             console.log(`[cursor-verify] tooltip="${tooltipItem}" matches expected — cursor confirmed EMPTY (clearing cursorItemSignature)`);
+            const previouslyHeld = plan.cursorItemSignature?.item ?? "item";
             plan.cursorItemSignature = null;
             plan.pickupSourceSlot = null;
-            state.closedLoopHistory.unshift(`cursor-verify: confirmed cursor empty via OCR(${job.slotName ?? job.knownSlotIdx})="${tooltipItem}"; previous "holding" was stale`);
+            state.closedLoopHistory.unshift(`cursor-verify (OCR-confirmed via tooltip): the ${previouslyHeld} the previous context said you were holding is now confirmed empty — it was fully placed/consumed in the prior step. The place_all destination is empty as expected; treat that subtask as completed and continue with the next recipe step.`);
             state.closedLoopHistory = state.closedLoopHistory.slice(0, 5);
           } else {
             console.warn(`[cursor-verify] tooltip="${tooltipItem}" expected="${job.expectedItem}" — cursor probably STILL holding (or anomaly); leaving cursorItemSignature unchanged`);
