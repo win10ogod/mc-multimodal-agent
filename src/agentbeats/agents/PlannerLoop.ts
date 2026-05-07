@@ -145,6 +145,17 @@ export async function runPlannerLoop(
       }
       if (fname === "dispatch_subgoal") {
         const sg = fargs as Subgoal;
+        // OpenAI's chat API requires every assistant tool_call to be answered
+        // by a tool-role message before the next assistant/user turn. Without
+        // this synthetic ack, the saved plannerMessages becomes malformed
+        // when the next observation pushes the user reflection — and the
+        // following chat.completions.create either errors or hangs forever
+        // on reasoning models.
+        state.plannerMessages.push({
+          role: "tool",
+          tool_call_id: tc.id as string,
+          content: `dispatched ${sg.kind}: ${sg.description}`,
+        });
         console.log(`[planner] DISPATCH ${sg.kind} <- "${sg.description}" (success: "${sg.success_criteria}")`);
         await log("planner_dispatch", { hop, subgoal: sg });
         return { kind: "dispatch", subgoal: sg };
