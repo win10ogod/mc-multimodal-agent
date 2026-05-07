@@ -70,6 +70,22 @@ export async function dispatchObservation(
     }
   })();
 
+  // World subagents (placing / world_explore / mining / combat) require
+  // world view, not an open GUI. If a GUI is open at the moment the planner
+  // dispatched a world subagent (typical: episode-init pre-armed open-inventory
+  // macro fires, recipe-needs-3x3 BLOCKS, planner dispatches placing(crafting_table),
+  // but the inventory is still open), close the GUI first by emitting
+  // inventory=1, then route to the subagent on the next observation.
+  if (
+    guiOpen
+    && (current.kind === "placing" || current.kind === "world_explore" || current.kind === "mining" || current.kind === "combat")
+  ) {
+    console.log(`[dispatcher] closing GUI before delegating to ${current.kind} subagent (subgoal: "${current.description.slice(0, 80)}")`);
+    const closeAction = defaultMcuAction();
+    closeAction.inventory = 1;
+    return { action: closeAction, holdSteps: 1, taskDone: false };
+  }
+
   // For ui_inventory dispatches with gui_target set (e.g. cake → use placed
   // crafting_table), run the WorldBlockOpener align+use macro before falling
   // through to the regular closed-loop step. Once the opener reports done,
