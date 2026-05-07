@@ -136,14 +136,9 @@ function noop(): McuEnvAction {
   return defaultMcuAction();
 }
 
-let DEBUG_SEQ = 220000;
-
 function recordDebug(target: string, payload: Record<string, unknown>, obsBase64?: string): void {
   const dbg = getDebugRecorder();
   if (!dbg.isEnabled()) return;
-  // Use the canonical recorder for the OCR-style image attachment so the
-  // dashboard can render it; for plain phase logs go through record() with
-  // no image to keep things small.
   if (obsBase64) {
     dbg.record(
       { type: "world_block_opener", data: { target, ...payload } },
@@ -152,22 +147,9 @@ function recordDebug(target: string, payload: Record<string, unknown>, obsBase64
     );
     return;
   }
-  // Manual append for ultra-light phase logs (no image, no PNG conversion).
-  const debugDir = process.env.AGENTBEATS_DEBUG_DIR;
-  if (!debugDir) return;
-  try {
-    const seq = String(++DEBUG_SEQ).padStart(5, "0");
-    const line = JSON.stringify({
-      seq: DEBUG_SEQ,
-      ts: new Date().toISOString(),
-      type: "world_block_opener_step",
-      data: { target, ...payload },
-    });
-    fs.appendFileSync(path.join(debugDir, "events.jsonl"), line + "\n");
-    void seq;
-  } catch (e) {
-    console.warn(`[world-block-opener] debug write failed: ${e instanceof Error ? e.message : String(e)}`);
-  }
+  // Phase log without an image still goes through the recorder so seq is
+  // globally monotonic with all other events.
+  dbg.record({ type: "world_block_opener_step", data: { target, ...payload } });
 }
 
 export class WorldBlockOpener {

@@ -16,8 +16,7 @@
  * whose jpeg-js decode comes out BGR.
  */
 import type OpenAI from "openai";
-import * as fs from "node:fs";
-import * as path from "node:path";
+import { getDebugRecorder } from "./DebugRecorder";
 
 export type HotbarBannerMatchOpts = {
   client: OpenAI;
@@ -109,28 +108,16 @@ export async function hotbarBannerMatch(opts: HotbarBannerMatchOpts): Promise<Ho
       return { match: false, observed: "" };
     }
   })();
-  const debugDir = process.env.AGENTBEATS_DEBUG_DIR;
-  if (debugDir) {
-    try {
-      const seq = String(++DEBUG_SEQ).padStart(5, "0");
-      const fname = `${seq}_hotbar_ocr.png`;
-      fs.writeFileSync(path.join(debugDir, fname), Buffer.from(cropB64, "base64"));
-      const line = JSON.stringify({
-        seq: DEBUG_SEQ,
-        ts: new Date().toISOString(),
-        type: "hotbar_ocr",
-        imageFile: fname,
-        data: { target: opts.target, candidateLabel: opts.candidateLabel ?? null, raw, parsed },
-      });
-      fs.appendFileSync(path.join(debugDir, "events.jsonl"), line + "\n");
-    } catch (e) {
-      console.warn(`[hotbar-ocr] debug write failed: ${e instanceof Error ? e.message : String(e)}`);
-    }
+  const dbg = getDebugRecorder();
+  if (dbg.isEnabled()) {
+    dbg.record(
+      { type: "hotbar_ocr", data: { target: opts.target, candidateLabel: opts.candidateLabel ?? null, raw, parsed } },
+      cropB64,
+      "png",
+    );
   }
   return parsed;
 }
-
-let DEBUG_SEQ = 210000;
 
 function cropBannerRegion(obsBase64: string): string {
   // eslint-disable-next-line @typescript-eslint/no-require-imports
