@@ -32,11 +32,6 @@ type PlacingPhase =
   | "verify_swap_to"
   | "verify_settle"
   | "verify_read"
-  // After verify confirms placement, if the target opens a GUI (crafting_table,
-  // furnace, chest, etc.) emit one more use=1 to right-click the placed block
-  // and leave the agent inside the GUI for ui_inventory to take over.
-  | "open_gui"
-  | "open_settle"
   | "done";
 
 type PlacingState = {
@@ -46,35 +41,7 @@ type PlacingState = {
   verifier: HotbarVerifier | null;
   equippedSlot: number | null;
   verifySettleCounter: number;
-  openSettleCounter: number;
 };
-
-/** Block ids whose right-click opens an interactable GUI. After placing
- *  any of these, the macro emits one more use=1 to leave the agent
- *  inside that GUI for ui_inventory to take over. Other placeables
- *  (dirt, cobblestone, oak_log, ...) skip the open phase and just exit
- *  with the player still in world view. */
-const OPEN_GUI_BLOCKS: ReadonlySet<string> = new Set([
-  "crafting_table",
-  "furnace",
-  "chest",
-  "ender_chest",
-  "smoker",
-  "blast_furnace",
-  "stonecutter",
-  "loom",
-  "smithing_table",
-  "cartography_table",
-  "fletching_table",
-  "anvil",
-  "brewing_stand",
-  "enchanting_table",
-  "dispenser",
-  "dropper",
-  "hopper",
-  "shulker_box",
-  "barrel",
-]);
 
 // Hard tilt — measured from MC: pitch +45 deg from neutral horizon points the
 // crosshair at the ground tile ~1 block in front of the player on flat terrain.
@@ -141,7 +108,6 @@ export function createPlacing(deps: WorldSubAgentDeps): SubAgent {
       }),
       equippedSlot: null,
       verifySettleCounter: 0,
-      openSettleCounter: 0,
     };
   }
 
@@ -254,37 +220,15 @@ export function createPlacing(deps: WorldSubAgentDeps): SubAgent {
             },
           };
         }
-        if (OPEN_GUI_BLOCKS.has(state.target)) {
-          state.phase = "open_gui";
-          // Fall through to open_gui on next call.
-        } else {
-          state.phase = "done";
-          // Fall through to done.
-        }
-      }
-
-      if (state.phase === "open_gui") {
-        state.phase = "open_settle";
-        state.openSettleCounter = 0;
-        console.log(`[placing-macro] verify_done → open_gui (use=1 to right-click placed ${state.target})`);
-        return { kind: "act", action: useAction(), holdSteps: 2 };
-      }
-
-      if (state.phase === "open_settle") {
-        if (state.openSettleCounter < 1) {
-          state.openSettleCounter += 1;
-          return { kind: "act", action: noop(), holdSteps: 1 };
-        }
         state.phase = "done";
-        // Fall through.
+        // Fall through to done.
       }
 
       // phase === "done"
-      const openedSuffix = OPEN_GUI_BLOCKS.has(state.target) ? " and opened its GUI" : "";
-      console.log(`[placing-macro] subgoal_done target=${state.target} (verified consumed${openedSuffix})`);
+      console.log(`[placing-macro] subgoal_done target=${state.target} (verified consumed)`);
       return {
         kind: "subgoal_done",
-        summary: `placed ${state.target} via deterministic macro (equip hotbar.${state.equippedSlot} → tilt +${PLACE_PITCH_DEG} → use → verified item consumed${openedSuffix})`,
+        summary: `placed ${state.target} via deterministic macro (equip hotbar.${state.equippedSlot} → tilt +${PLACE_PITCH_DEG} → use → verified item consumed)`,
       };
     },
   };
