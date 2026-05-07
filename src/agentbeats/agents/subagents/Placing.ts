@@ -2,7 +2,8 @@ import type { SubAgent, SubAgentStep, SubAgentStepInput } from "../SubAgent";
 import { PLACING_SYSTEM_PROMPT } from "../../prompts/subagents/placing";
 import { type WorldSubAgentDeps } from "./WorldExplorer";
 import { HotbarVerifier } from "../../tools/HotbarVerifier";
-import { defaultMcuAction, type McuEnvAction } from "../../McuPrompt";
+import { hotbarBannerMatch } from "../../tools/HotbarOcr";
+import { defaultMcuAction, type McuButtonKey, type McuEnvAction } from "../../McuPrompt";
 
 // Phase machine:
 //   equip    : runtime HotbarVerifier sweeps hotbar slots, OCR-confirms target
@@ -17,7 +18,21 @@ import { defaultMcuAction, type McuEnvAction } from "../../McuPrompt";
 // use=1 — it kept emitting micro camera tilts. A deterministic 5-frame macro
 // guarantees a place attempt; if the world is genuinely obstructed the planner
 // will re-dispatch after seeing no crafting_table on its next inspect.
-type PlacingPhase = "equip" | "aim_down" | "settle" | "place" | "post" | "done";
+type PlacingPhase =
+  | "equip"
+  | "aim_down"
+  | "settle"
+  | "place"
+  | "post"
+  // Post-place verify phases (FastUI-inspired): swap away from equipped slot,
+  // swap back to force the held-item banner to render again, settle, then
+  // OCR the banner. If the target name still appears, the use=1 didn't
+  // actually consume the item (obstructed, looking at sky, etc.) — escalate.
+  | "verify_swap_away"
+  | "verify_swap_to"
+  | "verify_settle"
+  | "verify_read"
+  | "done";
 
 type PlacingState = {
   subgoalKey: string;
@@ -25,6 +40,7 @@ type PlacingState = {
   phase: PlacingPhase;
   verifier: HotbarVerifier | null;
   equippedSlot: number | null;
+  verifySettleCounter: number;
 };
 
 // Hard tilt — measured from MC: pitch +45 deg from neutral horizon points the
@@ -43,9 +59,17 @@ function useAction(): McuEnvAction {
   return a;
 }
 
+function hotbarAct(slot: number): McuEnvAction {
+  const a = defaultMcuAction();
+  (a as Record<McuButtonKey | "camera", unknown>)[`hotbar.${slot}` as McuButtonKey] = 1;
+  return a;
+}
+
 function noop(): McuEnvAction {
   return defaultMcuAction();
 }
+
+const VERIFY_SETTLE_FRAMES = 1;
 
 /** Resolve the placing target. Prefer the structured subgoal.target field
  *  (filled by the GoalPlanner via dispatch_subgoal). Fall back to a regex
@@ -83,6 +107,7 @@ export function createPlacing(deps: WorldSubAgentDeps): SubAgent {
         subgoalDescription: subgoal.description,
       }),
       equippedSlot: null,
+      verifySettleCounter: 0,
     };
   }
 
@@ -137,16 +162,73 @@ export function createPlacing(deps: WorldSubAgentDeps): SubAgent {
       }
 
       if (state.phase === "post") {
+        const equipped = state.equippedSlot ?? 1;
+        const swapAway = (equipped % 9) + 1;
+        state.phase = "verify_swap_away";
+        console.log(`[placing-macro] post → verify_swap_away (hotbar.${swapAway})`);
+        return { kind: "act", action: hotbarAct(swapAway), holdSteps: 1 };
+      }
+
+      if (state.phase === "verify_swap_away") {
+        const equipped = state.equippedSlot ?? 1;
+        state.phase = "verify_swap_to";
+        console.log(`[placing-macro] verify_swap_away → verify_swap_to (hotbar.${equipped})`);
+        return { kind: "act", action: hotbarAct(equipped), holdSteps: 1 };
+      }
+
+      if (state.phase === "verify_swap_to") {
+        state.phase = "verify_settle";
+        state.verifySettleCounter = 0;
+        console.log(`[placing-macro] verify_swap_to → verify_settle`);
+        return { kind: "act", action: noop(), holdSteps: 1 };
+      }
+
+      if (state.phase === "verify_settle") {
+        if (state.verifySettleCounter < VERIFY_SETTLE_FRAMES) {
+          state.verifySettleCounter += 1;
+          return { kind: "act", action: noop(), holdSteps: 1 };
+        }
+        state.phase = "verify_read";
+        // Fall through to read on the same frame so the banner is freshest.
+      }
+
+      if (state.phase === "verify_read") {
+        const result = await hotbarBannerMatch({
+          client: deps.client,
+          model: deps.model,
+          obsBase64: input.obs.imageBase64,
+          target: state.target,
+          candidateLabel: `hotbar.${state.equippedSlot ?? "?"} (post-place verify)`,
+        });
+        console.log(`[placing-macro] verify_read observed=${JSON.stringify(result.observed)} match=${result.match}`);
+        if (result.match) {
+          // Banner still shows the target → place did not consume the item.
+          // Most common cause: crosshair on sky / blocked by entity / the
+          // target slot has a stack >1 (we placed one but more remain — the
+          // place actually succeeded but the consume signal is ambiguous).
+          // For stack=1 cases (typical for crafting_table in eval givens)
+          // this is a true failure signal; escalate so the planner can
+          // re-dispatch and re-run the macro.
+          return {
+            kind: "subgoal_failed",
+            reason: `place_did_not_consume: ${state.target} still on hotbar.${state.equippedSlot} after use=1`,
+            reportFields: {
+              code: "place_did_not_consume",
+              item: state.target,
+              equippedSlot: state.equippedSlot,
+              observed: result.observed,
+            },
+          };
+        }
         state.phase = "done";
-        console.log(`[placing-macro] post → done`);
-        return { kind: "act", action: noop(), holdSteps: 2 };
+        // Fall through to done.
       }
 
       // phase === "done"
-      console.log(`[placing-macro] subgoal_done target=${state.target}`);
+      console.log(`[placing-macro] subgoal_done target=${state.target} (verified consumed)`);
       return {
         kind: "subgoal_done",
-        summary: `placed ${state.target} via deterministic macro (equip hotbar.${state.equippedSlot} → tilt +${PLACE_PITCH_DEG} → use)`,
+        summary: `placed ${state.target} via deterministic macro (equip hotbar.${state.equippedSlot} → tilt +${PLACE_PITCH_DEG} → use → verified item consumed)`,
       };
     },
   };
