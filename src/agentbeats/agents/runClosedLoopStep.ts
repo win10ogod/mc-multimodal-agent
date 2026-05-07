@@ -304,21 +304,18 @@ export async function runClosedLoopStep(
             state.closedLoopHistory.unshift(`cursor-verify (OCR-confirmed via tooltip): the ${previouslyHeld} the previous context said you were holding is now confirmed empty — it was fully placed/consumed in the prior step. The place_all destination is empty as expected; treat that subtask as completed and continue with the next recipe step.`);
             state.closedLoopHistory = state.closedLoopHistory.slice(0, 5);
           } else {
-            // Two cases produce a non-match:
-            //   (a) OCR returns "empty" — slot is genuinely empty now;
-            //       slotMemory was stale (previous content moved away).
-            //       Invalidate the stale entry so the NEXT cursor-verify
-            //       trigger picks a different known slot.
-            //   (b) OCR returns a different item — slotMemory is stale or
-            //       the cursor IS holding (suppressing tooltip would give
-            //       "empty" not a different name). Invalidate too.
-            if (tooltipItem === "empty" || tooltipItem === "unknown" || tooltipItem !== job.expectedItem) {
-              plan.slotMemory.invalidate(job.target.x, job.target.y);
-              console.warn(`[cursor-verify] tooltip="${tooltipItem}" expected="${job.expectedItem}" — cursor probably STILL holding (or stale memory); invalidated slotMemory at ${job.slotName ?? job.knownSlotIdx} so next verify picks a different known slot`);
-            } else {
-              console.warn(`[cursor-verify] tooltip="${tooltipItem}" expected="${job.expectedItem}" — leaving cursorItemSignature unchanged`);
-            }
-            state.closedLoopHistory.unshift(`cursor-verify: OCR(${job.slotName ?? job.knownSlotIdx}) returned "${tooltipItem}" (expected "${job.expectedItem}"); slotMemory entry invalidated, cursor state unchanged.`);
+            // OCR returned "empty"/"unknown" or a different name. We're
+            // using OCR to PROBE cursor state — when the cursor is holding,
+            // MC suppresses ALL slot tooltips, so an "empty" reading on a
+            // known-occupied slot is the EXPECTED holding signal, not
+            // evidence that the slot is now empty. Do NOT update slotMemory
+            // from cursor-verify OCR — that would erase legitimate context
+            // (e.g. wipe the book entry at craft_3x3_1 because cursor was
+            // suppressing its tooltip). Cursor state stays "holding"; the
+            // outer planner gets a feedback line and can decide what to
+            // do next.
+            console.warn(`[cursor-verify] tooltip="${tooltipItem}" expected="${job.expectedItem}" — cursor probably STILL holding (tooltip suppressed by held item); leaving slotMemory and cursorItemSignature unchanged`);
+            state.closedLoopHistory.unshift(`cursor-verify: OCR(${job.slotName ?? job.knownSlotIdx}) returned "${tooltipItem}" (expected "${job.expectedItem}"); cursor likely still holding ${plan.cursorItemSignature?.item ?? "(?)"} — slot memory preserved.`);
             state.closedLoopHistory = state.closedLoopHistory.slice(0, 5);
           }
           plan.cursorVerifyJob = null;
