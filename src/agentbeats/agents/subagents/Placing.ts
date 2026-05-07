@@ -29,15 +29,20 @@ function emittedHotbarSlot(action: McuEnvAction): number | null {
   return null;
 }
 
-/** Extract the snake_case block name from a Placing subgoal description.
- *  Matches the goal_planner few-shot formats, with or without a leading article:
- *    "place crafting_table on the ground..."
- *    "Try to place a crafting_table at..."
- *    "place the crafting_table..."
- *  Skips "a"/"an"/"the" so the captured token is the actual block name (2+ chars). */
-function extractPlacingTarget(description: string): string | null {
-  const m = description.match(/\bplace\s+(?:(?:a|an|the)\s+)?([a-z][a-z0-9_]+)/i);
-  return m ? m[1].toLowerCase() : null;
+/** Resolve the placing target. Prefer the structured subgoal.target field
+ *  (filled by the GoalPlanner via dispatch_subgoal). Fall back to a regex
+ *  on the description for backwards compat when an older planner doesn't
+ *  pass target — but log a warning so we notice the planner regression. */
+function resolvePlacingTarget(subgoal: { target?: string; description: string }): string | null {
+  if (subgoal.target && /^[a-z][a-z0-9_]+$/.test(subgoal.target)) {
+    return subgoal.target.toLowerCase();
+  }
+  const m = subgoal.description.match(/\bplace\s+(?:(?:a|an|the)\s+)?([a-z][a-z0-9_]+)/i);
+  if (m) {
+    console.warn(`[placing] subgoal.target missing; fell back to regex parse of description: "${subgoal.description}" -> ${m[1]}`);
+    return m[1].toLowerCase();
+  }
+  return null;
 }
 
 export function createPlacing(deps: WorldSubAgentDeps): SubAgent {
@@ -47,7 +52,7 @@ export function createPlacing(deps: WorldSubAgentDeps): SubAgent {
     subgoal: SubAgentStepInput["subgoal"],
     contextId: string,
   ): PlacingState | null {
-    const target = extractPlacingTarget(subgoal.description);
+    const target = resolvePlacingTarget(subgoal);
     if (!target) return null;
     return {
       subgoalKey: subgoal.description,

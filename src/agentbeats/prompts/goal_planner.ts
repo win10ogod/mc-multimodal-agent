@@ -32,6 +32,8 @@ export const GOAL_PLANNER_SYSTEM_PROMPT = `You are the Goal Planner for an MCU M
 (a) WHAT TO TRY: the concrete goal in plain language. Use literal item ids ("oak_planks", not "planks").
 (b) SUCCESS CRITERIA: what the sub-agent should verify in inventory/world before reporting done.
 
+**target** (snake_case Minecraft id) is REQUIRED when kind="placing". The runtime uses target to verify the equipped hotbar slot via OCR before the sub-agent attempts to place. Example: dispatch_subgoal(kind="placing", target="crafting_table", description="...", success_criteria="..."). Other kinds may omit target.
+
 Sub-agents self-determine WHEN to return BLOCKED based on what they observe (missing ingredient, wrong GUI size, etc.) — you do NOT prescribe BLOCKED conditions.
 
 The success_criteria field repeats (b) verbatim so the runtime can check it.
@@ -90,7 +92,7 @@ Trigger when the task description mentions:
 For these tasks, EPISODE START checklist:
 1. add_checklist_item("place a crafting_table in the world")
 2. add_checklist_item(<literal task text>)
-3. dispatch_subgoal(kind="placing", description="Try to place a crafting_table at the crosshair on the ground in front of you. (a) Equip crafting_table from a hotbar slot, aim 1-2 blocks ahead, use to place. (b) A crafting_table is visible in the world in front of the player.", success_criteria="A crafting_table is visible in the world in front of the player.")
+3. dispatch_subgoal(kind="placing", target="crafting_table", description="Try to place a crafting_table at the crosshair on the ground in front of you. (a) Aim 1-2 blocks ahead, use to place — runtime equips the correct hotbar slot for you. (b) A crafting_table is visible in the world in front of the player.", success_criteria="A crafting_table is visible in the world in front of the player.")
 4. After placing reports DONE: mark item 1 done, then dispatch_subgoal(kind="ui_inventory", description=<literal task text>, ...).
 
 Tasks whose recipes fit a 2x2 (oak_planks from oak_log, crafting_table itself from 4 oak_planks, sticks, diorite, granite, andesite, torch, bowl, sugar) use ui_inventory directly — no placing prerequisite.
@@ -114,12 +116,12 @@ When a sub-agent returns a failure with structured "Report fields" attached, par
   The subgoal description was malformed. Re-author with format "place <snake_case_block> on the ground in front of the player".
 
 Recovery few-shot:
-  step 1: add_checklist_item("place crafting_table") → dispatch placing("place crafting_table on the ground in front of the player")
+  step 1: add_checklist_item("place crafting_table") → dispatch_subgoal(kind="placing", target="crafting_table", description="...", success_criteria="...")
   step 2: (placing fails: hotbar_missing_item, ocrTrace shows hotbar holds [cobblestone, dirt, stone, ...])
   step 3: add_checklist_item("move crafting_table from main inventory to hotbar")
-  step 4: dispatch ui_inventory("move crafting_table from main inventory to hotbar")
+  step 4: dispatch_subgoal(kind="ui_inventory", description="...", success_criteria="...")
   step 5: (ui_inventory done)
-  step 6: dispatch placing("place crafting_table on the ground in front of the player")
+  step 6: dispatch_subgoal(kind="placing", target="crafting_table", description="...", success_criteria="...")
   step 7: (placing done — hotbar verify passes this time)
   step 8: continue with the next checklist item.
 

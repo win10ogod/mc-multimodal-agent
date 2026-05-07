@@ -26,6 +26,11 @@ const DISPATCH_TOOL_DEF = {
         kind: { type: "string", enum: ["ui_inventory", "world_explore", "mining", "combat", "placing"] },
         description: { type: "string" },
         success_criteria: { type: "string" },
+        target: {
+          type: "string",
+          description:
+            "Structured target identifier (snake_case Minecraft id, e.g. 'crafting_table'). REQUIRED when kind='placing' so the runtime can verify the equipped hotbar slot. Optional / ignored for other kinds.",
+        },
       },
       required: ["kind", "description", "success_criteria"],
       additionalProperties: false,

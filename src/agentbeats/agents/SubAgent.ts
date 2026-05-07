@@ -14,6 +14,10 @@ export type Subgoal = {
   kind: SubAgentKind;
   description: string;
   success_criteria: string;
+  /** Structured target identifier for sub-agents that act on a single
+   *  named entity (e.g. placing.target = "crafting_table"). Required
+   *  for kind="placing"; ignored by other kinds today. */
+  target?: string;
 };
 
 export type SubAgentStep =
