@@ -851,7 +851,7 @@ export function discoverSlots(jpegBase64: string): DiscoveredLayout | null {
   // into two separate components that each fall inside the slot, or
   // armor pieces with internal gaps), MERGE them into a single bbox
   // covering both. We score overlap by intersection-over-union; anything
-  // >0.3 is treated as belonging to the same slot and unioned.
+  // >0.1 (10%+ overlap) is treated as belonging to the same slot.
   //
   // Previous behaviour DROPPED the smaller component, which lost the
   // outer extent of icons that spanned past one component's bounds and
@@ -873,7 +873,7 @@ export function discoverSlots(jpegBase64: string): DiscoveredLayout | null {
           if (ix1 < ix0 || iy1 < iy0) continue;
           const inter = (ix1 - ix0 + 1) * (iy1 - iy0 + 1);
           const iou = inter / (aArea + bArea - inter);
-          if (iou > 0.3) {
+          if (iou > 0.1) {
             const ux0 = Math.min(ax0, bx0);
             const uy0 = Math.min(ay0, by0);
             const ux1 = Math.max(ax1, bx1);
