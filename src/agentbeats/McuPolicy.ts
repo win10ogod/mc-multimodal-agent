@@ -379,6 +379,7 @@ export class McuVisualPolicy {
   private readonly contexts = new Map<string, McuContextState>();
   private readonly toolDrivers = new Map<string, import("./McuToolDriver").McuToolDriver>();
   private readonly episodes = new Map<string, EpisodeState>();
+  private subagents: Record<SubAgentKind, SubAgent> | null = null;
 
   constructor(private readonly config: AgentConfig) {
     this.client = new OpenAI({
@@ -556,17 +557,25 @@ export class McuVisualPolicy {
       this.episodes.set(contextId, episode);
     }
 
-    const worldDeps = { client: this.client, model: this.config.openai.model };
-    const subagents: Record<SubAgentKind, SubAgent> = {
-      ui_inventory: {
-        kind: "ui_inventory", systemPrompt: "",
-        step: async () => ({ kind: "subgoal_failed", reason: "ui_inventory must be invoked via runClosedLoopStep (GUI gate)" }),
-      },
-      world_explore: createWorldExplorer(worldDeps),
-      mining: createMining(worldDeps),
-      combat: createCombat(worldDeps),
-      placing: createPlacing(worldDeps),
-    };
+    // Subagents are cached at the class level so per-subgoal closure state
+    // (e.g. Placing's HotbarVerifier) survives across observation steps.
+    // Previous bug: rebuilding the map every dispatchEpisode reset Placing's
+    // verifier on every frame, leaving it perpetually stuck in the first
+    // "swap_away" inner phase with no progress.
+    if (!this.subagents) {
+      const worldDeps = { client: this.client, model: this.config.openai.model };
+      this.subagents = {
+        ui_inventory: {
+          kind: "ui_inventory", systemPrompt: "",
+          step: async () => ({ kind: "subgoal_failed", reason: "ui_inventory must be invoked via runClosedLoopStep (GUI gate)" }),
+        },
+        world_explore: createWorldExplorer(worldDeps),
+        mining: createMining(worldDeps),
+        combat: createCombat(worldDeps),
+        placing: createPlacing(worldDeps),
+      };
+    }
+    const subagents = this.subagents;
 
     const recorder = getDebugRecorder();
     const closedLoopDeps = {

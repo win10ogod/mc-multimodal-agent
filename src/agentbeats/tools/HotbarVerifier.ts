@@ -117,6 +117,7 @@ export class HotbarVerifier {
       const swapAway = this.swapAwaySlot(candidate);
       this.innerPhase = "swap_away";
       this.activeSlot = swapAway;
+      console.log(`[hotbar-verifier] start target=${this.target} swap-away to hotbar.${swapAway}`);
       this.emitDebug(`hotbar.${swapAway}`, { swapAway });
       return { kind: "act", action: hotbarAction(swapAway), holdSteps: 1 };
     }
@@ -155,11 +156,14 @@ export class HotbarVerifier {
       });
       this.ocrTrace.push({ slot: candidate, observed: result.observed, match: result.match });
       this.emitDebug("ocr", { observed: result.observed, match: result.match });
+      console.log(`[hotbar-verifier] read hotbar.${candidate} observed=${JSON.stringify(result.observed)} match=${result.match}`);
       if (result.match) {
+        console.log(`[hotbar-verifier] DONE equipped=hotbar.${candidate} target=${this.target}`);
         return { kind: "done", equippedSlot: candidate };
       }
       this.cursor += 1;
       if (this.cursor >= CANDIDATE_ORDER.length) {
+        console.log(`[hotbar-verifier] FAIL hotbar_missing_item target=${this.target} trace=${JSON.stringify(this.ocrTrace)}`);
         return this.fail();
       }
       const nextCandidate = CANDIDATE_ORDER[this.cursor]!;
