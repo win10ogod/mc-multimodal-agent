@@ -99,7 +99,12 @@ export async function dispatchObservation(
   // subgoal_failed
   state.completedSummaries.push(`SUBGOAL_FAILED: ${step.reason}`);
   state.history.push(`failed: ${current.description} -> ${step.reason}`);
-  state.pendingReflection = { subgoal: current, outcome: "failed", summary: step.reason };
+  state.pendingReflection = {
+    subgoal: current,
+    outcome: "failed",
+    summary: step.reason,
+    reportFields: step.reportFields,
+  };
   state.subgoals = []; state.idx = 0;
   return NOOP_ONE;
 }

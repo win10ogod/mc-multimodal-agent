@@ -19,7 +19,7 @@ export type Subgoal = {
 export type SubAgentStep =
   | { kind: "act"; action: McuEnvAction; holdSteps: number }
   | { kind: "subgoal_done"; summary: string }
-  | { kind: "subgoal_failed"; reason: string };
+  | { kind: "subgoal_failed"; reason: string; reportFields?: Record<string, unknown> };
 
 export interface SubAgentStepInput {
   obs: { imageBase64: string; inventory?: unknown };
@@ -52,7 +52,12 @@ export type EpisodeState = {
     tool_calls?: any[];
   }>;
   checklist: TaskChecklist;
-  pendingReflection: { subgoal: Subgoal; outcome: "done" | "failed"; summary: string } | null;
+  pendingReflection: {
+    subgoal: Subgoal;
+    outcome: "done" | "failed";
+    summary: string;
+    reportFields?: Record<string, unknown>;
+  } | null;
 };
 
 export function makeEpisodeState(taskText: string): EpisodeState {

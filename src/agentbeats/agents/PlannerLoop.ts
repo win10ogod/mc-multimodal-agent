@@ -63,15 +63,19 @@ export async function runPlannerLoop(
       state.plannerMessages.push({ role: "system", content: GOAL_PLANNER_SYSTEM_PROMPT });
       state.plannerMessages.push({ role: "user", content: `Task: ${state.taskText}` });
     }
+    const reportLine = r.reportFields
+      ? `Report fields (structured): ${JSON.stringify(r.reportFields)}\n`
+      : "";
     state.plannerMessages.push({
       role: "user",
       content:
         `The sub-agent for "${r.subgoal.description}" returned: ${r.outcome.toUpperCase()}.\n` +
-        `Summary: ${r.summary}\n\n` +
-        `REFLECT before your next move:\n` +
+        `Summary: ${r.summary}\n` +
+        reportLine +
+        `\nREFLECT before your next move:\n` +
         `1. Call read_checklist.\n` +
         `2. If success, VERIFY the result with inspect_inventory or verify_slots BEFORE marking done.\n` +
-        `3. If failure starts with "BLOCKED:", insert prerequisite checklist items, then dispatch the first prerequisite.\n` +
+        `3. If failure starts with "BLOCKED:" or has report fields with a "code", insert prerequisite checklist items, then dispatch the first prerequisite.\n` +
         `4. After the checklist reflects reality, either dispatch the next pending item or call task_complete (only if every item is done).`,
     });
     state.pendingReflection = null;
