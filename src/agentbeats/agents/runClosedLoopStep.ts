@@ -1259,6 +1259,35 @@ export async function runClosedLoopStep(
             // on confirmed place_all) — NOT the legacy CV cursorHolding
             // IIFE, which false-positives on grey items / animated bg.
             if (plan.cursorItemSignature?.item) {
+              // Before refusing, sanity-check the cursor state via OCR.
+              // The signature can go stale when the LLM consumed the last
+              // unit on a previous click and the runtime never observed
+              // the consume (the place_all hit a same-item slot and got
+              // no_op'd, OR the place was skipped). Held items suppress
+              // slot tooltips, so a readable tooltip on a known slot
+              // proves the cursor is actually empty.
+              const knownEntries = plan.slotMemory.snapshot().filter(e => e.item && e.item !== "unknown");
+              if (!plan.cursorVerifyJob && knownEntries.length > 0 && layoutForProbe) {
+                const candidate = knownEntries[0];
+                let knownSlotIdx = -1;
+                for (let i = 0; i < layoutForProbe.slots.length; i++) {
+                  const s = layoutForProbe.slots[i];
+                  if (s && Math.hypot(s.cx - candidate.x, s.cy - candidate.y) < 8) { knownSlotIdx = i; break; }
+                }
+                if (knownSlotIdx >= 0) {
+                  plan.cursorVerifyJob = {
+                    knownSlotIdx,
+                    target: { x: candidate.x, y: candidate.y },
+                    slotName: layoutForProbe.slots[knownSlotIdx]?.name,
+                    expectedItem: candidate.item,
+                    phase: "servo",
+                    servoSteps: 0,
+                    hoverFrames: 0,
+                  };
+                  console.warn(`[agentbeats] verify_slots: cursor tracked as holding ${plan.cursorItemSignature.item} — running cursor-empty OCR verify on ${candidate.item} @ (${Math.round(candidate.x)},${Math.round(candidate.y)}) before refusing`);
+                  return { kind: "act", action: defaultMcuAction(), holdSteps: 1 };
+                }
+              }
               state.closedLoopHistory.unshift(`verify_slots refused: cursor holding ${plan.cursorItemSignature.item}; clear cursor first`);
               state.closedLoopHistory = state.closedLoopHistory.slice(0, 5);
               console.warn(`[agentbeats] verify_slots refused: cursor holding ${plan.cursorItemSignature.item} (per tracked state)`);
