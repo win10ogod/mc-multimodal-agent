@@ -30,11 +30,13 @@ function emittedHotbarSlot(action: McuEnvAction): number | null {
 }
 
 /** Extract the snake_case block name from a Placing subgoal description.
- *  Matches the goal_planner few-shot format:
- *    "place crafting_table on the ground in front of the player"
- *  Picks the FIRST snake_case token after the word "place". */
+ *  Matches the goal_planner few-shot formats, with or without a leading article:
+ *    "place crafting_table on the ground..."
+ *    "Try to place a crafting_table at..."
+ *    "place the crafting_table..."
+ *  Skips "a"/"an"/"the" so the captured token is the actual block name (2+ chars). */
 function extractPlacingTarget(description: string): string | null {
-  const m = description.match(/\bplace\s+([a-z][a-z0-9_]*)/i);
+  const m = description.match(/\bplace\s+(?:(?:a|an|the)\s+)?([a-z][a-z0-9_]+)/i);
   return m ? m[1].toLowerCase() : null;
 }
 
