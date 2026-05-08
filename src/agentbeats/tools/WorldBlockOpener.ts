@@ -30,6 +30,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { defaultMcuAction, type McuEnvAction } from "../McuPrompt";
 import { getDebugRecorder } from "./DebugRecorder";
+import { drawCrosshair } from "./CrosshairOverlay";
 
 export type WorldBlockOpenerDeps = {
   client: OpenAI;
@@ -85,7 +86,15 @@ async function vlmDirection(
   obsBase64: string,
   target: string,
 ): Promise<Direction> {
-  const url = `data:image/jpeg;base64,${obsBase64.replace(/^data:image\/[a-z]+;base64,/, "")}`;
+  // Overlay a high-contrast crosshair so the VLM has an unambiguous
+  // reference for "what block is at the crosshair". The native MC
+  // crosshair is invisible after JPEG compression at 640x360.
+  const augmented = (() => {
+    try { return drawCrosshair(obsBase64); } catch { return null; }
+  })();
+  const url = augmented
+    ? `data:image/png;base64,${augmented}`
+    : `data:image/jpeg;base64,${obsBase64.replace(/^data:image\/[a-z]+;base64,/, "")}`;
   const userText = `Target block: ${target}. Where is it relative to the crosshair? Reply JSON only.`;
   let raw = "";
   try {

@@ -8,6 +8,7 @@ import { MCU_ACTION_SCHEMA } from "../../McuPrompt";
 import { parseMcuActionText, normalizeMcuAction } from "../../McuPolicy";
 import { WORLD_EXPLORE_SYSTEM_PROMPT } from "../../prompts/subagents/world_explore";
 import { getDebugRecorder } from "../../tools/DebugRecorder";
+import { drawCrosshair } from "../../tools/CrosshairOverlay";
 
 export type WorldSubAgentDeps = { client: OpenAI; model: string };
 
@@ -18,9 +19,19 @@ export async function callWorldVlm(
   agentLabel: "world_explore" | "placing" | "mining" | "combat" = "world_explore",
 ): Promise<SubAgentStep> {
   const userText = `Subgoal: ${input.subgoal.description}\nSuccess: ${input.subgoal.success_criteria}\nRecent history: ${input.history.slice(-5).join(" | ")}`;
+  // Overlay a high-contrast crosshair (red+yellow +) at frame centre so the
+  // VLM can reliably tell "what is Steve aiming at" — the native MC crosshair
+  // is invisible after JPEG compression at 640x360. Applied to ALL world-view
+  // subagents (placing/mining/combat/world_explore).
+  const augmented = (() => {
+    try { return drawCrosshair(input.obs.imageBase64); } catch { return null; }
+  })();
+  const imgUrl = augmented
+    ? `data:image/png;base64,${augmented}`
+    : `data:image/jpeg;base64,${input.obs.imageBase64}`;
   const userMsg = [
     { type: "text" as const, text: userText },
-    { type: "image_url" as const, image_url: { url: `data:image/jpeg;base64,${input.obs.imageBase64}` } },
+    { type: "image_url" as const, image_url: { url: imgUrl } },
   ];
   // Save the frame + prompt to events.jsonl so the dashboard surfaces
   // what the world subagent saw at each step (placing/mining/combat
