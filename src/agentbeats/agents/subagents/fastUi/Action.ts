@@ -103,9 +103,9 @@ function buildActionUserText(input: ActionInput): string {
   const subtaskLine = (() => {
     switch (subtask.kind) {
       case "verify_items_visible": return `verify_items_visible items=[${(subtask.items ?? []).join(", ")}] slots=[${(subtask.slots ?? []).join(", ")}]`;
-      case "pickup":               return `pickup sourceSlot=${subtask.sourceSlot} expectedItem=${subtask.expectedItem}`;
-      case "place_one":            return `place_one destSlot=${subtask.destSlot} expectedItem=${subtask.expectedItem}`;
-      case "place_all":            return `place_all destSlot=${subtask.destSlot} expectedItem=${subtask.expectedItem}`;
+      case "pickup":               return `pickup sourceSlot=${subtask.sourceSlot ?? "MISSING"} expectedItem=${subtask.expectedItem ?? "MISSING"}`;
+      case "place_one":            return `place_one destSlot=${subtask.destSlot ?? "MISSING"} expectedItem=${subtask.expectedItem ?? "MISSING"}`;
+      case "place_all":            return `place_all destSlot=${subtask.destSlot ?? "MISSING"} expectedItem=${subtask.expectedItem ?? "MISSING"}`;
       case "take_result":          return `take_result expectedItem=${subtask.expectedItem}`;
       case "wait_for_output":      return `wait_for_output expectedItem=${subtask.expectedItem}`;
       case "verify_state":         return `verify_state condition=${subtask.condition}`;
