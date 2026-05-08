@@ -1,12 +1,17 @@
 /**
  * High-contrast crosshair overlay for world-view VLM frames.
  *
- * The native MC crosshair at 640x360 is a 1-2 px white + symbol that's
- * effectively invisible after JPEG compression — VLMs reliably fail to
- * report "what block is at the crosshair?" because they can't even FIND
- * the crosshair on the image. This module decodes the obs JPEG, draws a
- * bold red+yellow crosshair at the image centre, and returns a PNG
- * base64 that can be sent to the VLM in place of the raw obs.
+ * The native MC crosshair at 640x360 is a 1-2 px white + symbol — visible
+ * to a human but small enough that VLM ViT backbones (typically 14×14 or
+ * larger patch tokenizers) normalize it into the surrounding patch's
+ * background statistics. The model has nothing salient to attend to when
+ * asked "what block is at the crosshair?" so its answer drifts toward
+ * whatever object happens to dominate the centre region.
+ *
+ * This module decodes the obs JPEG, draws a bold red+yellow crosshair at
+ * the image centre (28 px arms with a 5 px-stroke yellow halo and a 1 px
+ * red core), and returns a PNG base64. The overlay spans multiple ViT
+ * patches so it's a first-class feature the attention can latch onto.
  *
  * Use for ALL world-view VLM calls (WorldBlockOpener, WorldExplorer,
  * Mining, Combat, Placing). Skip for GUI-mode frames (the cursor is

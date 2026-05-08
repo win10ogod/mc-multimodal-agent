@@ -19,9 +19,10 @@ export async function callWorldVlm(
   agentLabel: "world_explore" | "placing" | "mining" | "combat" = "world_explore",
 ): Promise<SubAgentStep> {
   const userText = `Subgoal: ${input.subgoal.description}\nSuccess: ${input.subgoal.success_criteria}\nRecent history: ${input.history.slice(-5).join(" | ")}`;
-  // Overlay a high-contrast crosshair (red+yellow +) at frame centre so the
-  // VLM can reliably tell "what is Steve aiming at" — the native MC crosshair
-  // is invisible after JPEG compression at 640x360. Applied to ALL world-view
+  // Overlay a bold crosshair (red+yellow +) at frame centre. The native MC
+  // crosshair is too small (1-2 px) for the VLM's ViT patch tokenizer to
+  // attend to — it gets normalized into background — so model answers drift
+  // when asked "what is Steve aiming at?". Applied to ALL world-view
   // subagents (placing/mining/combat/world_explore).
   const augmented = (() => {
     try { return drawCrosshair(input.obs.imageBase64); } catch { return null; }

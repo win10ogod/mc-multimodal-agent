@@ -86,9 +86,10 @@ async function vlmDirection(
   obsBase64: string,
   target: string,
 ): Promise<Direction> {
-  // Overlay a high-contrast crosshair so the VLM has an unambiguous
-  // reference for "what block is at the crosshair". The native MC
-  // crosshair is invisible after JPEG compression at 640x360.
+  // Overlay a bold crosshair so the VLM has a salient reference for
+  // "what block is at the crosshair". The native MC crosshair is too
+  // small (1-2 px) for ViT patch tokenizers to attend to — it gets
+  // normalized into background — so the model's "facing" answer drifts.
   const augmented = (() => {
     try { return drawCrosshair(obsBase64); } catch { return null; }
   })();
