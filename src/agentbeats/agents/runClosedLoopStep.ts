@@ -12,7 +12,7 @@ import {
   makeServoIntegrator,
 } from "../tools/UiFastControl";
 import { probeNextCraftAction } from "../tools/InventoryProbe";
-import { detectCursorWithExpectation, detectGuiLayout, samplePatchFingerprint, samplePatchPixels, patchSimilarity } from "../tools/SlotDetector";
+import { detectCursorWithExpectation, detectGuiLayout, detectGuiSlots, samplePatchFingerprint, samplePatchPixels, patchSimilarity } from "../tools/SlotDetector";
 import { repairDecisionForTask, shouldUseModelOnStep } from "../McuPolicyUtils";
 import type { UiFastControlFrame } from "../tools/UiFastControl";
 
@@ -76,10 +76,29 @@ export async function runClosedLoopStep(
     return { kind: "act", action: frame.action, holdSteps };
   };
 
-  // Drain any queued macro frames first.
-  if (state.pendingMacroFrames.length > 0) {
-    const frame = state.pendingMacroFrames.shift()!;
-    return emitMacroFrame(frame);
+  // Drain any queued macro frames first. Skip queued inventory=1 presses
+  // when a GUI is already detected: pressing E toggles, so firing the
+  // init-time "open inventory" macro after WorldBlockOpener has already
+  // opened a 3x3 GUI (or after the player inventory is otherwise open)
+  // would CLOSE the GUI and undo the prior step.
+  while (state.pendingMacroFrames.length > 0) {
+    const next = state.pendingMacroFrames[0];
+    if (next.action.inventory === 1 && payload.obs) {
+      let guiAlreadyOpen = false;
+      try {
+        const det = detectGuiSlots(payload.obs);
+        guiAlreadyOpen = (det?.slots?.length ?? 0) >= 2;
+      } catch { /* leave guiAlreadyOpen=false; emit frame as before */ }
+      if (guiAlreadyOpen) {
+        state.pendingMacroFrames.shift();
+        if (state.pendingMacroFrames[0]?.label.endsWith(":settle_after_open")) {
+          state.pendingMacroFrames.shift();
+        }
+        console.log(`[agentbeats] macro skipped open_inv (label=${next.label}) at step=${step} — GUI already open`);
+        continue;
+      }
+    }
+    return emitMacroFrame(state.pendingMacroFrames.shift()!);
   }
 
   // Auto-arm Planner re-judge whenever IBVS is idle (no pending click,

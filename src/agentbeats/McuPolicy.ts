@@ -18,6 +18,7 @@ import {
 } from "./McuPrompt";
 import {
   buildCraftOpenInventoryFrames,
+  lookupRecipe,
   parseTargetItem,
   planClosedLoopCraft,
   type ClosedLoopCraftPlan,
@@ -452,14 +453,36 @@ export class McuVisualPolicy {
     // opens) just press inventory once and let the regular VLM path
     // drive any out-of-inventory steps. parseTargetItem returns null
     // for tasks that don't match the "craft X" pattern.
+    //
+    // 3x3 recipes (recipe.requiresTable=true, e.g. furnace, cake, ladder)
+    // need a crafting_table BLOCK placed in the world and right-clicked
+    // to open the 3x3 GUI — the player's 2x2 inventory cannot make them.
+    // Pre-arming the inventory-open macro here would (a) open the wrong
+    // GUI, and (b) toggle the 3x3 GUI shut later when the queued frame
+    // drains during ui_inventory routing. Skip the macro for those.
     const inventoryHintTarget = (() => {
       try {
-        return parseTargetItem(taskText) ?? "";
+        const target = parseTargetItem(taskText);
+        if (!target) return "";
+        const recipe = lookupRecipe(target);
+        if (recipe?.requiresTable) return "";
+        return target;
       } catch { return ""; }
     })();
+    // Startup noop hold: the eval framework's /give commands run on the
+    // server and can take 1-2 seconds to land. Without this, the agent
+    // starts placing/picking before the items are in the hotbar — hotbar
+    // verifier sweeps an empty bar, reports hotbar_missing_item, and
+    // the chain fails. 30 noop frames (~3 s @ 10 fps) covers typical
+    // /give latency.
+    const startupNoop: UiFastControlFrame[] = Array.from({ length: 30 }, () => ({
+      action: defaultMcuAction(),
+      holdSteps: 1,
+      label: "startup_wait_for_give",
+    }));
     const pendingMacroFrames: UiFastControlFrame[] = inventoryHintTarget
-      ? buildCraftOpenInventoryFrames(inventoryHintTarget)
-      : [];
+      ? [...startupNoop, ...buildCraftOpenInventoryFrames(inventoryHintTarget)]
+      : startupNoop;
     this.contexts.set(contextId, {
       taskText,
       promptText,
