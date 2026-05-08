@@ -140,6 +140,11 @@ export function createPlacing(deps: WorldSubAgentDeps): SubAgent {
           console.log(`[placing-macro] equip done → aim_down (target=${state.target}, slot=${r.equippedSlot})`);
           return { kind: "act", action: noop(), holdSteps: 1 };
         }
+        // Verifier reported full-sweep miss — terminal failure. Clear
+        // closure state so the next planner re-dispatch (e.g. after a
+        // fetch-from-inventory recovery) re-runs the verifier from
+        // scratch instead of resuming a stale phase.
+        state = null;
         return { kind: "subgoal_failed", reason: r.reason, reportFields: r.reportFields };
       }
 
@@ -209,13 +214,16 @@ export function createPlacing(deps: WorldSubAgentDeps): SubAgent {
           // For stack=1 cases (typical for crafting_table in eval givens)
           // this is a true failure signal; escalate so the planner can
           // re-dispatch and re-run the macro.
+          const target = state.target;
+          const equippedSlot = state.equippedSlot;
+          state = null;
           return {
             kind: "subgoal_failed",
-            reason: `place_did_not_consume: ${state.target} still on hotbar.${state.equippedSlot} after use=1`,
+            reason: `place_did_not_consume: ${target} still on hotbar.${equippedSlot} after use=1`,
             reportFields: {
               code: "place_did_not_consume",
-              item: state.target,
-              equippedSlot: state.equippedSlot,
+              item: target,
+              equippedSlot,
               observed: result.observed,
             },
           };
@@ -226,9 +234,15 @@ export function createPlacing(deps: WorldSubAgentDeps): SubAgent {
 
       // phase === "done"
       console.log(`[placing-macro] subgoal_done target=${state.target} (verified consumed)`);
+      const summary = `placed ${state.target} via deterministic macro (equip hotbar.${state.equippedSlot} → tilt +${PLACE_PITCH_DEG} → use → verified item consumed)`;
+      // Clear closure state so a future re-dispatch (e.g. another
+      // placing subgoal in the same purple process for a re-tried or
+      // chained recipe) starts a fresh equip/verify sweep instead of
+      // short-circuiting straight to done.
+      state = null;
       return {
         kind: "subgoal_done",
-        summary: `placed ${state.target} via deterministic macro (equip hotbar.${state.equippedSlot} → tilt +${PLACE_PITCH_DEG} → use → verified item consumed)`,
+        summary,
       };
     },
   };
