@@ -278,7 +278,11 @@ export async function runPlanner(deps: PlannerDeps, input: PlannerInput): Promis
   const body: Record<string, unknown> = {
     model: deps.model,
     temperature: 0,
-    max_completion_tokens: 800,
+    // 800 was truncating mid-checklist on long recipes (run 26 furnace
+    // task: 13 step JSON regen got cut off → parser failed → planner
+    // stuck regenerating the same truncated response forever). 3000 gives
+    // headroom for ~25 step recipes plus the surrounding JSON envelope.
+    max_completion_tokens: 3000,
     messages: [
       { role: "system", content: sys },
       {
