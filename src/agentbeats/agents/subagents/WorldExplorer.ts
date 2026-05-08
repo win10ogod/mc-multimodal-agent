@@ -34,9 +34,9 @@ export async function callWorldVlm(
     { type: "text" as const, text: userText },
     { type: "image_url" as const, image_url: { url: imgUrl } },
   ];
-  // Save the frame + prompt to events.jsonl so the dashboard surfaces
-  // what the world subagent saw at each step (placing/mining/combat
-  // were previously dark — only FastUI events made it to the log).
+  // Save the AUGMENTED frame (the actual pixels the model received,
+  // including the crosshair overlay) so the dashboard reflects exactly
+  // what the VLM saw — not the raw obs.
   const dbg = getDebugRecorder();
   if (dbg.isEnabled()) {
     dbg.record(
@@ -50,8 +50,8 @@ export async function callWorldVlm(
           userText,
         },
       },
-      input.obs.imageBase64,
-      "jpg",
+      augmented ?? input.obs.imageBase64,
+      augmented ? "png" : "jpg",
     );
   }
   try {
