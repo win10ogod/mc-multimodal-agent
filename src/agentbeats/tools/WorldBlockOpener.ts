@@ -81,68 +81,6 @@ Output ONLY JSON: {"direction": "<one of the values above>"}.
 
 NEVER guess based on inventory icons or HUD. Only the in-world block matters.`;
 
-/** Focused "attention" agent: answers a single question — "what block is Steve
- *  facing right now (the block at the crosshair)?". Used as the AUTHORITY for
- *  whether the opener should emit use=1. The direction agent is for movement
- *  hints; the attention agent decides task completion. Splitting these two
- *  questions across separate VLM calls (each with a tighter prompt) cuts
- *  hallucination — when run together as one direction call, the model
- *  conflates "where is the block" with "is anything at the crosshair" and
- *  reports not_visible / wrong direction even when the block sits clearly
- *  under the crosshair. */
-const ATTENTION_PROMPT = `You are a Minecraft block identifier.
-
-Look at the first-person frame (640x360). A bold red+yellow CROSSHAIR (+) has been drawn at the EXACT image centre — that is what Steve is currently aiming at.
-
-Your only job: identify the block whose face the crosshair sits on right now — i.e. the block Steve would interact with on a right-click.
-
-Output ONLY JSON: {"facing_block": "<snake_case_id>"} or {"facing_block": "none"} if the crosshair points at sky / cloud / open air / inside the player's own body / a HUD element.
-
-Rules:
-- Be precise: "crafting_table", "cobblestone", "grass_block", "oak_log", "dirt", "obsidian" — exact MC ids in snake_case.
-- If the crosshair is on a block but you genuinely cannot tell which kind: {"facing_block": "unknown"}.
-- Ignore HUD overlays (achievement banners, advancement notifications, hotbar, chat). Look at the world geometry under the crosshair only.
-- Do NOT report a block that's NEAR the crosshair if the crosshair is actually pointing somewhere else (e.g. above it at sky).`;
-
-async function vlmAttention(
-  deps: WorldBlockOpenerDeps,
-  frameB64: string,
-  frameExt: "png" | "jpg",
-): Promise<string> {
-  const mime = frameExt === "png" ? "image/png" : "image/jpeg";
-  const url = `data:${mime};base64,${frameB64.replace(/^data:image\/[a-z]+;base64,/, "")}`;
-  let raw = "";
-  try {
-    const resp = await deps.client.chat.completions.create({
-      model: deps.model,
-      temperature: 0,
-      max_completion_tokens: 32,
-      messages: [
-        { role: "system", content: ATTENTION_PROMPT },
-        {
-          role: "user",
-          content: [
-            { type: "text", text: "What block is Steve facing? Reply JSON only." },
-            { type: "image_url", image_url: { url, detail: "high" } },
-          ] as never,
-        },
-      ],
-    });
-    raw = resp.choices?.[0]?.message?.content ?? "";
-  } catch (e) {
-    console.warn(`[world-block-opener] attention VLM call failed: ${e instanceof Error ? e.message : String(e)}`);
-    return "unknown";
-  }
-  const cleaned = raw.trim().replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "");
-  try {
-    const obj = JSON.parse(cleaned) as Record<string, unknown>;
-    const v = String(obj.facing_block ?? "").toLowerCase().replace(/[^a-z0-9_]/g, "");
-    return v || "unknown";
-  } catch {
-    return "unknown";
-  }
-}
-
 async function vlmDirection(
   deps: WorldBlockOpenerDeps,
   frameB64: string,
@@ -246,40 +184,26 @@ export class WorldBlockOpener {
       return this.fail("align_exhausted");
     }
 
-    // Compute the augmented (with-crosshair) frame ONCE per step so:
-    //   (a) the AttentionAgent and DirectionAgent see the SAME pixels;
-    //   (b) the saved debug PNG is the EXACT image the model received.
+    // Compute the augmented (with-crosshair) frame ONCE per step so the VLM
+    // and the saved debug PNG share the EXACT pixels the model received.
     const augmented = (() => {
       try { return drawCrosshair(obsBase64); } catch { return null; }
     })();
     const frameB64 = augmented ?? obsBase64;
     const frameExt: "png" | "jpg" = augmented ? "png" : "jpg";
 
-    // Two-tier VLM:
-    //   1. AttentionAgent — focused: "what block is Steve facing?". This is
-    //      the AUTHORITY for emitting use=1.
-    //   2. DirectionAgent — for camera movement only when attention says
-    //      it's not the target.
-    const facingBlock = await vlmAttention(this.deps, frameB64, frameExt);
+    const direction = await vlmDirection(this.deps, frameB64, frameExt, this.target);
     this.alignIter += 1;
     console.log(
-      `[world-block-opener] align iter=${this.alignIter} target=${this.target} facing=${facingBlock}`,
+      `[world-block-opener] align iter=${this.alignIter} target=${this.target} direction=${direction} not_visible_streak=${this.consecutiveNotVisible}`,
     );
-    recordDebug(this.target, { phase: "attention", iter: this.alignIter, facingBlock }, frameB64, frameExt);
+    recordDebug(this.target, { phase: "align", iter: this.alignIter, direction, consecutiveNotVisible: this.consecutiveNotVisible }, frameB64, frameExt);
 
-    if (facingBlock === this.target) {
+    if (direction === "centered") {
       this.innerPhase = "settle";
-      this.consecutiveNotVisible = 0;
-      console.log(`[world-block-opener] FACING ${this.target} → use=1 (attention-confirmed)`);
+      console.log(`[world-block-opener] CENTERED → use=1 target=${this.target}`);
       return { kind: "act", action: useAct(), holdSteps: 2 };
     }
-
-    // Not facing the target yet — call direction agent for the next move.
-    const direction = await vlmDirection(this.deps, frameB64, frameExt, this.target);
-    console.log(
-      `[world-block-opener] iter=${this.alignIter} direction=${direction} (facing was ${facingBlock}) not_visible_streak=${this.consecutiveNotVisible}`,
-    );
-    recordDebug(this.target, { phase: "direction", iter: this.alignIter, direction, facingBlock, consecutiveNotVisible: this.consecutiveNotVisible });
 
     if (direction === "not_visible") {
       this.consecutiveNotVisible += 1;
@@ -287,13 +211,11 @@ export class WorldBlockOpener {
         console.log(`[world-block-opener] FAIL target_ui_not_in_view target=${this.target}`);
         return this.fail("target_ui_not_in_view");
       }
+      // Scan: emit a wider yaw step to look around for the target.
       return { kind: "act", action: camAct(SCAN_YAW_DEG, 0), holdSteps: 2 };
     }
 
-    // direction in {left, right, up, down, centered} — reset streak.
-    // If "centered" came back here, attention disagreed (block wasn't
-    // recognized at the crosshair). Treat as a small re-aim — nudge down
-    // since placed blocks usually sit slightly below the natural look.
+    // Direction is one of left/right/up/down — reset the not_visible streak.
     this.consecutiveNotVisible = 0;
     let yaw = 0;
     let pitch = 0;
@@ -301,7 +223,6 @@ export class WorldBlockOpener {
     else if (direction === "right") yaw = CAMERA_STEP_DEG;
     else if (direction === "up") pitch = -CAMERA_STEP_DEG;
     else if (direction === "down") pitch = CAMERA_STEP_DEG;
-    else if (direction === "centered") pitch = CAMERA_STEP_DEG;
     return { kind: "act", action: camAct(yaw, pitch), holdSteps: 2 };
   }
 
