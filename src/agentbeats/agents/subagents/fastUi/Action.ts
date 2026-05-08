@@ -44,18 +44,18 @@ TRUST the "Cursor:" line from the user prompt as authoritative. The runtime trac
 Subtask → action (1:1 mapping):
 - verify_items_visible: emit verify_slots on up to 3 candidates from items[] OR the explicit slots[] passed in. If every listed item is already named in Known, emit done.
 - pickup { sourceSlot, expectedItem }: emit pickup slot=sourceSlot. (Pre-cond: Cursor: (empty) per prompt. If prompt says holding, that's a planner mistake — emit fallback_manual.)
-- place_one { destSlot, expectedItem }: emit place_one slot=destSlot. Trust the prompt's Cursor: line; emit even if the image looks ambiguous.
-- place_all { destSlot, expectedItem }: emit place_all slot=destSlot. Trust the prompt's Cursor: line.
+- place_one { destSlot, expectedItem }: emit place_one slot=destSlot. Trust the prompt's Cursor: line; emit even if the image looks ambiguous. Do NOT inspect the destination icon visually — the planner already validated it. MC will safely no-op or stack if slot is empty or already has the same item; refusing wastes a step.
+- place_all { destSlot, expectedItem }: emit place_all slot=destSlot. Trust the prompt's Cursor: line AND the planner's chosen destSlot. Emit the action even if the destination LOOKS occupied — for "return to source" placements the slot legitimately holds (or held) the same item, and MC will stack. NEVER emit fallback_manual on place_all because of perceived destination occupancy.
 - take_result { expectedItem }: emit pickup slot=<the slot whose role==="result">.
 - wait_for_output { expectedItem }: emit wait with holdSteps proportional to expected sim ticks (cap 60).
 - verify_state { condition }: if condition holds in frame+known, emit done; else fallback_manual.
 
 Rules:
 - Slot index = the YELLOW BADGE you read off the frame, validated against layout_slots.role for the expected role.
-- Never overwrite a different item in dest.
+- For place_one/place_all: TRUST the planner's destSlot. Do not refuse based on perceived "different item" in dest — return-to-source destinations legitimately have the same item, and MC's place mechanic safely stacks/swaps.
 - After a pickup or place, if the image shows a slot that contradicts Known, emit verify_slots on the affected slots.
 - If an expected ingredient is missing from Known, scan hotbar/main_inv visually and emit verify_slots on the 3 most likely slots — do NOT fallback_manual.
-- If anything is ambiguous, emit fallback_manual with reason.
+- fallback_manual is RESERVED for: (1) the prompt is contradictory (e.g. pickup but Cursor says holding), (2) the requested slot doesn't exist in layout_slots, (3) genuinely no safe action exists. Visual ambiguity about a destination is NOT grounds for fallback_manual.
 
 Output strict JSON, one action only:
   { "action": "pickup",     "slot": N }   // cursor empty: left-click slot N to grab whole stack

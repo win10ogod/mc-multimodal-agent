@@ -643,6 +643,24 @@ export type ClosedLoopCraftPlan = {
    *  The runtime fires the Planner agent on the next entry to update
    *  the checklist + judge completion. */
   judgeAfterChain: boolean;
+  /** Triggered when a place_one/place_all returned no_op while
+   *  cursorItemSignature said the cursor was holding something — most
+   *  likely the cursor is actually empty and the Action LLM consumed
+   *  the last item on a previous click. Runtime servos to a known slot,
+   *  hovers, then runs SlotOcr.readTooltip; a readable tooltip (matching
+   *  the slot's known item) confirms the cursor is empty (held items
+   *  suppress slot tooltips), at which point cursorItemSignature is
+   *  cleared and the failed click is dropped without retry. If the
+   *  tooltip is unreadable / mismatched, that's a genuine anomaly. */
+  cursorVerifyJob: {
+    knownSlotIdx: number;
+    target: { x: number; y: number };
+    slotName?: string;
+    expectedItem: string;
+    phase: "servo" | "hover_settle" | "read";
+    servoSteps: number;
+    hoverFrames: number;
+  } | null;
 };
 
 /** Servo control law: given current cursor + target slot pixel center,
@@ -801,6 +819,7 @@ export function planClosedLoopCraft(taskText: string): ClosedLoopCraftPlan {
     checklist: [],
     activeChecklistIdx: -1,
     judgeAfterChain: false,
+    cursorVerifyJob: null,
   };
 }
 

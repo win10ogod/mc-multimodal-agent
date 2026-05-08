@@ -43,22 +43,30 @@ for (const e of events) {
     case "verify":
     case "pre_check_move":
     case "planner_assistant":
-    case "planner_dispatch": {
+    case "planner_dispatch":
+    case "placing_call":
+    case "placing_response":
+    case "mining_call":
+    case "mining_response":
+    case "combat_call":
+    case "combat_response":
+    case "world_explore_call":
+    case "world_explore_response":
+    case "hotbar_ocr":
+    case "hotbar_verifier_step": {
       rows.push({ t, seq, type: e.type, data: e.data ?? {}, imageFile: e.imageFile });
       break;
     }
     default: rows.push({ t, seq, type: e.type, data: e.data ?? {}, imageFile: e.imageFile });
   }
 }
-// Sort by timestamp first (true wall-clock chronology — OCR events
-// use a separate seq range starting at 200001 which would dump them
-// at the end of any seq-based sort). Fall back to seq when ts ties.
-rows.sort((a, b) => {
-  if (a.t && b.t && a.t !== b.t) return String(a.t).localeCompare(String(b.t));
-  const sa = Number(a.seq), sb = Number(b.seq);
-  if (Number.isFinite(sa) && Number.isFinite(sb)) return sa - sb;
-  return 0;
-});
+// PRESERVE FILE ORDER — every recorder (DebugRecorder, SlotOcr, HotbarOcr,
+// WorldBlockOpener) appends to events.jsonl atomically as the event fires,
+// so the line order in the file IS the causal order. Sorting by timestamp
+// is unreliable (ms-resolution clashes, batched writes can land out of
+// order); sorting by seq is even worse because each module uses its own
+// seq range (recorder=1+, SlotOcr=200001+, HotbarOcr=210001+, WorldBlockOpener=220001+),
+// dumping OCR events at the end of a seq sort. File order has no such issues.
 
 // Map each row to its likely associated image: probe → 0000N_probe_input.png,
 // action → fastui_action_NNNNN_input.png, ocr → 200NNN_slot_ocr.png, etc.
@@ -155,6 +163,58 @@ function summarize(row) {
         body: [
           d.tool_calls?.length ? `tools: ${d.tool_calls.map((tc) => `${tc.function?.name}(${tc.function?.arguments?.slice(0, 80)})`).join(" | ")}` : `content: ${(d.content || "").slice(0, 200)}`,
         ],
+      };
+    }
+    case "placing_call":
+    case "mining_call":
+    case "combat_call":
+    case "world_explore_call": {
+      const sg = d.subgoal ?? {};
+      return {
+        title: `[${row.type.replace("_call", "")} iter=${d.iteration}] subgoal: ${sg.description ?? "?"}`,
+        body: [
+          `success: ${sg.success_criteria ?? "?"}`,
+          `recent_history: ${(d.history ?? []).slice(-3).join(" | ")}`,
+        ],
+      };
+    }
+    case "placing_response":
+    case "mining_response":
+    case "combat_response":
+    case "world_explore_response": {
+      const p = d.parsed ?? {};
+      const a = p.action ?? {};
+      const buttons = ["attack","use","forward","back","left","right","jump","sneak","sprint","drop","inventory"]
+        .filter((k) => a[k] === 1);
+      const hotbar = Object.keys(a).filter((k) => k.startsWith("hotbar.") && a[k] === 1);
+      return {
+        title: `[${row.type.replace("_response", "")}] iter=${d.iteration} ${p.task_done ? "task_done=TRUE" : ""}`,
+        body: [
+          `pressed: ${[...buttons, ...hotbar].join(", ") || "(none)"}`,
+          `camera: ${JSON.stringify(a.camera ?? [0, 0])}`,
+          d.rawText ? `rawText: ${(d.rawText || "").slice(0, 120)}` : "",
+        ].filter(Boolean),
+      };
+    }
+    case "hotbar_ocr": {
+      const parsed = d.parsed ?? {};
+      const observedTxt = parsed.observed === "" ? "(no banner)" : parsed.observed;
+      return {
+        title: `[hotbar_ocr] target=${d.target ?? "?"} candidate=${d.candidateLabel ?? "?"} match=${parsed.match ? "TRUE" : "false"}`,
+        body: [
+          `observed: ${observedTxt}`,
+          `raw: ${(d.raw ?? "").slice(0, 80)}`,
+        ],
+      };
+    }
+    case "hotbar_verifier_step": {
+      return {
+        title: `[verifier] phase=${d.innerPhase ?? "?"} cursor=${d.cursor ?? "?"} candidate=hotbar.${d.candidateSlot ?? "?"} target=${d.target ?? "?"}`,
+        body: [
+          `action: ${d.action ?? ""}`,
+          d.observed !== undefined ? `observed: ${d.observed} match: ${d.match}` : "",
+          `activeSlot: ${d.activeSlot ?? "(unknown)"}`,
+        ].filter(Boolean),
       };
     }
     default:

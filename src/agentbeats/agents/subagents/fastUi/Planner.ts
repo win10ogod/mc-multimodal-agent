@@ -159,7 +159,7 @@ When emitting your actual checklist, replace each <...> placeholder with a CONCR
 NOTE on verify_items_visible:
 - Place ONE at the top with items=[...] when Known is missing any recipe ingredient. Action OCRs candidate hotbar slots.
 - Place ONE before take_result with slots=[result_slot, deposit_slot] to confirm the crafted item is present AND the deposit target is empty.
-- The runtime auto-ticks each verify_items_visible once OCR completes; Re-PLAN reads the refreshed Known and adjusts sourceSlot fields in subsequent pickup/place steps.
+ot re- The runtime auto-ticks each verify_items_visible once OCR completes; Re-PLAN reads the refreshed Known and adjusts sourceSlot fields in subsequent pickup/place steps.
 
 DEPOSIT SLOT RULE: any place_all that deposits a held item into "free inventory" MUST target a slot whose role is hotbar (slot indices 38..46) or main_inv (slot indices 11..37). NEVER pick offhand (slot 10), armor (0, 1, 8, 9), craft cells (2, 3, 5, 6 for 2x2; or 9 craft slots for 3x3), the result slot, or gap slot 4. The Slots-by-role block in the user prompt lists exact ranges per layout — follow it.
 

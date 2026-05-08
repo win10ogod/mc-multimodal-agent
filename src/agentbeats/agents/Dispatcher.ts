@@ -9,6 +9,7 @@ import { runPlannerLoop } from "./PlannerLoop";
 import { detectGuiSlots } from "../tools/SlotDetector";
 import type { McuEnvAction } from "../McuPrompt";
 import { defaultMcuAction } from "../McuPrompt";
+import { WorldBlockOpener } from "../tools/WorldBlockOpener";
 
 export type DispatchDeps = {
   client: OpenAI;
@@ -68,6 +69,59 @@ export async function dispatchObservation(
       return false;
     }
   })();
+
+  // World subagents (placing / world_explore / mining / combat) require
+  // world view, not an open GUI. If a GUI is open at the moment the planner
+  // dispatched a world subagent (typical: episode-init pre-armed open-inventory
+  // macro fires, recipe-needs-3x3 BLOCKS, planner dispatches placing(crafting_table),
+  // but the inventory is still open), close the GUI first by emitting
+  // inventory=1, then route to the subagent on the next observation.
+  if (
+    guiOpen
+    && (current.kind === "placing" || current.kind === "world_explore" || current.kind === "mining" || current.kind === "combat")
+  ) {
+    console.log(`[dispatcher] closing GUI before delegating to ${current.kind} subagent (subgoal: "${current.description.slice(0, 80)}")`);
+    const closeAction = defaultMcuAction();
+    closeAction.inventory = 1;
+    return { action: closeAction, holdSteps: 1, taskDone: false };
+  }
+
+  // For ui_inventory dispatches with gui_target set (e.g. cake → use placed
+  // crafting_table), run the WorldBlockOpener align+use macro before falling
+  // through to the regular closed-loop step. Once the opener reports done,
+  // the next observation should see the GUI open and closedLoopStep takes
+  // over normally. On fail (target_ui_not_in_view) escalate to the planner.
+  if (current.kind === "ui_inventory" && current.gui_target && current.gui_target !== "player_inventory" && !guiOpen) {
+    if (!state.worldBlockOpener) {
+      state.worldBlockOpener = new WorldBlockOpener({
+        target: current.gui_target,
+        deps: { client: deps.client, model: deps.plannerModel },
+      });
+    }
+    const r = await state.worldBlockOpener.nextAction(obs.imageBase64);
+    if (r.kind === "act") {
+      return { action: r.action, holdSteps: r.holdSteps, taskDone: false };
+    }
+    if (r.kind === "done") {
+      state.worldBlockOpener = null;
+      // Emit one noop frame so the use=1 the opener emitted lands and the GUI
+      // appears in the next observation; closedLoopStep will see it open.
+      return NOOP_ONE;
+    }
+    // r.kind === "fail"
+    state.worldBlockOpener = null;
+    state.completedSummaries.push(`SUBGOAL_FAILED: ${r.reason}`);
+    state.history.push(`failed: ${current.description} -> ${r.reason}`);
+    state.pendingReflection = {
+      subgoal: current,
+      outcome: "failed",
+      summary: r.reason,
+      reportFields: r.reportFields,
+    };
+    state.subgoals = []; state.idx = 0;
+    return NOOP_ONE;
+  }
+
   const kind: SubAgentKind = guiOpen ? "ui_inventory" : current.kind;
 
   let step: SubAgentStep;
@@ -93,13 +147,20 @@ export async function dispatchObservation(
     state.history.push(`done: ${current.description} -> ${step.summary}`);
     state.pendingReflection = { subgoal: current, outcome: "done", summary: step.summary };
     state.subgoals = []; state.idx = 0;  // force planner re-call next obs (which will see pendingReflection)
+    state.worldBlockOpener = null;
     return NOOP_ONE;
   }
 
   // subgoal_failed
   state.completedSummaries.push(`SUBGOAL_FAILED: ${step.reason}`);
   state.history.push(`failed: ${current.description} -> ${step.reason}`);
-  state.pendingReflection = { subgoal: current, outcome: "failed", summary: step.reason };
+  state.pendingReflection = {
+    subgoal: current,
+    outcome: "failed",
+    summary: step.reason,
+    reportFields: step.reportFields,
+  };
   state.subgoals = []; state.idx = 0;
+  state.worldBlockOpener = null;
   return NOOP_ONE;
 }

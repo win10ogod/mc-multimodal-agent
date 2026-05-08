@@ -95,6 +95,7 @@ export async function runClosedLoopStep(
     && !state.closedLoopCraft.pendingClick
     && state.closedLoopCraft.pendingChain.length === 0
     && !state.closedLoopCraft.pendingOcrBatch
+    && !state.closedLoopCraft.cursorVerifyJob
     && state.closedLoopCraft.checklist.length > 0
   ) {
     state.closedLoopCraft.judgeAfterChain = true;
@@ -235,6 +236,93 @@ export async function runClosedLoopStep(
     } else {
       const cursor = detectCursorWithExpectation(payload.obs, layout, null);
       plan.cursor = cursor ?? plan.cursor;
+
+      // === Cursor-empty OCR verify (preempts everything) ===
+      // Fires when a place_one/place_all returned no_op (or verify_slots
+      // was refused) while cursorItemSignature was pinned. Held items
+      // suppress slot tooltips in MC, so a readable tooltip on a known
+      // slot proves the cursor is empty. Servo → hover → OCR → decide.
+      // MUST run before the Planner / Action / probe-action handlers,
+      // since verify_slots-refusal exits early at its own handler.
+      if (plan.cursorVerifyJob && !plan.done) {
+        const job = plan.cursorVerifyJob;
+        const CV_SERVO_STEP_CAP = 20;
+        const CV_HIT_THRESHOLD_PX = 5;
+
+        if (job.phase === "servo") {
+          const stepResult = servoCursorStep({
+            cursor,
+            target: job.target,
+            button: "attack",
+            hitThresholdPx: CV_HIT_THRESHOLD_PX,
+          });
+          job.servoSteps += 1;
+          const arrived = !!cursor && Math.hypot(cursor.x - job.target.x, cursor.y - job.target.y) <= CV_HIT_THRESHOLD_PX;
+          if (arrived || job.servoSteps > CV_SERVO_STEP_CAP) {
+            job.phase = "hover_settle";
+            job.hoverFrames = 0;
+            console.log(`[cursor-verify] arrived at ${job.slotName ?? job.knownSlotIdx} (${job.target.x},${job.target.y}); hovering for tooltip`);
+            return { kind: "act", action: defaultMcuAction(), holdSteps: 1 };
+          }
+          if (stepResult && !stepResult.click) {
+            return { kind: "act", action: stepResult.action, holdSteps: 1 };
+          }
+          return { kind: "act", action: defaultMcuAction(), holdSteps: 1 };
+        }
+
+        if (job.phase === "hover_settle") {
+          job.hoverFrames += 1;
+          if (job.hoverFrames < 2) {
+            return { kind: "act", action: defaultMcuAction(), holdSteps: 1 };
+          }
+          job.phase = "read";
+          // Fall through to read on the same step — the OCR runs against
+          // this frame which has had a hover frame to render.
+        }
+
+        if (job.phase === "read") {
+          const { readTooltip } = await import("../tools/SlotOcr");
+          let tooltipItem = "unknown";
+          try {
+            const r = await readTooltip({
+              client: deps.client,
+              model: deps.model,
+              obsBase64: payload.obs ?? "",
+              slotPos: { x: job.target.x, y: job.target.y },
+              slotName: job.slotName,
+            });
+            tooltipItem = r.item;
+          } catch (e) {
+            console.warn(`[cursor-verify] readTooltip threw: ${e instanceof Error ? e.message : String(e)}`);
+          }
+          const matchesExpected = tooltipItem !== "empty" && tooltipItem !== "unknown" && tooltipItem === job.expectedItem;
+          if (matchesExpected) {
+            console.log(`[cursor-verify] tooltip="${tooltipItem}" matches expected — cursor confirmed EMPTY (clearing cursorItemSignature)`);
+            const previouslyHeld = plan.cursorItemSignature?.item ?? "item";
+            plan.cursorItemSignature = null;
+            plan.pickupSourceSlot = null;
+            state.closedLoopHistory.unshift(`cursor-verify (OCR-confirmed via tooltip): the ${previouslyHeld} the previous context said you were holding is now confirmed empty — it was fully placed/consumed in the prior step. The place_all destination is empty as expected; treat that subtask as completed and continue with the next recipe step.`);
+            state.closedLoopHistory = state.closedLoopHistory.slice(0, 5);
+          } else {
+            // OCR returned "empty"/"unknown" or a different name. We're
+            // using OCR to PROBE cursor state — when the cursor is holding,
+            // MC suppresses ALL slot tooltips, so an "empty" reading on a
+            // known-occupied slot is the EXPECTED holding signal, not
+            // evidence that the slot is now empty. Do NOT update slotMemory
+            // from cursor-verify OCR — that would erase legitimate context
+            // (e.g. wipe the book entry at craft_3x3_1 because cursor was
+            // suppressing its tooltip). Cursor state stays "holding"; the
+            // outer planner gets a feedback line and can decide what to
+            // do next.
+            console.warn(`[cursor-verify] tooltip="${tooltipItem}" expected="${job.expectedItem}" — cursor probably STILL holding (tooltip suppressed by held item); leaving slotMemory and cursorItemSignature unchanged`);
+            state.closedLoopHistory.unshift(`cursor-verify: OCR(${job.slotName ?? job.knownSlotIdx}) returned "${tooltipItem}" (expected "${job.expectedItem}"); cursor likely still holding ${plan.cursorItemSignature?.item ?? "(?)"} — slot memory preserved.`);
+            state.closedLoopHistory = state.closedLoopHistory.slice(0, 5);
+          }
+          plan.cursorVerifyJob = null;
+          // Either way, give control back to the Planner on the next obs.
+          return { kind: "act", action: defaultMcuAction(), holdSteps: 1 };
+        }
+      }
 
       // Servo test mode: AGENTBEATS_SERVO_TEST=1 disables LLM /
       // Planner / Action and just cycles a hover-only pendingClick
@@ -1010,6 +1098,22 @@ export async function runClosedLoopStep(
               state.closedLoopHistory.unshift(`recipe_lookup '${probed.item}' -> ${r.target} (${ingStr})`);
               state.closedLoopHistory = state.closedLoopHistory.slice(0, 5);
               console.log(`[agentbeats] recipe_lookup '${probed.item}' resolved: ingredients=${ingStr} inShape=${r.inShape ? "yes" : "no"}`);
+              // Hard prerequisite check: a 3x3-shaped recipe (or
+              // shapeless with > 4 unique cells needed) cannot be
+              // crafted in the player_inventory's 2x2 grid. Report
+              // BLOCKED so the GoalPlanner places a crafting_table
+              // and re-dispatches inventory after.
+              const craftCells = layoutForProbe.slots.filter((s) => s.role === "craft_2x2" || s.role === "craft_3x3").length;
+              const need3x3 = (r.inShape && (r.inShape.length > 2 || r.inShape.some((row) => row.length > 2)))
+                || (!r.inShape && r.ingredients.reduce((sum, it) => sum + it.count, 0) > 4);
+              // Only fire when the open GUI has a 2x2 craft area (4 cells)
+              // — that's the player_inventory case where a 3x3 recipe
+              // can't fit. Other GUIs (chest=0, furnace=0, etc.) leave
+              // craftCells at 0 and we don't gate them with this check.
+              if (need3x3 && craftCells === 4) {
+                console.warn(`[agentbeats] ${r.target} needs a 3x3 grid but the open GUI is player_inventory (2x2). Reporting BLOCKED.`);
+                return { kind: "subgoal_failed", reason: `BLOCKED: need a crafting_table 3x3 GUI to craft ${r.target}` };
+              }
               try {
                 const knownSlotsForPlanner = plan.slotMemory.snapshot()
                   .filter((e) => e.item && e.item !== "empty")
@@ -1243,6 +1347,35 @@ export async function runClosedLoopStep(
             // on confirmed place_all) — NOT the legacy CV cursorHolding
             // IIFE, which false-positives on grey items / animated bg.
             if (plan.cursorItemSignature?.item) {
+              // Before refusing, sanity-check the cursor state via OCR.
+              // The signature can go stale when the LLM consumed the last
+              // unit on a previous click and the runtime never observed
+              // the consume (the place_all hit a same-item slot and got
+              // no_op'd, OR the place was skipped). Held items suppress
+              // slot tooltips, so a readable tooltip on a known slot
+              // proves the cursor is actually empty.
+              const knownEntries = plan.slotMemory.snapshot().filter(e => e.item && e.item !== "unknown");
+              if (!plan.cursorVerifyJob && knownEntries.length > 0 && layoutForProbe) {
+                const candidate = knownEntries[0];
+                let knownSlotIdx = -1;
+                for (let i = 0; i < layoutForProbe.slots.length; i++) {
+                  const s = layoutForProbe.slots[i];
+                  if (s && Math.hypot(s.cx - candidate.x, s.cy - candidate.y) < 8) { knownSlotIdx = i; break; }
+                }
+                if (knownSlotIdx >= 0) {
+                  plan.cursorVerifyJob = {
+                    knownSlotIdx,
+                    target: { x: candidate.x, y: candidate.y },
+                    slotName: layoutForProbe.slots[knownSlotIdx]?.name,
+                    expectedItem: candidate.item,
+                    phase: "servo",
+                    servoSteps: 0,
+                    hoverFrames: 0,
+                  };
+                  console.warn(`[agentbeats] verify_slots: cursor tracked as holding ${plan.cursorItemSignature.item} — running cursor-empty OCR verify on ${candidate.item} @ (${Math.round(candidate.x)},${Math.round(candidate.y)}) before refusing`);
+                  return { kind: "act", action: defaultMcuAction(), holdSteps: 1 };
+                }
+              }
               state.closedLoopHistory.unshift(`verify_slots refused: cursor holding ${plan.cursorItemSignature.item}; clear cursor first`);
               state.closedLoopHistory = state.closedLoopHistory.slice(0, 5);
               console.warn(`[agentbeats] verify_slots refused: cursor holding ${plan.cursorItemSignature.item} (per tracked state)`);
@@ -1978,6 +2111,53 @@ export async function runClosedLoopStep(
             plan.pendingClick = null;
             plan.pendingChain = [];
             return { kind: "act", action: defaultMcuAction(), holdSteps: 1 };
+          }
+          // no_op: BEFORE retrying, sanity-check the cursor. The most common
+          // cause of place_one/place_all → no_op when cursorItemSignature
+          // says we're holding something is that the Action LLM consumed
+          // the last item on a previous click and the runtime never cleared
+          // the signature (place_all on the SAME pickup slot returns no_op
+          // because the slot can't change). Held items suppress slot
+          // tooltips, so an OCR-readable tooltip on a known slot proves
+          // the cursor is empty.
+          const isPlace = pc.actionKind === "place_one" || pc.actionKind === "place_all";
+          if (
+            isPlace
+            && plan.cursorItemSignature?.item
+            && !plan.cursorVerifyJob
+            && plan.slotMemory.snapshot().some(e => e.item && e.item !== "unknown")
+          ) {
+            const known = plan.slotMemory.snapshot().filter(e => e.item && e.item !== "unknown");
+            // Prefer a slot DIFFERENT from the failed click's destination so
+            // we're not OCR'ing a stale/mid-flight slot.
+            const candidate = known.find(e => Math.hypot(e.x - pc.frozenTarget.x, e.y - pc.frozenTarget.y) > 8) ?? known[0];
+            // Find the candidate's raster index in the current layout (so the
+            // servo step can target a valid slot index).
+            let knownSlotIdx = -1;
+            for (let i = 0; i < layout!.slots.length; i++) {
+              const s = layout!.slots[i];
+              if (s && Math.hypot(s.cx - candidate.x, s.cy - candidate.y) < 8) { knownSlotIdx = i; break; }
+            }
+            if (knownSlotIdx >= 0) {
+              plan.cursorVerifyJob = {
+                knownSlotIdx,
+                target: { x: candidate.x, y: candidate.y },
+                slotName: layout!.slots[knownSlotIdx]?.name,
+                expectedItem: candidate.item,
+                phase: "servo",
+                servoSteps: 0,
+                hoverFrames: 0,
+              };
+              // Suspend the failed click chain — we'll either drop it
+              // (cursor confirmed empty) or escalate (genuine anomaly)
+              // when the OCR result is in. Don't retry yet.
+              const savedFailureLabel = `${pc.actionKind ?? pc.kind ?? "click"} slot=${pc.rasterIndex}${pc.slotName ? `(${pc.slotName})` : ""} no_op pending cursor-empty OCR verify`;
+              console.log(`[agentbeats] ${savedFailureLabel} — servoing to ${candidate.item} @ (${Math.round(candidate.x)},${Math.round(candidate.y)}) for tooltip OCR`);
+              plan.lastParkSnapshot = postSnap;
+              plan.pendingClick = null;
+              plan.pendingChain = [];
+              return { kind: "act", action: defaultMcuAction(), holdSteps: 1 };
+            }
           }
           // no_op: retry up to MAX_RETRIES, then abort.
           const inActionAgentMode = plan.checklist.length > 0 && plan.activeChecklistIdx >= 0;

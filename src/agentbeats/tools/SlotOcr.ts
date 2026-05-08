@@ -17,8 +17,7 @@
  * frame is given.
  */
 import type OpenAI from "openai";
-import * as fs from "node:fs";
-import * as path from "node:path";
+import { getDebugRecorder } from "./DebugRecorder";
 
 export type SlotOcrOpts = {
   client: OpenAI;
@@ -98,28 +97,16 @@ export async function readTooltip(opts: SlotOcrOpts): Promise<SlotOcrResult> {
       return { item: m ? m[0] : "unknown" };
     }
   })();
-  const debugDir = process.env.AGENTBEATS_DEBUG_DIR;
-  if (debugDir) {
-    try {
-      const seq = String(++DEBUG_SEQ).padStart(5, "0");
-      const fname = `${seq}_slot_ocr.png`;
-      fs.writeFileSync(path.join(debugDir, fname), Buffer.from(cropB64, "base64"));
-      const line = JSON.stringify({
-        seq: DEBUG_SEQ,
-        ts: new Date().toISOString(),
-        type: "slot_ocr",
-        imageFile: fname,
-        data: { slotPos: opts.slotPos, slotName: opts.slotName, raw, parsed },
-      });
-      fs.appendFileSync(path.join(debugDir, "events.jsonl"), line + "\n");
-    } catch (e) {
-      console.warn(`[slot-ocr] debug write failed: ${e instanceof Error ? e.message : String(e)}`);
-    }
+  const dbg = getDebugRecorder();
+  if (dbg.isEnabled()) {
+    dbg.record(
+      { type: "slot_ocr", data: { slotPos: opts.slotPos, slotName: opts.slotName, raw, parsed } },
+      cropB64,
+      "png",  // crop is already R/B-swapped PNG; recorder skips swap for png
+    );
   }
   return parsed;
 }
-
-let DEBUG_SEQ = 200000;
 
 function cropTooltipRegion(obsBase64: string, slotX: number, slotY: number): string {
   // eslint-disable-next-line @typescript-eslint/no-require-imports
