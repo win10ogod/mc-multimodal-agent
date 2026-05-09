@@ -30,6 +30,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { defaultMcuAction, type McuEnvAction } from "../McuPrompt";
 import { getDebugRecorder } from "./DebugRecorder";
+import { drawCrosshair } from "./CrosshairOverlay";
 
 export type WorldBlockOpenerDeps = {
   client: OpenAI;
@@ -82,10 +83,12 @@ NEVER guess based on inventory icons or HUD. Only the in-world block matters.`;
 
 async function vlmDirection(
   deps: WorldBlockOpenerDeps,
-  obsBase64: string,
+  frameB64: string,
+  frameExt: "png" | "jpg",
   target: string,
 ): Promise<Direction> {
-  const url = `data:image/jpeg;base64,${obsBase64.replace(/^data:image\/[a-z]+;base64,/, "")}`;
+  const mime = frameExt === "png" ? "image/png" : "image/jpeg";
+  const url = `data:${mime};base64,${frameB64.replace(/^data:image\/[a-z]+;base64,/, "")}`;
   const userText = `Target block: ${target}. Where is it relative to the crosshair? Reply JSON only.`;
   let raw = "";
   try {
@@ -136,14 +139,14 @@ function noop(): McuEnvAction {
   return defaultMcuAction();
 }
 
-function recordDebug(target: string, payload: Record<string, unknown>, obsBase64?: string): void {
+function recordDebug(target: string, payload: Record<string, unknown>, frameB64?: string, frameExt: "png" | "jpg" = "jpg"): void {
   const dbg = getDebugRecorder();
   if (!dbg.isEnabled()) return;
-  if (obsBase64) {
+  if (frameB64) {
     dbg.record(
       { type: "world_block_opener", data: { target, ...payload } },
-      obsBase64,
-      "jpg",
+      frameB64,
+      frameExt,
     );
     return;
   }
@@ -181,12 +184,20 @@ export class WorldBlockOpener {
       return this.fail("align_exhausted");
     }
 
-    const direction = await vlmDirection(this.deps, obsBase64, this.target);
+    // Compute the augmented (with-crosshair) frame ONCE per step so the VLM
+    // and the saved debug PNG share the EXACT pixels the model received.
+    const augmented = (() => {
+      try { return drawCrosshair(obsBase64); } catch { return null; }
+    })();
+    const frameB64 = augmented ?? obsBase64;
+    const frameExt: "png" | "jpg" = augmented ? "png" : "jpg";
+
+    const direction = await vlmDirection(this.deps, frameB64, frameExt, this.target);
     this.alignIter += 1;
     console.log(
       `[world-block-opener] align iter=${this.alignIter} target=${this.target} direction=${direction} not_visible_streak=${this.consecutiveNotVisible}`,
     );
-    recordDebug(this.target, { phase: "align", iter: this.alignIter, direction, consecutiveNotVisible: this.consecutiveNotVisible }, obsBase64);
+    recordDebug(this.target, { phase: "align", iter: this.alignIter, direction, consecutiveNotVisible: this.consecutiveNotVisible }, frameB64, frameExt);
 
     if (direction === "centered") {
       this.innerPhase = "settle";

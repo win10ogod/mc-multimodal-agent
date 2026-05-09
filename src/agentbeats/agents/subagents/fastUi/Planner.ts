@@ -92,9 +92,9 @@ function buildSystemPrompt(opts: { taskCategory?: "crafting" | "smelting" | "bre
 
 Subtask kinds (with explicit slot indices):
 - verify_items_visible { items?, slots? }: OCR slots to refresh Known. Pass items=[...] to have the Action find candidate slots, OR pass slots=[N1, N2, ...] to OCR specific slot indices (use this to confirm the result slot holds the crafted item, or to confirm a deposit target is empty before take_result).
-- pickup { sourceSlot, expectedItem }: left-click sourceSlot. Cursor MUST be empty before; will hold expectedItem after.
-- place_one { destSlot, expectedItem }: right-click destSlot to drop ONE item. Cursor MUST hold expectedItem; cursor still holds (stack-1) after.
-- place_all { destSlot, expectedItem }: left-click destSlot to drop the whole stack. Cursor MUST hold expectedItem; cursor empty after.
+- pickup { sourceSlot, expectedItem }: left-click sourceSlot. Cursor MUST be empty before; will hold expectedItem after. **BOTH fields are REQUIRED. sourceSlot MUST be a concrete integer index from Known/slots_by_role — never omit, never let the Action subagent guess "which cobblestone to pick" by name alone. expectedItem is the name the Action will use to verify it picked the right thing. (sourceSlot may be a craft-grid slot when doing a RECOVERY pickup — e.g. lifting a misplaced item back out — but in that case still emit the concrete slot id.)**
+- place_one { destSlot, expectedItem }: right-click destSlot to drop ONE item. Cursor MUST hold expectedItem; cursor still holds (stack-1) after. **BOTH fields are REQUIRED. destSlot MUST be a concrete integer index.**
+- place_all { destSlot, expectedItem }: left-click destSlot to drop the whole stack. Cursor MUST hold expectedItem; cursor empty after. **BOTH fields are REQUIRED. destSlot MUST be a concrete integer index.**
 - take_result { expectedItem }: left-click the result slot to take the crafted output. Cursor MUST be empty before; will hold expectedItem after. Follow with a place_all to a free hotbar/main_inv slot to deposit it.
 - wait_for_output { expectedItem }: wait for furnace/brewing output.
 - verify_state { condition }: confirm a non-action condition holds.
@@ -278,7 +278,11 @@ export async function runPlanner(deps: PlannerDeps, input: PlannerInput): Promis
   const body: Record<string, unknown> = {
     model: deps.model,
     temperature: 0,
-    max_completion_tokens: 800,
+    // 800 was truncating mid-checklist on long recipes (run 26 furnace
+    // task: 13 step JSON regen got cut off → parser failed → planner
+    // stuck regenerating the same truncated response forever). 3000 gives
+    // headroom for ~25 step recipes plus the surrounding JSON envelope.
+    max_completion_tokens: 3000,
     messages: [
       { role: "system", content: sys },
       {

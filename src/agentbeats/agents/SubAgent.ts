@@ -78,6 +78,14 @@ export type EpisodeState = {
    *  reports done (GUI open) or fail (target_ui_not_in_view). Cleared on
    *  subgoal completion. */
   worldBlockOpener: WorldBlockOpener | null;
+  /** Frames remaining to wait after a WorldBlockOpener returned done before
+   *  the dispatcher allows creating another opener. MC takes 1-3 frames to
+   *  render the GUI after a use=1 right-click, during which guiOpen detects
+   *  false — without this cooldown the dispatcher spawned a new opener
+   *  every frame and emitted use=1 multiple times in a row, opening (and
+   *  closing) the GUI repeatedly. Set by Dispatcher on opener-done; gates
+   *  the "is GUI open?" check so the runtime waits for the render to land. */
+  worldBlockOpenerCooldown: number;
 };
 
 export function makeEpisodeState(taskText: string): EpisodeState {
@@ -94,5 +102,6 @@ export function makeEpisodeState(taskText: string): EpisodeState {
     checklist: new TaskChecklist(),
     pendingReflection: null,
     worldBlockOpener: null,
+    worldBlockOpenerCooldown: 0,
   };
 }

@@ -8,6 +8,7 @@ import { MCU_ACTION_SCHEMA } from "../../McuPrompt";
 import { parseMcuActionText, normalizeMcuAction } from "../../McuPolicy";
 import { WORLD_EXPLORE_SYSTEM_PROMPT } from "../../prompts/subagents/world_explore";
 import { getDebugRecorder } from "../../tools/DebugRecorder";
+import { drawCrosshair } from "../../tools/CrosshairOverlay";
 
 export type WorldSubAgentDeps = { client: OpenAI; model: string };
 
@@ -18,13 +19,24 @@ export async function callWorldVlm(
   agentLabel: "world_explore" | "placing" | "mining" | "combat" = "world_explore",
 ): Promise<SubAgentStep> {
   const userText = `Subgoal: ${input.subgoal.description}\nSuccess: ${input.subgoal.success_criteria}\nRecent history: ${input.history.slice(-5).join(" | ")}`;
+  // Overlay a bold crosshair (red+yellow +) at frame centre. The native MC
+  // crosshair is too small (1-2 px) for the VLM's ViT patch tokenizer to
+  // attend to — it gets normalized into background — so model answers drift
+  // when asked "what is Steve aiming at?". Applied to ALL world-view
+  // subagents (placing/mining/combat/world_explore).
+  const augmented = (() => {
+    try { return drawCrosshair(input.obs.imageBase64); } catch { return null; }
+  })();
+  const imgUrl = augmented
+    ? `data:image/png;base64,${augmented}`
+    : `data:image/jpeg;base64,${input.obs.imageBase64}`;
   const userMsg = [
     { type: "text" as const, text: userText },
-    { type: "image_url" as const, image_url: { url: `data:image/jpeg;base64,${input.obs.imageBase64}` } },
+    { type: "image_url" as const, image_url: { url: imgUrl } },
   ];
-  // Save the frame + prompt to events.jsonl so the dashboard surfaces
-  // what the world subagent saw at each step (placing/mining/combat
-  // were previously dark — only FastUI events made it to the log).
+  // Save the AUGMENTED frame (the actual pixels the model received,
+  // including the crosshair overlay) so the dashboard reflects exactly
+  // what the VLM saw — not the raw obs.
   const dbg = getDebugRecorder();
   if (dbg.isEnabled()) {
     dbg.record(
@@ -38,8 +50,8 @@ export async function callWorldVlm(
           userText,
         },
       },
-      input.obs.imageBase64,
-      "jpg",
+      augmented ?? input.obs.imageBase64,
+      augmented ? "png" : "jpg",
     );
   }
   try {

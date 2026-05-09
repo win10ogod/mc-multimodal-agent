@@ -91,7 +91,15 @@ export async function dispatchObservation(
   // through to the regular closed-loop step. Once the opener reports done,
   // the next observation should see the GUI open and closedLoopStep takes
   // over normally. On fail (target_ui_not_in_view) escalate to the planner.
-  if (current.kind === "ui_inventory" && current.gui_target && current.gui_target !== "player_inventory" && !guiOpen) {
+  // Decrement cooldown each frame; skip opener creation while non-zero.
+  if (state.worldBlockOpenerCooldown > 0) state.worldBlockOpenerCooldown -= 1;
+  if (
+    current.kind === "ui_inventory"
+    && current.gui_target
+    && current.gui_target !== "player_inventory"
+    && !guiOpen
+    && state.worldBlockOpenerCooldown === 0
+  ) {
     if (!state.worldBlockOpener) {
       state.worldBlockOpener = new WorldBlockOpener({
         target: current.gui_target,
@@ -104,8 +112,10 @@ export async function dispatchObservation(
     }
     if (r.kind === "done") {
       state.worldBlockOpener = null;
-      // Emit one noop frame so the use=1 the opener emitted lands and the GUI
-      // appears in the next observation; closedLoopStep will see it open.
+      // Wait for MC to render the GUI before letting the dispatcher decide
+      // again — without this, guiOpen=false on the next obs spawns another
+      // opener and another use=1, repeatedly toggling the GUI.
+      state.worldBlockOpenerCooldown = 6;
       return NOOP_ONE;
     }
     // r.kind === "fail"

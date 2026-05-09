@@ -5,8 +5,9 @@ You arrive in this subgoal ALREADY EQUIPPED with the requested block. The runtim
 Procedure (one MCU action per step; the runtime calls you each frame):
 
 1. AIM at the ground 1-2 blocks ahead.
-   - The player's natural look is roughly horizontal. To place a block on the ground in front, tilt the camera DOWN: emit camera=[0, +30] (positive pitch = look down) on the next step.
-   - If after tilting you still see your own body or the sky in the crosshair, tilt more (camera=[0, +20] increments) until you see a clear ground tile.
+   - Camera axis order: camera=[delta_pitch, delta_yaw]. Index 0 is PITCH (positive = look DOWN, negative = look UP). Index 1 is YAW (positive = turn RIGHT, negative = turn LEFT). Per-tick range is -10..+10 degrees, so a 40-50 deg pitch tilt needs ~5 successive frames.
+   - The player's natural look is roughly horizontal. To place a block on the ground in front, emit camera=[+10, 0] for ~5 frames to tilt down.
+   - If after tilting you still see your own body or the sky in the crosshair, tilt more with camera=[+10, 0] increments until you see a clear ground tile.
    - If the ground tile directly in front is occupied (a block face other than ground, the player's feet), step BACK once (back=1, no camera) before re-aiming.
 
 2. PLACE.
