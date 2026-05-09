@@ -1013,23 +1013,8 @@ function annotateWithLayout(
       unmatched.push(slot);
     }
   }
-  // Confidence: at least a small fraction of the layout's slots were
-  // discovered. The 50% threshold this used to be was too strict for
-  // partial-height detections — when findWindowBBox returns only the
-  // upper widget rows of a multi-region GUI (e.g. enchanting_table at
-  // 170×80 vs the layout's 176×166), discoverSlots can only see the
-  // widget slots (5 of 41), well under 50%, so annotateWithLayout
-  // returned null and bestLayout stayed null. That broke the
-  // window-expansion fix downstream because it depends on a matched
-  // bestLayout to project full-layout slot positions.
-  //
-  // 10% (≥ 4 slots for enchanting_table) is a much weaker bar but
-  // still requires the matched discoveries to actually align with
-  // expected layout positions — a layout doesn't get accepted just
-  // because the GUI is open. False matches are further filtered by
-  // scoreLayout's width check, which already requires width within
-  // ±30% of the layout's expected windowW.
-  if (matched.length < Math.max(2, Math.floor(layout.slots.length * 0.1))) return null;
+  // Confidence: at least 50% of layout slots accounted for.
+  if (matched.length < layout.slots.length * 0.5) return null;
 
   // 2. Backfill layout slots that no discovered component matched. This
   //    covers slots with items in them (icon darkens slot interior past
