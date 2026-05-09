@@ -44,6 +44,15 @@ export async function runClosedLoopStep(
 ): Promise<SubAgentStep> {
   const { context: state, payload, step } = input;
 
+  // The current subgoal's description is the immediate intent the
+  // GoalPlanner asked FastUI to handle this dispatch (e.g. "craft
+  // enchanting_table" vs "verify inventory contains <items>" vs
+  // "fill furnace with raw_iron and coal"). Distinct from
+  // state.taskText, which is the EPISODE-level goal set once at init.
+  // Surfaced so the FastUI Planner can branch on per-dispatch intent
+  // (verify-only / organize / craft / smelt / etc.).
+  const currentSubgoalDescription = input.episode.subgoals[input.episode.idx]?.description;
+
   // VLM-driven early stop: when the model previously set task_done=true,
   // do not call it again for the rest of the episode. Emit a dummy
   // no-op action each step. The benchmark cannot be early-ended by
@@ -173,6 +182,7 @@ export async function runClosedLoopStep(
       const layoutSlotsForPlanner = (cp.sessionLayout as { slots: Array<{ index: number; name?: string; role?: string }> } | null)?.slots ?? [];
       const rj = await runPlanner({ client: deps.client, model: deps.model, recordDebug: deps.recordDebug }, {
         taskText: state.taskText,
+        subgoalDescription: currentSubgoalDescription,
         recipeInfo: cp.recipeOverride,
         knownSlots: knownSlotsForPlanner,
         layoutSlots: layoutSlotsForPlanner,
@@ -1181,6 +1191,7 @@ export async function runClosedLoopStep(
                 const layoutSlotsForPlanner = (plan.sessionLayout as { slots: Array<{ index: number; name?: string; role?: string }> } | null)?.slots ?? [];
                 const r0 = await runPlanner({ client: deps.client, model: deps.model, recordDebug: deps.recordDebug }, {
                   taskText: state.taskText,
+                  subgoalDescription: currentSubgoalDescription,
                   recipeInfo: r,
                   knownSlots: knownSlotsForPlanner,
                   layoutSlots: layoutSlotsForPlanner,
