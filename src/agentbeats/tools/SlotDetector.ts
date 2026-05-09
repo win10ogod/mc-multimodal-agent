@@ -1228,61 +1228,42 @@ export function detectGuiLayout(
     slots = filled.map((s, i) => ({ index: i, cx: s.cx, cy: s.cy, w: s.w, h: s.h }));
   }
 
-  // Expand the window bbox to encompass every slot the agent might
-  // legitimately interact with. Two sources of slot positions:
+  // Expand the discovered window bbox to encompass every detected slot
+  // (with slot-half-width padding). For multi-region GUIs like
+  // enchanting_table — where the matched LogicalLayout only covers the
+  // upper widget (item / lapis / offer buttons) but the player's
+  // main_inv + hotbar render below — the original disc.window* would
+  // NOT cover the hotbar slots. The closed-loop driver's click
+  // suppression guard then refused to fire pickups on hotbar slots
+  // even though the cursor was correctly parked there ("click
+  // suppressed: cursor outside inventory window"). Treating the window
+  // as the bbox of all DISCOVERED slot centres (not just the layout-
+  // matched subset) keeps the guard's "don't drop held items into the
+  // void" semantics intact while fixing the false-positive abort on
+  // hotbar interactions.
   //
-  // 1. PROJECTED LogicalLayout slots — when bestLayout matched. The
-  //    LogicalLayout (e.g. enchanting_table) defines ALL slots —
-  //    widget + main_inv + hotbar — at known logical (x, y) coords.
-  //    Projecting them to pixel space via the matched scale yields
-  //    the TRUE positions of every slot, including hotbar at y≈245
-  //    even when findWindowBBox only detected the upper widget at
-  //    y=100..180. This is the authoritative source.
-  //
-  // 2. DISCOVERED disc.slots — fallback for unknown / partial layouts
-  //    where bestLayout is null. Bounded by disc.windowW/H but at
-  //    least covers everything findWindowBBox could see.
-  //
-  // Pad each slot centre by half the discovered slot width so the
-  // bbox covers slot interiors, then union with the original
-  // disc.window* so the chrome around the matched widget (borders,
-  // button areas) is still considered inside the GUI.
-  //
-  // The closed-loop driver's click-suppression guard ("don't drop
-  // held items by clicking outside the inventory window") consults
-  // these window* fields. Without this expansion, pickups on hotbar
-  // slots were aborting with "cursor outside inventory window" even
-  // when the cursor was correctly parked on a real slot — see the
-  // enchant_diamond_sword run that scored 5.00 with FastUI stuck
-  // mid-recipe at the first hotbar pickup.
+  // Use disc.slots (the raw discoveries, including main_inv + hotbar
+  // even when those don't appear in the matched LogicalLayout) — NOT
+  // the post-match `slots` variable, which only contains widget slots
+  // for partial-coverage layouts.
   let windowX = disc.windowX;
   let windowY = disc.windowY;
   let windowW = disc.windowW;
   let windowH = disc.windowH;
-  let minX = Number.POSITIVE_INFINITY, minY = Number.POSITIVE_INFINITY;
-  let maxX = Number.NEGATIVE_INFINITY, maxY = Number.NEGATIVE_INFINITY;
-  const halfPx = Math.max(4, Math.round(disc.slotPx / 2));
-  if (bestLayout) {
-    // Project ALL slots in the matched LogicalLayout to pixel space.
-    const layoutScale = disc.windowW / bestLayout.windowW;
-    for (const ls of bestLayout.slots) {
-      const p = slotScreenCenter(ls, disc.windowX, disc.windowY, layoutScale);
-      if (p.x - halfPx < minX) minX = p.x - halfPx;
-      if (p.y - halfPx < minY) minY = p.y - halfPx;
-      if (p.x + halfPx > maxX) maxX = p.x + halfPx;
-      if (p.y + halfPx > maxY) maxY = p.y + halfPx;
-    }
-  } else {
-    // No layout match — fall back to discovered slot positions.
-    const allDiscovered = disc.slots ?? [];
+  const allDiscovered = disc.slots ?? [];
+  if (allDiscovered.length > 0) {
+    const halfPx = Math.max(4, Math.round(disc.slotPx / 2));
+    let minX = Number.POSITIVE_INFINITY, minY = Number.POSITIVE_INFINITY;
+    let maxX = Number.NEGATIVE_INFINITY, maxY = Number.NEGATIVE_INFINITY;
     for (const s of allDiscovered) {
       if (s.cx - halfPx < minX) minX = s.cx - halfPx;
       if (s.cy - halfPx < minY) minY = s.cy - halfPx;
       if (s.cx + halfPx > maxX) maxX = s.cx + halfPx;
       if (s.cy + halfPx > maxY) maxY = s.cy + halfPx;
     }
-  }
-  if (Number.isFinite(minX) && Number.isFinite(minY) && Number.isFinite(maxX) && Number.isFinite(maxY)) {
+    // Union with the originally-discovered widget window so the chrome
+    // around the matched widget (borders, button areas) is still
+    // considered inside the GUI, not just slot interiors.
     const ux0 = Math.min(disc.windowX, Math.round(minX));
     const uy0 = Math.min(disc.windowY, Math.round(minY));
     const ux1 = Math.max(disc.windowX + disc.windowW, Math.round(maxX));
