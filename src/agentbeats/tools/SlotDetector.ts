@@ -1228,50 +1228,11 @@ export function detectGuiLayout(
     slots = filled.map((s, i) => ({ index: i, cx: s.cx, cy: s.cy, w: s.w, h: s.h }));
   }
 
-  // Expand the discovered window bbox to encompass every detected slot
-  // (with slot-half-width padding). For multi-region GUIs like
-  // enchanting_table — where the discovered "window" only matches the
-  // upper widget but the player's main inventory + hotbar render below
-  // — the original disc.window* would NOT cover the hotbar slots. The
-  // closed-loop driver's click-suppression guard then refused to fire
-  // pickups on hotbar slots even though the cursor was correctly
-  // parked there ("click suppressed: cursor outside inventory window").
-  // Treating the window as the bbox of all detected slot centres keeps
-  // the guard's "don't drop held items into the void" semantics intact
-  // (the slot positions are by definition inside the rendered inventory
-  // region) while fixing the false-positive abort on hotbar interactions.
-  let windowX = disc.windowX;
-  let windowY = disc.windowY;
-  let windowW = disc.windowW;
-  let windowH = disc.windowH;
-  if (slots.length > 0) {
-    const halfPx = Math.max(4, Math.round(disc.slotPx / 2));
-    let minX = Number.POSITIVE_INFINITY, minY = Number.POSITIVE_INFINITY;
-    let maxX = Number.NEGATIVE_INFINITY, maxY = Number.NEGATIVE_INFINITY;
-    for (const s of slots) {
-      if (s.cx - halfPx < minX) minX = s.cx - halfPx;
-      if (s.cy - halfPx < minY) minY = s.cy - halfPx;
-      if (s.cx + halfPx > maxX) maxX = s.cx + halfPx;
-      if (s.cy + halfPx > maxY) maxY = s.cy + halfPx;
-    }
-    // Union with the originally-discovered window so the chrome around
-    // the matched widget (borders, button areas) is still considered
-    // inside the GUI, not just slot interiors.
-    const ux0 = Math.min(disc.windowX, Math.round(minX));
-    const uy0 = Math.min(disc.windowY, Math.round(minY));
-    const ux1 = Math.max(disc.windowX + disc.windowW, Math.round(maxX));
-    const uy1 = Math.max(disc.windowY + disc.windowH, Math.round(maxY));
-    windowX = ux0;
-    windowY = uy0;
-    windowW = ux1 - ux0;
-    windowH = uy1 - uy0;
-  }
-
   return {
-    windowX,
-    windowY,
-    windowW,
-    windowH,
+    windowX: disc.windowX,
+    windowY: disc.windowY,
+    windowW: disc.windowW,
+    windowH: disc.windowH,
     matchedLayoutId: bestLayout?.id ?? null,
     slots,
     cursorOpenCenter: disc.cursorOpenCenter,
