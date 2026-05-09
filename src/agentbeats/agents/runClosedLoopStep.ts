@@ -1561,17 +1561,31 @@ export async function runClosedLoopStep(
                 state.closedLoopHistory = state.closedLoopHistory.slice(0, 5);
                 return { kind: "act", action: defaultMcuAction(), holdSteps: 1 };
               }
-              const expectAfter: "should_empty" | "should_fill" =
-                (probed.action === "place_one" || probed.action === "place_all") ? "should_fill" : "should_empty";
+              // Click-mode sentinel: place_all with empty expectedItem
+              // is a button click (e.g. enchant offer, trade offer,
+              // recipe-book toggle) — no slot transition expected, no
+              // cursor-state requirement. Verify by patch fingerprint
+              // change at the destSlot (e.g. enchant offer level text
+              // disappears after click).
+              const activeTask = plan.checklist[plan.activeChecklistIdx]?.task as { kind?: string; expectedItem?: string } | undefined;
+              const isButtonClick = probed.action === "place_all"
+                && activeTask?.kind === "place_all"
+                && activeTask.expectedItem === "";
+              const expectAfter: "should_empty" | "should_fill" | "should_change" =
+                isButtonClick ? "should_change"
+                : (probed.action === "place_one" || probed.action === "place_all") ? "should_fill"
+                : "should_empty";
               // Record what item the cursor is about to drop. Verify
               // uses this to write slotMemory[dest] = item on confirmed
               // placement — without it, the place verify can't identify
               // the placed item and slotMemory loses the destination
               // entry, leaving the next planner call blind to a slot
-              // we just deterministically filled.
-              const placedItemName = (probed.action === "place_one" || probed.action === "place_all")
-                ? plan.cursorItemSignature?.item
-                : undefined;
+              // we just deterministically filled. Skip for button clicks.
+              const placedItemName = isButtonClick
+                ? undefined
+                : (probed.action === "place_one" || probed.action === "place_all")
+                  ? plan.cursorItemSignature?.item
+                  : undefined;
               plan.pendingClick = {
                 rasterIndex: probed.slot,
                 slotName: probedSlot.name,
@@ -1957,6 +1971,57 @@ export async function runClosedLoopStep(
           const { takeLayoutSnapshot, diffSnapshots, classifyOutcome, identifyChangedSlot } = await import("../tools/SnapshotDiff");
           const postSnap = takeLayoutSnapshot(payload.obs, layout!, cursor, plan.iteration, plan.parkEmptyCursorPatch, plan.lastProbeCursor);
           const preSnap = plan.lastParkSnapshot;
+          // Button-click verify (place_all with expectedItem=""): no
+          // slot transition is expected. Confirm by sampling the
+          // destSlot's patch fingerprint and comparing to prePatch —
+          // a successful click visibly changes the button (e.g.
+          // enchant offer level text disappears).
+          if (pc.expectAfter === "should_change") {
+            const postPatch = samplePatchFingerprint(payload.obs, pc.frozenTarget.x, pc.frozenTarget.y, 6);
+            const dr = postPatch && pc.prePatch ? Math.abs(postPatch.meanR - pc.prePatch.meanR) : 0;
+            const dg = postPatch && pc.prePatch ? Math.abs(postPatch.meanG - pc.prePatch.meanG) : 0;
+            const db = postPatch && pc.prePatch ? Math.abs(postPatch.meanB - pc.prePatch.meanB) : 0;
+            const dStd = postPatch && pc.prePatch ? Math.abs(postPatch.stddev - pc.prePatch.stddev) : 0;
+            const meanDelta = (dr + dg + db) / 3;
+            const changed = postPatch !== null && pc.prePatch !== undefined && (meanDelta > 12 || dStd > 8);
+            console.log(`[agentbeats] verify ${pc.slotName ?? pc.rasterIndex} click: meanDelta=${meanDelta.toFixed(1)} dStd=${dStd.toFixed(1)} -> ${changed ? "CHANGED" : "no_op"}`);
+            plan.lastParkSnapshot = postSnap;
+            if (changed) {
+              state.closedLoopHistory.unshift(`click slot=${pc.rasterIndex}(${pc.slotName ?? "?"}) OK (visual change)`);
+              state.closedLoopHistory = state.closedLoopHistory.slice(0, 5);
+              if (plan.activeChecklistIdx >= 0
+                  && plan.activeChecklistIdx < plan.checklist.length
+                  && !plan.checklist[plan.activeChecklistIdx].done) {
+                const active = plan.checklist[plan.activeChecklistIdx];
+                if ((active.task as { kind?: string })?.kind === "place_all") {
+                  active.done = true;
+                  console.log(`[agentbeats] auto-tick checklist[${plan.activeChecklistIdx}] (${active.id}, click) done`);
+                }
+              }
+              if (plan.pendingChain.length === 0) plan.judgeAfterChain = true;
+              const next = plan.pendingChain.shift();
+              if (next) {
+                next.phase = "servo";
+                next.retries = 0;
+                plan.pendingClick = next;
+                plan.servoSteps = 0;
+              } else {
+                plan.pendingClick = null;
+              }
+              return { kind: "act", action: defaultMcuAction(), holdSteps: 1 };
+            }
+            // No change detected. Retry up to 2 times before giving up.
+            pc.retries += 1;
+            if (pc.retries >= 3) {
+              state.closedLoopHistory.unshift(`click slot=${pc.rasterIndex}(${pc.slotName ?? "?"}) failed (no visual change after 3 tries)`);
+              state.closedLoopHistory = state.closedLoopHistory.slice(0, 5);
+              plan.pendingClick = null;
+              plan.judgeAfterChain = true;
+              return { kind: "act", action: defaultMcuAction(), holdSteps: 1 };
+            }
+            pc.phase = "servo";
+            return { kind: "act", action: defaultMcuAction(), holdSteps: 1 };
+          }
           if (!preSnap) {
             console.warn(`[agentbeats] verify: no pre-snapshot available — accepting click and capturing post as new baseline`);
             plan.lastParkSnapshot = postSnap;

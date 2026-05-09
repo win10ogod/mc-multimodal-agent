@@ -10,8 +10,10 @@
  *   trade_result    — output (e.g. enchanted_book)
  *
  * Note: unlike crafting, the runtime expects you to first SELECT a
- * trade offer (place_one on trade_offer_N), then load payments, then
- * take the result. Selecting an offer doesn't consume cursor state.
+ * trade offer (place_all on trade_offer_N with expectedItem=""),
+ * then load payments, then take the result. The empty expectedItem
+ * is the BUTTON-CLICK SENTINEL — see baseRules. Selecting an offer
+ * doesn't consume cursor state.
  */
 export const FEW_SHOT_TRADING = `
 
@@ -20,7 +22,7 @@ TRADING MODE (subgoal_directive mentions trade / villager / wandering_trader). T
 EXAMPLE — task "trade 5 emerald with librarian for an enchanted_book (offer #3)". Suppose Known shows emerald at <emerald_src>; slots-by-role lists <O3>=trade_offer_3, <P1>=trade_payment_1, <R>=trade_result.
 
   step1: verify_items_visible { items: ["emerald"] }
-  step2: place_one { destSlot: <O3>, expectedItem: "" }                                   // SELECT trade #3 — empty cursor, just clicks the offer button
+  step2: place_all { destSlot: <O3>, expectedItem: "" }                                   // SELECT trade #3 — BUTTON-CLICK SENTINEL (expectedItem="" = left-click, verify by visual change at the button, no cursor or slot bookkeeping)
   step3: verify_items_visible { slots: [<P1>] }                                           // confirm payment slot now shows the cost icon (5 emerald)
   step4: pickup { sourceSlot: <emerald_src>, expectedItem: "emerald" }
   step5: place_all { destSlot: <P1>, expectedItem: "emerald" }                             // load the emerald payment
@@ -29,7 +31,7 @@ EXAMPLE — task "trade 5 emerald with librarian for an enchanted_book (offer #3
   step8: place_all { destSlot: <empty_inv>, expectedItem: "enchanted_book" }
 next_idx: 0
 
-OFFER SELECTION: emit place_one (NOT pickup) on the trade_offer_N slot — it's a button click, not a slot transfer. expectedItem can be empty since you're not depositing an item.
+OFFER SELECTION: emit place_all { destSlot: <trade_offer_N>, expectedItem: "" } — the empty expectedItem is the BUTTON-CLICK SENTINEL (see baseRules). Runtime fires a left-click and verifies by visual change at the button. DO NOT use place_one (right-click won't activate the offer) and DO NOT supply a real item name (that would mis-route through item-tracking).
 
 LOCKED TRADES: if Known after step3 shows <P1>=empty even after offer-select, the trade is locked (used up its daily quota or villager has no stock). Surface "BLOCKED: trade #N is locked" and try a different offer index.
 
