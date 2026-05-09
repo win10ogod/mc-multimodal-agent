@@ -123,9 +123,18 @@ async function vlmDirection(
   return "not_visible";
 }
 
-function camAct(yaw: number, pitch: number): McuEnvAction {
+// McuEnvAction.camera is [delta_pitch, delta_yaw] per the system prompt
+// and the cameraX/cameraY split in toCompactMcuAgentActionPayload —
+// camera[0] is pitch (positive = look DOWN), camera[1] is yaw (positive
+// = turn RIGHT). Earlier this helper stored [yaw, pitch], which made
+// every "yaw right" alignment emit as "pitch down" — the camera
+// progressively tilted at the floor while the VLM kept reporting
+// the target was still to the right (because the table was now
+// off-screen above-right of the crosshair). Same bug pattern as the
+// historical Placing.camAction defect.
+function camAct(pitch: number, yaw: number): McuEnvAction {
   const a = defaultMcuAction();
-  a.camera = [yaw, pitch];
+  a.camera = [pitch, yaw];
   return a;
 }
 
@@ -212,7 +221,7 @@ export class WorldBlockOpener {
         return this.fail("target_ui_not_in_view");
       }
       // Scan: emit a wider yaw step to look around for the target.
-      return { kind: "act", action: camAct(SCAN_YAW_DEG, 0), holdSteps: 2 };
+      return { kind: "act", action: camAct(0, SCAN_YAW_DEG), holdSteps: 2 };
     }
 
     // Direction is one of left/right/up/down — reset the not_visible streak.
@@ -223,7 +232,7 @@ export class WorldBlockOpener {
     else if (direction === "right") yaw = CAMERA_STEP_DEG;
     else if (direction === "up") pitch = -CAMERA_STEP_DEG;
     else if (direction === "down") pitch = CAMERA_STEP_DEG;
-    return { kind: "act", action: camAct(yaw, pitch), holdSteps: 2 };
+    return { kind: "act", action: camAct(pitch, yaw), holdSteps: 2 };
   }
 
   private fail(code: "target_ui_not_in_view" | "align_exhausted"): WorldBlockOpenerFail {
