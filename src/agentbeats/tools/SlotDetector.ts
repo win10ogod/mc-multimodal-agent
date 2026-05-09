@@ -940,21 +940,39 @@ export function discoverSlots(jpegBase64: string): DiscoveredLayout | null {
 // =========================================================================
 import { ALL_LAYOUTS, slotScreenCenter, type LogicalLayout } from "./InventoryLayouts";
 
-function aspect(w: number, h: number): number {
-  return h === 0 ? 0 : w / h;
-}
-
 /** Score a candidate logical layout's plausibility for the discovered
  *  geometry. Lower score = better match. Returns +Infinity for layouts
  *  that don't match aspect/slot-count basics at all. */
 function scoreLayout(disc: DiscoveredLayout, layout: LogicalLayout): number {
-  // Cheap pre-filter: only reject layouts with grossly wrong window
-  // aspect; let annotation + match-ratio scoring (see detectGuiLayout) do
-  // the real selection. A scoreLayout return value of 0 means "passes
-  // pre-filter, evaluate further".
-  const aDisc = aspect(disc.windowW, disc.windowH);
-  const aLayout = aspect(layout.windowW, layout.windowH);
-  if (Math.abs(aDisc - aLayout) > 0.3) return Infinity;
+  // Cheap pre-filter: reject only layouts with grossly wrong window
+  // dimensions. annotation + match-ratio scoring (see detectGuiLayout)
+  // does the real selection. Return 0 to "pass pre-filter".
+  //
+  // Width must match closely — findWindowBBox detects width robustly
+  // because the inventory background is wider than tall, so even when
+  // partially obscured the full width usually scans grey-rich.
+  // Height is more permissive: findWindowBBox can return a TALLER-
+  // than-actual or SHORTER-than-actual region depending on how the
+  // grey gap between widget and main_inv is rendered. For the
+  // enchanting_table case, only the upper widget rows (170×80) pass
+  // the grey threshold even though the LogicalLayout is 176×166;
+  // the original aspect-based filter (|disc/layout - 1| > 0.3)
+  // rejected enchanting_table because 170/80=2.125 differs from
+  // 176/166=1.06 by 1.06 > 0.3. With layouts rejected, bestLayout
+  // stayed null and the window-expansion fix fell back to disc.slots
+  // (constrained to the narrow widget bbox). Click guard then false-
+  // positive aborted hotbar pickups.
+  //
+  // Permissive logic: width within ±30% of layout.windowW; height
+  // either ≤ layout.windowH (partial vertical detection — accept) or
+  // within +30% of layout.windowH (close enough). Reject only on
+  // genuinely wrong dimensions.
+  const widthDiff = Math.abs(disc.windowW - layout.windowW) / layout.windowW;
+  if (widthDiff > 0.3) return Infinity;
+  // disc.windowH < layout.windowH is fine (partial detection); only
+  // reject if disc.windowH is meaningfully LARGER than the layout's
+  // (meaning we detected something else, not this layout).
+  if (disc.windowH > layout.windowH * 1.3) return Infinity;
   return 0;
 }
 
