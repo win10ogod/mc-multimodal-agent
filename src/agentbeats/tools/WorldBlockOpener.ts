@@ -82,13 +82,21 @@ const CENTERED_TOLERANCE_PX = 60;
 // (~92 px/tick), worst-case alignment is ~4 ticks; budget of 12 gives
 // headroom for VLM lag + scan-then-align.
 const ALIGN_ITERATIONS = 16;
-// Scan budget when the VLM reports the target is not visible. With
-// SCAN_YAW_DEG=20 alternating direction, this covers a full 360 deg
-// sweep before giving up. The previous limit of 4 only covered ~80 deg
-// in one direction — guaranteed miss for targets that started behind
-// or off-axis from the player's spawn orientation.
-const NOT_VISIBLE_LIMIT = 18;
-const SCAN_YAW_DEG = 20;
+// Scan budget when the VLM reports the target is not visible.
+//
+// Per-tick camera delta is clipped to ±10 deg by the encoder. The
+// world-subagent path does NOT honour SubAgentStep.holdSteps for
+// caching either — each obs calls subagent.step() afresh, so even
+// requesting yaw=20 with holdSteps=2 effectively yields ONE +10 deg
+// tick per WBO call. To cover a full 360 deg sweep we need 36 calls.
+//
+// (Earlier bound of 4 only covered ~40 deg, guaranteed miss for any
+// target outside the front-right cone of the player's spawn
+// orientation. The enchant_diamond_sword task spawns the table at
+// +X = east of a south-facing spawn, ~90 deg to the player's left,
+// completely outside that cone.)
+const NOT_VISIBLE_LIMIT = 36;
+const SCAN_YAW_DEG = 10;
 
 const SYSTEM_PROMPT = `You are a Minecraft block-localiser.
 
@@ -270,16 +278,15 @@ export class WorldBlockOpener {
         console.log(`[world-block-opener] FAIL target_ui_not_in_view target=${this.target}`);
         return this.fail("target_ui_not_in_view");
       }
-      // Alternating-direction scan: even attempts go right, odd go left,
-      // each step bumping the magnitude. Covers the full 360 deg sweep
-      // before bailing — the previous always-right scan with limit=4
-      // could only ever cover ~80 deg and was guaranteed to miss
-      // targets behind the player's spawn orientation (the
-      // enchant_diamond_sword task has the table at +X = east of a
-      // south-facing spawn, i.e. to the player's left).
-      const sign = (this.consecutiveNotVisible % 2 === 1) ? +1 : -1;
-      const yaw = sign * SCAN_YAW_DEG;
-      return { kind: "act", action: camAct(0, yaw), holdSteps: 2 };
+      // Monotonic rightward scan. With SCAN_YAW_DEG=20 and a budget
+      // of NOT_VISIBLE_LIMIT=18, this sweeps a full 360 deg before
+      // bailing. An earlier "alternating" version (+20, -20, +20…) had
+      // net rotation ≈ 0 per pair — agent oscillated between two
+      // neighbouring orientations and never explored further. The
+      // monotonic sweep is guaranteed to face every direction at some
+      // point during the budget, regardless of where the target sits
+      // relative to spawn orientation.
+      return { kind: "act", action: camAct(0, SCAN_YAW_DEG), holdSteps: 2 };
     }
 
     // Bbox returned — compute pixel offset from crosshair, convert to
