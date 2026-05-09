@@ -1162,6 +1162,10 @@ export function detectGuiLayout(
   const disc = discoverSlots(jpegBase64);
   if (!disc) return null;
 
+  const dbgDetect = process.env.SLOT_DEBUG_DETECT === "1";
+  if (dbgDetect) {
+    console.log(`[detect-gui-layout] disc.window=${disc.windowX},${disc.windowY},${disc.windowW}x${disc.windowH} disc.slots=${disc.slots.length} hint=${hintLayoutId ?? "null"}`);
+  }
   // Try the hinted layout first if given, else score all and pick best.
   let bestLayout: LogicalLayout | null = null;
   let bestSlots: GuiSlot[] | null = null;

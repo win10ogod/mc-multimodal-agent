@@ -156,6 +156,28 @@ export async function runPlannerLoop(
       }
       if (fname === "dispatch_subgoal") {
         const sg = fargs as Subgoal;
+        // Reject malformed dispatches before they reach the dispatcher.
+        // The planner LLM occasionally emits a tool call whose description
+        // is just "Task:" (the user-message prefix), an empty string, or
+        // something else too short to act on. Letting that through means
+        // the dispatcher routes a meaningless subgoal and the agent
+        // wanders randomly until the eval times out. Better to push an
+        // error tool result back into the conversation and let the LLM
+        // re-issue the call with a concrete description.
+        const desc = (sg.description ?? "").trim();
+        const isMalformed =
+          !sg.kind
+          || desc.length < 10
+          || desc === "Task:"
+          || /^Task:\s*$/i.test(desc)
+          || desc.toLowerCase() === "task";
+        if (isMalformed) {
+          const content = `error: dispatch_subgoal REJECTED — description is empty or malformed (got "${desc}"). Re-issue the call with a CONCRETE description (≥ 10 chars, plain language) that tells the sub-agent (a) what to try and (b) the success criteria. Do NOT echo the "Task:" prefix from the user message.`;
+          state.plannerMessages.push({ role: "tool", tool_call_id: tc.id as string, content });
+          console.warn(`[planner] DISPATCH REJECTED ${sg.kind ?? "?"} <- "${desc}" (description too short or malformed)`);
+          await log("planner_tool", { hop, name: fname, args: fargs, result: content, ok: false });
+          continue;
+        }
         // OpenAI's chat API requires every assistant tool_call to be answered
         // by a tool-role message before the next assistant/user turn. Without
         // this synthetic ack, the saved plannerMessages becomes malformed
