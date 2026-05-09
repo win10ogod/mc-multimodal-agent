@@ -84,19 +84,27 @@ const CENTERED_TOLERANCE_PX = 60;
 const ALIGN_ITERATIONS = 16;
 // Scan budget when the VLM reports the target is not visible.
 //
-// Per-tick camera delta is clipped to ±10 deg by the encoder. The
-// world-subagent path does NOT honour SubAgentStep.holdSteps for
-// caching either — each obs calls subagent.step() afresh, so even
-// requesting yaw=20 with holdSteps=2 effectively yields ONE +10 deg
-// tick per WBO call. To cover a full 360 deg sweep we need 36 calls.
+// Pattern: discrete-stop sweep at 8 yaw directions (every 45 deg)
+// around the player. At EACH stop, the agent fully sweeps pitch
+// from -45 deg (look up) through 0 (horizon) to +45 deg (look
+// down) and back, holding yaw FIXED during the sweep. This gives
+// the VLM a stable horizontal frame at every pitch angle — solves
+// the W-shape failure mode where the table was visible at one
+// pitch but the camera was simultaneously moving in yaw, so the
+// model never saw a clean stable view.
 //
-// (Earlier bound of 4 only covered ~40 deg, guaranteed miss for any
-// target outside the front-right cone of the player's spawn
-// orientation. The enchant_diamond_sword task spawns the table at
-// +X = east of a south-facing spawn, ~90 deg to the player's left,
-// completely outside that cone.)
-const NOT_VISIBLE_LIMIT = 36;
-const SCAN_YAW_DEG = 10;
+// Per-direction cycle (25 ticks):
+//   ticks  0..4  — pitch +10/tick (cumulative +50 deg, look down)
+//   ticks  5..14 — pitch -10/tick (cumulative -50 deg back, then up)
+//   ticks 15..19 — pitch +10/tick (return to horizon)
+//   ticks 20..24 — yaw   +10/tick (rotate +50 deg ≈ 45 deg next dir)
+// Encoder clips per-tick delta to ±10 deg, so each tick is one cam
+// step regardless of what we request. With 8 directions × 25 ticks
+// = 200 ticks budget we cover all 360 deg yaw × ±50 deg pitch.
+const TICKS_PER_DIR = 25;
+const NUM_DIRECTIONS = 8;
+const NOT_VISIBLE_LIMIT = TICKS_PER_DIR * NUM_DIRECTIONS;
+const SCAN_DELTA_DEG = 10;
 
 const SYSTEM_PROMPT = `You are a Minecraft block-localiser.
 
@@ -289,28 +297,22 @@ export class WorldBlockOpener {
         console.log(`[world-block-opener] FAIL target_ui_not_in_view target=${this.target}`);
         return this.fail("target_ui_not_in_view");
       }
-      // W-shape sweep: yaw monotonically rightward at the per-tick
-      // cap (+10 deg/tick), pitch oscillates down-up-down-up over a
-      // 24-tick cycle. Each 6-tick "leg" applies +5 or -5 deg/tick of
-      // pitch — cumulative ±30 deg from horizon. With
-      // NOT_VISIBLE_LIMIT=36 we cover the full 360 deg yaw circle
-      // while traversing both above- and below-horizon pitch ranges,
-      // catching targets at floor level (most blocks) AND ceiling
-      // level (signs, hanging entities, decorative blocks) without
-      // requiring the VLM to recognise them at marginal angles.
-      //
-      // Earlier "monotonic horizon-only" sweep missed the
-      // enchanting_table because the table sits at standing-foot
-      // level (block y=0 relative to player feet), and the spawn
-      // pitch was at horizon — table was below the bottom of the
-      // frame for every yaw direction.
-      const cycleTick = this.consecutiveNotVisible % 24;
-      let pitchDelta: number;
-      if (cycleTick < 6)       pitchDelta = +5;  // leg A: 0  → +30 (look down)
-      else if (cycleTick < 12) pitchDelta = -5;  // leg B: +30 → 0
-      else if (cycleTick < 18) pitchDelta = -5;  // leg C: 0  → -30 (look up)
-      else                     pitchDelta = +5;  // leg D: -30 → 0
-      return { kind: "act", action: camAct(pitchDelta, SCAN_YAW_DEG), holdSteps: 2 };
+      // Discrete-stop sweep: hold yaw FIXED while sweeping pitch
+      // through ±50 deg, then rotate yaw to the next direction. The
+      // earlier W-shape moved both axes every tick, so the camera
+      // was always changing — VLM never saw a clean stable frame.
+      // With this pattern the agent stops at 8 yaw directions
+      // (every 45 deg) and at each stop traverses the full pitch
+      // range, giving the VLM a stable horizontal angle to lock
+      // onto a target above or below horizon.
+      const phase = this.consecutiveNotVisible % TICKS_PER_DIR;
+      let pitchDelta = 0;
+      let yawDelta = 0;
+      if (phase < 5)        pitchDelta = +SCAN_DELTA_DEG;  // 0..4: descend +50 (look down)
+      else if (phase < 15)  pitchDelta = -SCAN_DELTA_DEG;  // 5..14: ascend back to 0 then up to -50
+      else if (phase < 20)  pitchDelta = +SCAN_DELTA_DEG;  // 15..19: descend back to 0 (return to horizon)
+      else                  yawDelta   = +SCAN_DELTA_DEG;  // 20..24: rotate yaw +50 deg toward next direction
+      return { kind: "act", action: camAct(pitchDelta, yawDelta), holdSteps: 2 };
     }
 
     // Bbox returned — compute pixel offset from crosshair, convert to
