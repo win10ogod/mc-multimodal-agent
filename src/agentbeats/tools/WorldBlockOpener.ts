@@ -82,28 +82,26 @@ const CENTERED_TOLERANCE_PX = 60;
 // (~92 px/tick), worst-case alignment is ~4 ticks; budget of 12 gives
 // headroom for VLM lag + scan-then-align.
 const ALIGN_ITERATIONS = 16;
-// Scan budget when the VLM reports the target is not visible.
+// Scan pattern when VLM reports not_visible.
 //
-// Pattern: discrete-stop sweep at 8 yaw directions (every 45 deg)
-// around the player. At EACH stop, the agent fully sweeps pitch
-// from -45 deg (look up) through 0 (horizon) to +45 deg (look
-// down) and back, holding yaw FIXED during the sweep. This gives
-// the VLM a stable horizontal frame at every pitch angle — solves
-// the W-shape failure mode where the table was visible at one
-// pitch but the camera was simultaneously moving in yaw, so the
-// model never saw a clean stable view.
+// Fishbone scan: yaw is the "spine" (8 stops every 45 deg around
+// the player), each stop emits a wide pitch sweep ("bone") covering
+// ±50 deg from horizon and back, then yaw rotates to the next stop.
 //
 // Per-direction cycle (25 ticks):
-//   ticks  0..4  — pitch +10/tick (cumulative +50 deg, look down)
-//   ticks  5..14 — pitch -10/tick (cumulative -50 deg back, then up)
-//   ticks 15..19 — pitch +10/tick (return to horizon)
-//   ticks 20..24 — yaw   +10/tick (rotate +50 deg ≈ 45 deg next dir)
-// Encoder clips per-tick delta to ±10 deg, so each tick is one cam
-// step regardless of what we request. With 8 directions × 25 ticks
-// = 200 ticks budget we cover all 360 deg yaw × ±50 deg pitch.
-const TICKS_PER_DIR = 25;
+//   ticks  0..4   pitch -10/tick  (up   — cumulative   0 → -50, look up 50 deg)
+//   ticks  5..9   pitch +10/tick  (down — cumulative -50 →   0, back to horizon)
+//   ticks 10..14  pitch +10/tick  (down — cumulative   0 → +50, look down 50 deg)
+//   ticks 15..19  pitch -10/tick  (up   — cumulative +50 →   0, back to horizon)
+//   ticks 20..24  yaw   +10/tick  (rotate +50 deg toward next direction)
+//
+// 25 ticks/direction × 8 directions = 200 ticks budget. Covers full
+// 360 deg yaw × ±50 deg pitch with the camera always returning to
+// horizon AT THE SAME yaw orientation (ticks 19) before rotating
+// yaw, so each yaw stop gets a complete vertical sweep.
+const CYCLE_LEN = 25;
 const NUM_DIRECTIONS = 8;
-const NOT_VISIBLE_LIMIT = TICKS_PER_DIR * NUM_DIRECTIONS;
+const NOT_VISIBLE_LIMIT = CYCLE_LEN * NUM_DIRECTIONS;
 const SCAN_DELTA_DEG = 10;
 
 const SYSTEM_PROMPT = `You are a Minecraft block-localiser.
@@ -297,21 +295,21 @@ export class WorldBlockOpener {
         console.log(`[world-block-opener] FAIL target_ui_not_in_view target=${this.target}`);
         return this.fail("target_ui_not_in_view");
       }
-      // Discrete-stop sweep: hold yaw FIXED while sweeping pitch
-      // through ±50 deg, then rotate yaw to the next direction. The
-      // earlier W-shape moved both axes every tick, so the camera
-      // was always changing — VLM never saw a clean stable frame.
-      // With this pattern the agent stops at 8 yaw directions
-      // (every 45 deg) and at each stop traverses the full pitch
-      // range, giving the VLM a stable horizontal angle to lock
-      // onto a target above or below horizon.
-      const phase = this.consecutiveNotVisible % TICKS_PER_DIR;
+      // Fishbone scan: yaw is the spine (8 stops every 45 deg around
+      // the player). At each yaw stop, do a full ±50 deg pitch sweep
+      // (4 legs of 5 ticks each: up, down, down, up — net 0) so the
+      // camera returns to horizon at the same yaw orientation before
+      // rotating to the next direction. Counter increments BEFORE
+      // phase compute, so subtract 1 to make the first call land on
+      // phase 0 (the first up-tick).
+      const phase = (this.consecutiveNotVisible - 1) % CYCLE_LEN;
       let pitchDelta = 0;
       let yawDelta = 0;
-      if (phase < 5)        pitchDelta = +SCAN_DELTA_DEG;  // 0..4: descend +50 (look down)
-      else if (phase < 15)  pitchDelta = -SCAN_DELTA_DEG;  // 5..14: ascend back to 0 then up to -50
-      else if (phase < 20)  pitchDelta = +SCAN_DELTA_DEG;  // 15..19: descend back to 0 (return to horizon)
-      else                  yawDelta   = +SCAN_DELTA_DEG;  // 20..24: rotate yaw +50 deg toward next direction
+      if      (phase < 5)        pitchDelta = -SCAN_DELTA_DEG; // up:    0 → -50
+      else if (phase < 10)       pitchDelta = +SCAN_DELTA_DEG; // down: -50 →   0
+      else if (phase < 15)       pitchDelta = +SCAN_DELTA_DEG; // down:   0 → +50
+      else if (phase < 20)       pitchDelta = -SCAN_DELTA_DEG; // up:   +50 →   0
+      else                       yawDelta   = +SCAN_DELTA_DEG; // yaw: rotate +50 deg next dir
       return { kind: "act", action: camAct(pitchDelta, yawDelta), holdSteps: 2 };
     }
 
