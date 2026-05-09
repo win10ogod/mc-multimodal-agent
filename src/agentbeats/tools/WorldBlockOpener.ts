@@ -102,13 +102,17 @@ const SYSTEM_PROMPT = `You are a Minecraft block-localiser.
 
 You are shown a Minecraft first-person frame at 640x360. A black "+" crosshair is drawn at the centre (pixel 320, 180). The user gives you a TARGET block id (snake_case, e.g. "crafting_table").
 
-Find the named block IN THE WORLD (not on the hotbar / HUD / inventory icons). Return either its pixel-space bounding box, or "not_visible" if you genuinely cannot find it after a careful look at the entire frame (including edges).
+Find the named block IN THE WORLD (not on the hotbar / HUD / inventory icons). Pick the FIRST applicable response shape from the list below:
 
-Output strict JSON, ONE of these two shapes only:
-  {"bbox": [x, y, w, h]}    — pixel rectangle of the target block face. x ∈ [0, 639], y ∈ [0, 359]; w and h are the block face's width/height in pixels.
-  {"found": false}          — target is genuinely not in the frame.
+  1. {"bbox": [x, y, w, h]}    — pixel rectangle of the target block face. x ∈ [0, 639], y ∈ [0, 359]; w and h are the block face's width/height in pixels. Use this when you can clearly see the block AND can place a tight rectangle around it (precision is helpful but does not need to be exact — a rough bbox is much better than refusing).
+  2. {"direction": "<side>"}    — when you can see the block but bbox coordinates would be a guess. <side> is one of: "centered" (on or very near the crosshair), "left", "right", "up", "down". Pick the direction the block sits relative to the crosshair.
+  3. {"found": false}           — ONLY if the target is genuinely absent from the entire frame after careful scanning.
 
-NEVER infer from icons in the hotbar/HUD; the player's inventory is irrelevant. Only the rendered 3D world matters.`;
+PREFER bbox over direction (more useful to the runtime), and PREFER direction over found:false. found:false is the LAST resort — almost-visible / corner-of-eye / partially-occluded counts as visible (return direction).
+
+NEVER infer from icons in the hotbar/HUD; the player's inventory is irrelevant. Only the rendered 3D world matters.
+
+Output strict JSON only — one of the three shapes above, no markdown fences.`;
 
 type BboxResult =
   | { kind: "bbox"; cx: number; cy: number; w: number; h: number }
@@ -167,13 +171,20 @@ async function vlmBbox(
       }
     }
     if (obj.found === false) return { kind: "not_visible" };
-    // Backwards-compat: if the model returns the old direction-only
-    // shape (e.g. {"direction":"centered"}), treat anything but
-    // not_visible as a centred no-op nudge — caller will re-check next
-    // tick. Better than failing the whole alignment over a stale
-    // schema slip.
+    // Direction fallback: when the model picks the coarse-direction
+    // shape ({"direction":"<left|right|up|down|centered>"}), synthesise
+    // a bbox at the canonical edge centre for that direction. The
+    // alignment math then derives a camera delta from it like any
+    // bbox — yields the same nudge per tick, just with less precision.
+    // Better than refusing alignment when the model can see the
+    // target but is unsure about exact pixels.
     const d = String(obj.direction ?? "").toLowerCase();
-    if (d === "centered") return { kind: "bbox", cx: CROSSHAIR_X, cy: CROSSHAIR_Y, w: 32, h: 32 };
+    const W = 32, H = 32; // synthetic block-face size for the offset math
+    if (d === "centered") return { kind: "bbox", cx: CROSSHAIR_X, cy: CROSSHAIR_Y, w: W, h: H };
+    if (d === "left")     return { kind: "bbox", cx: 50,  cy: CROSSHAIR_Y, w: W, h: H };
+    if (d === "right")    return { kind: "bbox", cx: FRAME_W - 50, cy: CROSSHAIR_Y, w: W, h: H };
+    if (d === "up")       return { kind: "bbox", cx: CROSSHAIR_X, cy: 30, w: W, h: H };
+    if (d === "down")     return { kind: "bbox", cx: CROSSHAIR_X, cy: FRAME_H - 30, w: W, h: H };
     if (d === "not_visible") return { kind: "not_visible" };
   } catch {
     /* fall through */
@@ -278,15 +289,28 @@ export class WorldBlockOpener {
         console.log(`[world-block-opener] FAIL target_ui_not_in_view target=${this.target}`);
         return this.fail("target_ui_not_in_view");
       }
-      // Monotonic rightward scan. With SCAN_YAW_DEG=20 and a budget
-      // of NOT_VISIBLE_LIMIT=18, this sweeps a full 360 deg before
-      // bailing. An earlier "alternating" version (+20, -20, +20…) had
-      // net rotation ≈ 0 per pair — agent oscillated between two
-      // neighbouring orientations and never explored further. The
-      // monotonic sweep is guaranteed to face every direction at some
-      // point during the budget, regardless of where the target sits
-      // relative to spawn orientation.
-      return { kind: "act", action: camAct(0, SCAN_YAW_DEG), holdSteps: 2 };
+      // W-shape sweep: yaw monotonically rightward at the per-tick
+      // cap (+10 deg/tick), pitch oscillates down-up-down-up over a
+      // 24-tick cycle. Each 6-tick "leg" applies +5 or -5 deg/tick of
+      // pitch — cumulative ±30 deg from horizon. With
+      // NOT_VISIBLE_LIMIT=36 we cover the full 360 deg yaw circle
+      // while traversing both above- and below-horizon pitch ranges,
+      // catching targets at floor level (most blocks) AND ceiling
+      // level (signs, hanging entities, decorative blocks) without
+      // requiring the VLM to recognise them at marginal angles.
+      //
+      // Earlier "monotonic horizon-only" sweep missed the
+      // enchanting_table because the table sits at standing-foot
+      // level (block y=0 relative to player feet), and the spawn
+      // pitch was at horizon — table was below the bottom of the
+      // frame for every yaw direction.
+      const cycleTick = this.consecutiveNotVisible % 24;
+      let pitchDelta: number;
+      if (cycleTick < 6)       pitchDelta = +5;  // leg A: 0  → +30 (look down)
+      else if (cycleTick < 12) pitchDelta = -5;  // leg B: +30 → 0
+      else if (cycleTick < 18) pitchDelta = -5;  // leg C: 0  → -30 (look up)
+      else                     pitchDelta = +5;  // leg D: -30 → 0
+      return { kind: "act", action: camAct(pitchDelta, SCAN_YAW_DEG), holdSteps: 2 };
     }
 
     // Bbox returned — compute pixel offset from crosshair, convert to
