@@ -38,40 +38,6 @@ export type ClosedLoopInput = {
   step: number;
 };
 
-/** DIAGNOSTIC: log the layout-detection timeline at every sessionLayout
- *  write so we can see when layout transitions from healthy (slots=41
- *  matched=enchanting_table) to degraded (slots=2 matched=null) and
- *  vice versa. Saves the raw payload.obs JPEG only on degraded
- *  detections so we can inspect what frame caused the bad call. */
-function dumpLayoutTimeline(
-  site: string,
-  obsBase64: string | undefined,
-  layout: { matchedLayoutId: string | null; windowX: number; windowY: number; windowW: number; windowH: number; slots: Array<unknown> },
-  debugDir: string | null | undefined,
-): void {
-  const slotCount = layout.slots.length;
-  const matchedId = layout.matchedLayoutId ?? "null";
-  const degraded = slotCount < 10 || layout.matchedLayoutId === null;
-  console.log(`[layout-timeline] site=${site} matched=${matchedId} window=${layout.windowX},${layout.windowY},${layout.windowW}x${layout.windowH} slots=${slotCount}${degraded ? " DEGRADED" : ""}`);
-  if (!degraded) return;
-  if (!debugDir || !obsBase64) return;
-  try {
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
-    const fs = require("node:fs");
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
-    const pathMod = require("node:path");
-    const ts = Date.now();
-    const cleaned = obsBase64.startsWith("data:image/")
-      ? obsBase64.replace(/^data:image\/[a-z]+;base64,/, "")
-      : obsBase64;
-    const fname = pathMod.join(debugDir, `layout_degraded_${site}_${ts}.jpg`);
-    fs.writeFileSync(fname, Buffer.from(cleaned, "base64"));
-    console.log(`[layout-timeline] dumped ${fname}`);
-  } catch (e) {
-    console.warn(`[layout-timeline] dump failed: ${e instanceof Error ? e.message : String(e)}`);
-  }
-}
-
 export async function runClosedLoopStep(
   deps: ClosedLoopDeps,
   input: ClosedLoopInput,
@@ -165,30 +131,25 @@ export async function runClosedLoopStep(
 
   // Compute the SoM-labeled image ONCE per obs and share it between
   // the Planner re-judge and the Action dispatch — both see the same
-  // pixels with the same yellow badges. Layout is RE-DETECTED fresh
-  // every obs so dynamic panel changes (recipe-book opens, etc.) are
-  // immediately reflected in the slot list both LLMs see.
+  // pixels with the same yellow badges. Layout is LOCKED at
+  // session_lock (when the GUI first opens with cursor at park spot —
+  // the only frame guaranteed to be free of tooltip occlusion /
+  // dimmed-bg artefacts). Re-detecting per-obs here used to corrupt
+  // the locked layout when the cursor was hovering an item. Reuse the
+  // locked layout for SoM marking; if none yet (first obs of a new
+  // GUI session), detect once just for marking — session_lock below
+  // writes the authoritative copy.
   let markedObsForLLMs: string | null = null;
   if (state.closedLoopCraft && payload.obs) {
     try {
       const { markInventoryFrame } = await import("../tools/SlotMarker");
-      const freshLayout = detectGuiLayout(payload.obs, state.closedLoopCraft.layoutHint ?? undefined);
-      if (freshLayout) {
-        // DIAGNOSTIC: log every sessionLayout update so we can see the
-        // timing of layout transitions. If layout suddenly drops from
-        // a healthy slots=41 to slots=2 mid-session, we've found the
-        // moment the bbox got bad. Dump the offending payload.obs
-        // when degraded (fewer than 10 slots OR null matched layout).
-        dumpLayoutTimeline("post_action_judge", payload.obs, freshLayout, deps.debugDir);
-        // Refresh sessionLayout each obs so Planner + Action always see
-        // the current panel composition (including newly-revealed
-        // template anchors like recipe_book_button or recipe entries).
-        state.closedLoopCraft.sessionLayout = freshLayout;
-        state.closedLoopCraft.layoutHint = freshLayout.matchedLayoutId;
+      const lockedLayout = state.closedLoopCraft.sessionLayout;
+      const layoutForMark = lockedLayout
+        ?? detectGuiLayout(payload.obs, state.closedLoopCraft.layoutHint ?? undefined);
+      if (layoutForMark) {
+        const marked = markInventoryFrame(payload.obs, layoutForMark as any);
+        markedObsForLLMs = `data:image/png;base64,${marked.pngBase64}`;
       }
-      const layoutForMark = freshLayout ?? state.closedLoopCraft.sessionLayout;
-      const marked = markInventoryFrame(payload.obs, layoutForMark as any);
-      markedObsForLLMs = `data:image/png;base64,${marked.pngBase64}`;
     } catch { /* fall back to raw */ }
   }
 
@@ -322,7 +283,6 @@ export async function runClosedLoopStep(
       plan.done = true;
     } else if (plan.sessionLayout === null) {
       // First detection in this session -- lock it.
-      dumpLayoutTimeline("session_lock", payload.obs, liveLayout, deps.debugDir);
       plan.sessionLayout = liveLayout;
       plan.layoutHint = liveLayout.matchedLayoutId;
       console.log(`[agentbeats] closed-loop session locked: layout=${liveLayout.matchedLayoutId ?? "unknown"} slots=${liveLayout.slots.length}`);
@@ -710,21 +670,14 @@ export async function runClosedLoopStep(
         }
         plan.parkSteps = 0;
         } // end skipNextPark gate
-        // Re-SOM only NOW, just before calling the VLM. Within an
-        // in-flight click sequence the layout stays stable (we keep
-        // using the locked session); fresh detection only matters at
-        // the moment the VLM is about to make a new decision.
-        let layoutForProbe = layout;
-        {
-          const fresh = detectGuiLayout(payload.obs, plan.layoutHint ?? undefined);
-          if (fresh) {
-            dumpLayoutTimeline("som_redetect", payload.obs, fresh, deps.debugDir);
-            plan.sessionLayout = fresh;
-            plan.layoutHint = fresh.matchedLayoutId;
-            layoutForProbe = fresh;
-            console.log(`[agentbeats] re-detected SoM for fresh probe: ${fresh.matchedLayoutId ?? "unknown"} slots=${fresh.slots.length}`);
-          }
-        }
+        // Layout is LOCKED at session_lock and reused throughout servo.
+        // Re-detecting here used to overwrite sessionLayout with a
+        // degraded bbox whenever the cursor was hovering an item
+        // (tooltip overlay breaks findWindowBBox). The locked layout
+        // captured at park spot is authoritative; the servo just reads
+        // pixels through it. UI-mutating actions return control to the
+        // Planner, which re-locks from a clean park frame.
+        const layoutForProbe = layout;
         // CV cursor-holding detection. Sample the held-item region
         // (renders below-right of the cursor tip in MC), not the
         // cursor arrow itself, so cursor-sprite pixels aren't part
@@ -1893,90 +1846,6 @@ export async function runClosedLoopStep(
               && cursor.y <= layout!.windowY + layout!.windowH;
             if (!cursorInsideWindow) {
               console.warn(`[agentbeats] click suppressed: cursor (${cursor?.x},${cursor?.y}) outside inventory window [${layout!.windowX},${layout!.windowY},${layout!.windowW}x${layout!.windowH}]; aborting to avoid throwing held item`);
-              // DIAGNOSTIC: dump (1) the raw obs JPEG the runtime
-              // saw at this moment, (2) a fresh detectGuiLayout
-              // result on that same frame, and (3) an annotated PNG
-              // showing the detected window bbox (magenta) + every
-              // detected slot centre (green) + the cursor position
-              // (red). Without this we keep "fixing" things that
-              // work on saved post-processed frames but not on the
-              // raw runtime input.
-              try {
-                // eslint-disable-next-line @typescript-eslint/no-require-imports
-                const fs = require("node:fs");
-                // eslint-disable-next-line @typescript-eslint/no-require-imports
-                const pathMod = require("node:path");
-                // eslint-disable-next-line @typescript-eslint/no-require-imports
-                const jpegLib = require("jpeg-js");
-                // eslint-disable-next-line @typescript-eslint/no-require-imports
-                const { PNG } = require("pngjs");
-                const dir = deps.debugDir ?? "/agent_debug";
-                if (dir && payload.obs) {
-                  const ts = Date.now();
-                  const cleaned = payload.obs.startsWith("data:image/")
-                    ? payload.obs.replace(/^data:image\/[a-z]+;base64,/, "")
-                    : payload.obs;
-                  const rawBuf = Buffer.from(cleaned, "base64");
-                  // (1) raw JPEG
-                  const jpgPath = pathMod.join(dir, `click_suppress_${ts}.jpg`);
-                  fs.writeFileSync(jpgPath, rawBuf);
-                  // (2) fresh detectGuiLayout on the same payload
-                  const fresh = detectGuiLayout(payload.obs);
-                  const sessionLid = (plan.sessionLayout as { matchedLayoutId?: string } | null)?.matchedLayoutId ?? "null";
-                  console.warn(`[click-suppress-dump] wrote ${jpgPath}`);
-                  console.warn(`[click-suppress-dump] session-layout-used: id=${sessionLid} window=${layout!.windowX},${layout!.windowY},${layout!.windowW}x${layout!.windowH}`);
-                  console.warn(`[click-suppress-dump] fresh detectGuiLayout(payload.obs): id=${fresh?.matchedLayoutId ?? "null"} window=${fresh?.windowX},${fresh?.windowY},${fresh?.windowW}x${fresh?.windowH} slots=${fresh?.slots.length ?? 0}`);
-                  // (3) annotated PNG: decode JPEG, R/B-swap so
-                  // human-viewable colours, then draw window bbox
-                  // (magenta) and every detected slot centre (green)
-                  // and the cursor (red). We use SESSION layout dims
-                  // (what the runtime actually rejected the click
-                  // against), not the fresh re-detection — those
-                  // could differ.
-                  const decoded = jpegLib.decode(rawBuf, { useTArray: true, formatAsRGBA: true });
-                  const w = decoded.width as number;
-                  const h = decoded.height as number;
-                  const out = new PNG({ width: w, height: h });
-                  // jpeg-js returns BGR-as-RGBA; swap to true RGB.
-                  for (let i = 0; i < decoded.data.length; i += 4) {
-                    out.data[i] = decoded.data[i + 2];
-                    out.data[i + 1] = decoded.data[i + 1];
-                    out.data[i + 2] = decoded.data[i];
-                    out.data[i + 3] = 255;
-                  }
-                  const stamp = (px: number, py: number, color: [number, number, number]) => {
-                    if (px < 0 || px >= w || py < 0 || py >= h) return;
-                    const idx = (py * w + px) * 4;
-                    out.data[idx] = color[0]; out.data[idx + 1] = color[1]; out.data[idx + 2] = color[2]; out.data[idx + 3] = 255;
-                  };
-                  const drawRect = (x0: number, y0: number, x1: number, y1: number, color: [number, number, number]) => {
-                    for (let x = x0; x <= x1; x += 1) { stamp(x, y0, color); stamp(x, y1, color); }
-                    for (let y = y0; y <= y1; y += 1) { stamp(x0, y, color); stamp(x1, y, color); }
-                  };
-                  const drawCircle = (cx: number, cy: number, r: number, color: [number, number, number]) => {
-                    for (let dy = -r; dy <= r; dy += 1) {
-                      for (let dx = -r; dx <= r; dx += 1) {
-                        const d2 = dx * dx + dy * dy;
-                        if (d2 > (r - 1) * (r - 1) && d2 < (r + 1) * (r + 1)) stamp(cx + dx, cy + dy, color);
-                      }
-                    }
-                  };
-                  // Magenta: session window the click was rejected against
-                  const wx = layout!.windowX, wy = layout!.windowY;
-                  drawRect(wx, wy, wx + layout!.windowW - 1, wy + layout!.windowH - 1, [255, 0, 255]);
-                  // Green: every slot centre in the session layout
-                  for (const s of (layout as { slots?: Array<{ cx: number; cy: number }> }).slots ?? []) {
-                    drawCircle(Math.round(s.cx), Math.round(s.cy), 4, [0, 255, 0]);
-                  }
-                  // Red: the cursor position that was rejected
-                  if (cursor) drawCircle(Math.round(cursor.x), Math.round(cursor.y), 5, [255, 0, 0]);
-                  const pngPath = pathMod.join(dir, `click_suppress_${ts}_annotated.png`);
-                  fs.writeFileSync(pngPath, PNG.sync.write(out));
-                  console.warn(`[click-suppress-dump] wrote ${pngPath}`);
-                }
-              } catch (e) {
-                console.warn(`[click-suppress-dump] failed: ${e instanceof Error ? e.message : String(e)}`);
-              }
               state.closedLoopHistory.unshift(`abort ${pc.slotName ?? pc.rasterIndex} (cursor outside window; would throw item)`);
               state.closedLoopHistory = state.closedLoopHistory.slice(0, 5);
               plan.pendingClick = null;
