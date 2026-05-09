@@ -90,20 +90,26 @@ Task "mine 3 oak logs":
 - Recursive prerequisites are fine but only add them when a sub-agent's BLOCKED reason demands it. Do NOT speculate prerequisites that may not be needed.
 - task_complete is gated on checklist.allDone(). Don't call it before marking items done.
 
-# Crafting-grid prerequisite — PRE-EMPT, do NOT wait for BLOCKED
-The player_inventory's built-in crafting area is 2x2 (4 cells). Any 3x3 recipe REQUIRES a placed crafting_table block in the world. The eval framework may RESTART the context after a BLOCKED return without forwarding the reflection — so on tasks that obviously need 3x3, dispatch placing FIRST.
+# Routing recipe / interaction tasks to the right sub-agent
 
-Trigger when the task description mentions:
-- "on a crafting table" / "using a crafting table" / "with a crafting table", OR
-- a recipe target you know is 3x3: cake, iron_pickaxe, diamond_pickaxe, iron_axe, iron_shovel, iron_hoe, iron_sword, iron_helmet, iron_chestplate, iron_leggings, iron_boots, golden_*, diamond_*, netherite_*, furnace, chest, hopper, beacon, anvil, loom, smoker, blast_furnace, stonecutter, cartography_table, fletching_table, smithing_table, dispenser, observer, piston, comparator, repeater, daylight_detector, jukebox, note_block, bow, crossbow, fishing_rod, shears, flint_and_steel, compass, clock, brewing_stand, cauldron, ender_chest, shulker_box, item_frame, painting, lectern.
+The placing(crafting_table) prerequisite ONLY applies when the target GUI for the task IS a crafting_table 3x3 grid (i.e., the recipe is too big for the player's 2x2 area). It does NOT apply when the task uses a different GUI block — enchanting_table, furnace, chest, anvil, brewing_stand, etc. — which are typically pre-placed in the world by the eval framework already.
 
-For these tasks, EPISODE START checklist:
-1. add_checklist_item("place a crafting_table in the world")
-2. add_checklist_item(<literal task text>)
-3. dispatch_subgoal(kind="placing", target="crafting_table", description="Try to place a crafting_table at the crosshair on the ground in front of you. (a) Aim 1-2 blocks ahead, use to place — runtime equips the correct hotbar slot for you. (b) A crafting_table is visible in the world in front of the player.", success_criteria="A crafting_table is visible in the world in front of the player.")
-4. After placing reports DONE: mark item 1 done, then dispatch_subgoal(kind="ui_inventory", gui_target="crafting_table", description=<literal task text>, success_criteria=<literal task text>). The gui_target tells the runtime to align the camera to the placed crafting_table and right-click it instead of opening the player's 2x2 inventory.
+Decision tree:
 
-Tasks whose recipes fit a 2x2 (oak_planks from oak_log, crafting_table itself from 4 oak_planks, sticks, diorite, granite, andesite, torch, bowl, sugar) use ui_inventory directly — no placing prerequisite.
+1. Task uses a NON-crafting_table GUI block ("enchant ... using an enchanting_table", "smelt ... using a furnace", "deposit ... in a chest", "repair ... on an anvil", "brew ... in a brewing_stand", etc.). The block is almost always pre-placed near the player by the eval framework. Episode-start:
+   - add_checklist_item(<literal task text>)
+   - dispatch_subgoal(kind="ui_inventory", gui_target="<block_id>", description=<literal task text>, success_criteria=<literal task text>). The runtime will align the camera to the placed block and right-click to open. Do NOT insert a placing(crafting_table) prereq — the task does not need one.
+
+2. Task is a 3x3 craft recipe ("craft a furnace", "craft a cake", "craft an iron_pickaxe", anything in the 3x3-recipe list below). The eval framework gives a crafting_table item in inventory; you must place it first. Episode-start:
+   - add_checklist_item("place a crafting_table in the world")
+   - add_checklist_item(<literal task text>)
+   - dispatch_subgoal(kind="placing", target="crafting_table", description="Try to place a crafting_table at the crosshair on the ground in front of you. (a) Aim 1-2 blocks ahead, use to place — runtime equips the correct hotbar slot for you. (b) A crafting_table is visible in the world in front of the player.", success_criteria="A crafting_table is visible in the world in front of the player.")
+   - After placing DONE: mark item 1 done, then dispatch_subgoal(kind="ui_inventory", gui_target="crafting_table", description=<literal task text>, success_criteria=<literal task text>).
+   3x3 recipe targets: cake, iron_pickaxe, diamond_pickaxe, iron_axe, iron_shovel, iron_hoe, iron_sword, iron_helmet, iron_chestplate, iron_leggings, iron_boots, golden_*, diamond_*, netherite_*, furnace, chest, hopper, beacon, anvil, loom, smoker, blast_furnace, stonecutter, cartography_table, fletching_table, smithing_table, dispenser, observer, piston, comparator, repeater, daylight_detector, jukebox, note_block, bow, crossbow, fishing_rod, shears, flint_and_steel, compass, clock, brewing_stand, cauldron, ender_chest, shulker_box, item_frame, painting, lectern.
+
+3. Task is a 2x2 craft recipe (oak_planks from oak_log, crafting_table itself from 4 oak_planks, sticks, diorite, granite, andesite, torch, bowl, sugar): use ui_inventory directly with no gui_target — opens the player's 2x2 inventory. No placing prereq.
+
+DO NOT pattern-match on the word "table" alone — "enchanting table", "smithing table", "fletching table" are NOT crafting_tables, they are their own GUI blocks (case 1 above). Read the task description carefully and route based on the actual GUI block named.
 
 # Sub-agent failure handling — STRUCTURED REPORT FIELDS
 
