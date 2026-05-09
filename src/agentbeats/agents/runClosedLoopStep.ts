@@ -184,9 +184,36 @@ export async function runClosedLoopStep(
       });
       cp.checklist = rj.checklist;
       if (rj.kind === "all_done") {
+        // FastUI Planner all_done means the GUI checklist is complete
+        // (e.g., the requested item is now in inventory). It does NOT
+        // mean the whole episode is done — multi-task evals chain
+        // multiple subgoals (place table → craft → place result → …)
+        // and the top-level GoalPlanner is the only thing that can
+        // judge overall completion. Mark the closed-loop plan done
+        // to silence the post-action re-judge gate, but propagate
+        // subgoal_done normally so Dispatcher records pendingReflection
+        // and the GoalPlanner re-evaluates the checklist on the next obs.
         cp.done = true;
-        state.earlyStop = true;
-        return { kind: "subgoal_done", summary: `FastUI Planner all_done` };
+        // Surface what the player is now carrying so the GoalPlanner can
+        // mark the right checklist item without re-inspecting the world.
+        // We deliberately report items by NAME + COUNT only — no slot
+        // indices, no pixel positions, no UI-specific raster IDs. Slot
+        // numbering depends on which GUI is open (2x2 vs 3x3 vs chest
+        // vs furnace), and the GoalPlanner doesn't care about that —
+        // it only needs to know "<item> is now in your inventory".
+        const counts = new Map<string, number>();
+        for (const e of cp.slotMemory.snapshot()) {
+          if (!e.item || e.item === "empty" || e.item === "unknown") continue;
+          counts.set(e.item, (counts.get(e.item) ?? 0) + 1);
+        }
+        const itemsStr = counts.size > 0
+          ? [...counts.entries()].sort((a, b) => a[0].localeCompare(b[0])).map(([k, v]) => v > 1 ? `${k}×${v}` : k).join(", ")
+          : "(none observed)";
+        const recipeTarget = cp.recipeOverride?.target ?? null;
+        const summary = recipeTarget
+          ? `FastUI subgoal complete: ${recipeTarget} now in inventory (task=${state.taskText || "?"}). Items in inventory: ${itemsStr}`
+          : `FastUI subgoal complete (task=${state.taskText || "?"}). Items in inventory: ${itemsStr}`;
+        return { kind: "subgoal_done", summary };
       }
       cp.activeChecklistIdx = rj.nextIdx;
       // CURSOR INVARIANT GUARD: if cursor holds an item but the next
