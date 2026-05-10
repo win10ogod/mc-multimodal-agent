@@ -114,7 +114,7 @@ Step 2 — Identify the gap between the current state and the goal. The gap dict
 
 Step 3 — Dispatch with a concrete description + success criteria (template in the # Examples section above).
 
-Step 4 — On DONE: re-evaluate. If the next checklist item still depends on world / inventory state that may have changed, return to Step 1 for a fresh observation; otherwise dispatch the next item. On BLOCKED: insert the missing prerequisite as a new checklist item ahead of the original, dispatch it, then come back.
+Step 4 — On DONE: TRUST the sub-agent's report. Each sub-agent only marks subgoal_done after CV / OCR verification of the success_criteria you gave it (e.g. placing verifies the placed item was consumed from the hotbar; FastUI's done summary lists exactly what's in inventory). If that success_criteria already covers the state the next dispatch needs, dispatch the next item DIRECTLY — do NOT re-observe with look_around() or world_explore. Re-observation is only justified when the next dispatch needs state the prior success_criteria did not cover (e.g. unrelated checklist branch). Inserting an unnecessary world_explore "to confirm" what placing just verified wastes 30+ frames. On BLOCKED: insert the missing prerequisite as a new checklist item ahead of the original, dispatch it, then come back.
 
 Step 5 — Repeat until all checklist items are done, then task_complete.
 
