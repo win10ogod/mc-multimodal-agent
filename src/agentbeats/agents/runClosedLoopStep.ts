@@ -11,7 +11,6 @@ import {
   lookupRecipe,
   makeServoIntegrator,
 } from "../tools/UiFastControl";
-import { probeNextCraftAction } from "../tools/InventoryProbe";
 import { detectCursorWithExpectation, detectGuiLayout, detectGuiSlots, samplePatchFingerprint, samplePatchPixels, patchSimilarity } from "../tools/SlotDetector";
 import { repairDecisionForTask, shouldUseModelOnStep } from "../McuPolicyUtils";
 import type { UiFastControlFrame } from "../tools/UiFastControl";
@@ -961,12 +960,28 @@ export async function runClosedLoopStep(
           }
           // Action agent path: when Planner has built a checklist and
           // an active subtask is selected, dispatch ONE step via the
-          // slim Action agent. Otherwise fall back to legacy probe
-          // (e.g. before recipe_lookup fires).
+          // slim Action agent. The legacy probeNextCraftAction path
+          // has been removed — it used a CraftAction schema whose
+          // `put` primitive (= dump whole cursor stack) had no
+          // place_one analogue, forcing the LLM to dump the rest of
+          // a multi-cell ingredient stack into one cell whenever the
+          // cursor was already holding mid-recipe. The FastUI Action
+          // path's enum has both place_one and place_all, so it can
+          // express the correct intent.
           const useActionAgent = plan.checklist.length > 0
             && plan.activeChecklistIdx >= 0
             && plan.activeChecklistIdx < plan.checklist.length
             && !plan.checklist[plan.activeChecklistIdx].done;
+          if (!useActionAgent) {
+            // No active subtask — the checklist is empty, exhausted,
+            // or the active item is already done. Arm planner re-judge
+            // so the next obs invokes the FastUI Planner to build /
+            // refresh the checklist; emit a noop so the runtime
+            // doesn't fall back to a probe of any kind.
+            plan.judgeAfterChain = true;
+            console.log(`[agentbeats] no active subtask (checklist=${plan.checklist.length}, idx=${plan.activeChecklistIdx}); armed planner re-judge for next obs`);
+            return { kind: "act", action: defaultMcuAction(), holdSteps: 1 };
+          }
 
           // Plan auto-fixer: before dispatching the active subtask,
           // check that the cursor state matches its precondition. If
@@ -1029,7 +1044,7 @@ export async function runClosedLoopStep(
           }
 
           let probed: import("../tools/InventoryProbe").CraftAction | null;
-          if (useActionAgent) {
+          {
             const { runAction } = await import("./subagents/fastUi/Action");
             // Cross-ref slotMemory entries (keyed by pixel pos) with the
             // current layout to surface concrete slot indices to Action.
@@ -1061,23 +1076,6 @@ export async function runClosedLoopStep(
               cursorHolding: cursorHoldingItem,
               obsBase64: markedObs,
             });
-          } else {
-            const result = await probeNextCraftAction({
-              client: deps.client,
-              model: deps.model,
-              obsBase64: payload.obs,
-              taskText: plan.taskText,
-              iteration: plan.iteration,
-              sessionLayout: layoutForProbe, // freshly redetected for each probe
-              recentActions: state.closedLoopHistory,
-              cursorHolding: plan.cursorItemSignature?.item ? true : null,
-              pickupSourceSlot: plan.pickupSourceSlot ?? null,
-              disappearedItems,
-              slotUpdates,
-              recipeInfo: plan.recipeOverride,
-              knownSlots,
-            });
-            probed = result.action;
           }
           plan.iteration += 1;
           if (!probed) {
