@@ -30,18 +30,18 @@ const DISPATCH_TOOL_DEF = {
     parameters: {
       type: "object",
       properties: {
-        kind: { type: "string", enum: ["ui_inventory", "world_explore", "mining", "combat", "placing", "use_block"] },
+        kind: { type: "string", enum: ["ui_inventory", "world_explore", "mining", "combat", "placing", "find_and_use_block"] },
         description: { type: "string" },
         success_criteria: { type: "string" },
         target: {
           type: "string",
           description:
-            "Structured target identifier (snake_case Minecraft id, e.g. 'crafting_table'). REQUIRED when kind='placing' (verifies the equipped hotbar slot) or kind='use_block' (the block to find and right-click). Optional / ignored for other kinds.",
+            "Structured target identifier (snake_case Minecraft id, e.g. 'crafting_table'). REQUIRED when kind='placing' (verifies the equipped hotbar slot) or kind='find_and_use_block' (the block to find and right-click). Optional / ignored for other kinds.",
         },
         gui_target: {
           type: "string",
           description:
-            "For kind='ui_inventory': which GUI is currently open. Omit or use 'player_inventory' for the default 2x2 inventory. Use a block id (e.g. 'crafting_table', 'furnace', 'chest') when operating a placed block's GUI — that GUI must ALREADY be open (typically via a prior use_block dispatch). The runtime no longer auto-opens the GUI from this field; if the GUI isn't open, dispatch use_block(target=<block>) first.",
+            "For kind='ui_inventory': which GUI is currently open. Omit or use 'player_inventory' for the default 2x2 inventory. Use a block id (e.g. 'crafting_table', 'furnace', 'chest') when operating a placed block's GUI — that GUI must ALREADY be open (typically via a prior find_and_use_block dispatch). The runtime no longer auto-opens the GUI from this field; if the GUI isn't open, dispatch find_and_use_block(target=<block>) first.",
         },
       },
       required: ["kind", "description", "success_criteria"],

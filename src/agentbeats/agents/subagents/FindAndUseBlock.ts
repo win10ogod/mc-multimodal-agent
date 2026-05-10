@@ -8,7 +8,7 @@ const SYSTEM_PROMPT = `Find the requested placed block in view and right-click i
 
 const RENDER_WAIT_FRAMES = 6;
 
-type UseBlockState = {
+type FindAndUseBlockState = {
   subgoalKey: string;
   target: string;
   opener: WorldBlockOpener | null;
@@ -20,11 +20,11 @@ function noop() {
   return defaultMcuAction();
 }
 
-export function createUseBlock(deps: WorldSubAgentDeps): SubAgent {
-  let state: UseBlockState | null = null;
+export function createFindAndUseBlock(deps: WorldSubAgentDeps): SubAgent {
+  let state: FindAndUseBlockState | null = null;
 
   return {
-    kind: "use_block",
+    kind: "find_and_use_block",
     systemPrompt: SYSTEM_PROMPT,
     step: async (input: SubAgentStepInput): Promise<SubAgentStep> => {
       // Reset on subgoal change.
@@ -33,8 +33,8 @@ export function createUseBlock(deps: WorldSubAgentDeps): SubAgent {
         if (!target) {
           return {
             kind: "subgoal_failed",
-            reason: `use_block requires subgoal.target (snake_case block id)`,
-            reportFields: { code: "use_block_target_missing", description: input.subgoal.description },
+            reason: `find_and_use_block requires subgoal.target (snake_case block id)`,
+            reportFields: { code: "find_and_use_block_target_missing", description: input.subgoal.description },
           };
         }
         state = {
@@ -74,7 +74,7 @@ export function createUseBlock(deps: WorldSubAgentDeps): SubAgent {
       if (guiOpen) {
         const target = state.target;
         state = null;
-        return { kind: "subgoal_done", summary: `use_block opened ${target} GUI; ready for slot work` };
+        return { kind: "subgoal_done", summary: `find_and_use_block opened ${target} GUI; ready for slot work` };
       }
       state.renderWaitFramesLeft -= 1;
       if (state.renderWaitFramesLeft <= 0) {
@@ -82,7 +82,7 @@ export function createUseBlock(deps: WorldSubAgentDeps): SubAgent {
         state = null;
         return {
           kind: "subgoal_failed",
-          reason: `use_block: WBO completed but ${target} GUI never rendered within ${RENDER_WAIT_FRAMES} frames`,
+          reason: `find_and_use_block: WBO completed but ${target} GUI never rendered within ${RENDER_WAIT_FRAMES} frames`,
           reportFields: { code: "gui_render_timeout", target },
         };
       }

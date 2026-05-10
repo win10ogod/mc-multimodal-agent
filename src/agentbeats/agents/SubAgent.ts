@@ -9,15 +9,15 @@ export type SubAgentKind =
   | "mining"
   | "combat"
   | "placing"
-  | "use_block";
+  | "find_and_use_block";
 
 export type Subgoal = {
   kind: SubAgentKind;
   description: string;
   success_criteria: string;
   /** Structured target identifier for sub-agents that act on a single
-   *  named entity (placing.target / use_block.target = a block id like
-   *  "crafting_table"). Required for kind="placing" and kind="use_block";
+   *  named entity (placing.target / find_and_use_block.target = a block id like
+   *  "crafting_table"). Required for kind="placing" and kind="find_and_use_block";
    *  ignored by other kinds. */
   target?: string;
   /** For kind="ui_inventory": which GUI is open and being operated.
@@ -25,7 +25,7 @@ export type Subgoal = {
    *  id (e.g. "crafting_table", "furnace") for placed-block GUIs, or
    *  omit / pass "player_inventory" for the player's 2x2. The runtime
    *  no longer auto-opens the GUI from this field — use a separate
-   *  use_block(target=<block>) dispatch first to open it. */
+   *  find_and_use_block(target=<block>) dispatch first to open it. */
   gui_target?: string;
 };
 
