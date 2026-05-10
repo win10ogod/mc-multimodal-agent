@@ -9,7 +9,6 @@ import { runPlannerLoop } from "./PlannerLoop";
 import { detectGuiSlots } from "../tools/SlotDetector";
 import type { McuEnvAction } from "../McuPrompt";
 import { defaultMcuAction } from "../McuPrompt";
-import { WorldBlockOpener } from "../tools/WorldBlockOpener";
 
 export type DispatchDeps = {
   client: OpenAI;
@@ -86,71 +85,6 @@ export async function dispatchObservation(
     return { action: closeAction, holdSteps: 1, taskDone: false };
   }
 
-  // For ui_inventory dispatches with gui_target set (e.g. cake → use placed
-  // crafting_table), run the WorldBlockOpener align+use macro before falling
-  // through to the regular closed-loop step. Once the opener reports done,
-  // the next observation should see the GUI open and closedLoopStep takes
-  // over normally. On fail (target_ui_not_in_view) escalate to the planner.
-  //
-  // Cooldown handling: after WBO returns done it sets the cooldown so we
-  // actively wait for MC to render the just-opened block GUI. The wait is
-  // not a fixed sleep — each frame we recheck guiOpen; the moment it turns
-  // true we drop the cooldown to 0 and fall through to closedLoopStep on
-  // the same frame. If guiOpen never turns true within the budget, the
-  // counter expires and closedLoopStep runs anyway (it will then bail
-  // with "inventory window no longer visible" and the planner will pick
-  // up the failure via target_ui_not_in_view recovery).
-  //
-  // The previous implementation only blocked WBO re-creation during the
-  // cooldown but let runClosedLoopStep run, which would CV-detect "no
-  // GUI" before MC had even rendered the GUI and reset the session,
-  // permanently losing the just-opened crafting_table.
-  if (state.worldBlockOpenerCooldown > 0) {
-    if (guiOpen) {
-      state.worldBlockOpenerCooldown = 0;
-    } else {
-      state.worldBlockOpenerCooldown -= 1;
-      return NOOP_ONE;
-    }
-  }
-  if (
-    current.kind === "ui_inventory"
-    && current.gui_target
-    && current.gui_target !== "player_inventory"
-    && !guiOpen
-    && state.worldBlockOpenerCooldown === 0
-  ) {
-    if (!state.worldBlockOpener) {
-      state.worldBlockOpener = new WorldBlockOpener({
-        target: current.gui_target,
-        deps: { client: deps.client, model: deps.plannerModel },
-      });
-    }
-    const r = await state.worldBlockOpener.nextAction(obs.imageBase64);
-    if (r.kind === "act") {
-      return { action: r.action, holdSteps: r.holdSteps, taskDone: false };
-    }
-    if (r.kind === "done") {
-      state.worldBlockOpener = null;
-      // Wait for MC to render the GUI before letting the dispatcher decide
-      // again — without this, guiOpen=false on the next obs spawns another
-      // opener and another use=1, repeatedly toggling the GUI.
-      state.worldBlockOpenerCooldown = 6;
-      return NOOP_ONE;
-    }
-    // r.kind === "fail"
-    state.worldBlockOpener = null;
-    state.completedSummaries.push(`SUBGOAL_FAILED: ${r.reason}`);
-    state.history.push(`failed: ${current.description} -> ${r.reason}`);
-    state.pendingReflection = {
-      subgoal: current,
-      outcome: "failed",
-      summary: r.reason,
-      reportFields: r.reportFields,
-    };
-    state.subgoals = []; state.idx = 0;
-    return NOOP_ONE;
-  }
 
   const kind: SubAgentKind = guiOpen ? "ui_inventory" : current.kind;
 
@@ -177,7 +111,6 @@ export async function dispatchObservation(
     state.history.push(`done: ${current.description} -> ${step.summary}`);
     state.pendingReflection = { subgoal: current, outcome: "done", summary: step.summary };
     state.subgoals = []; state.idx = 0;  // force planner re-call next obs (which will see pendingReflection)
-    state.worldBlockOpener = null;
     return NOOP_ONE;
   }
 
@@ -191,6 +124,5 @@ export async function dispatchObservation(
     reportFields: step.reportFields,
   };
   state.subgoals = []; state.idx = 0;
-  state.worldBlockOpener = null;
   return NOOP_ONE;
 }
