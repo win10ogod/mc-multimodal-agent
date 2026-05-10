@@ -1912,22 +1912,28 @@ export async function runClosedLoopStep(
                 plan.slotMemory.record(changedSlotLayout.cx, changedSlotLayout.cy, itemToRecord, plan.iteration, fp, newPatch ?? undefined);
                 console.log(`[agentbeats] place confirmed: ${slotLabel} item=${itemToRecord}`);
               }
-              if (change === "swapped") {
+              // Decide swap-vs-clean-place using slotMemory as ground
+              // truth, not the classifier's "swapped" label. The classifier
+              // labels "swapped" when isPatchFilled(before)=true AND
+              // isPatchFilled(after)=true, but isPatchFilled has false
+              // positives on actually-empty slots (cursor sprite drift,
+              // hover highlight, render noise can push fg pixel count
+              // above its threshold). slotMemory is OCR-confirmed and
+              // authoritative — trust it.
+              const slotWasGenuinelyHeld = slotPreviousItem
+                && slotPreviousItem !== "empty"
+                && slotPreviousItem !== "unknown";
+              const wasReallySwap = change === "swapped" && slotWasGenuinelyHeld;
+              if (wasReallySwap) {
                 // MC swap: cursor's old item went into the slot, slot's
                 // old item is now on the cursor. Update cursorItemSignature
-                // to the slot's previous contents (if known) so subsequent
-                // dispatches see the correct held item. Applies to BOTH
-                // place_one and place_all — both swap when the dest slot
-                // already holds a different item.
-                if (slotPreviousItem && slotPreviousItem !== "empty" && slotPreviousItem !== "unknown") {
-                  plan.cursorItemSignature = { meanR: 0, meanG: 0, meanB: 0, item: slotPreviousItem };
-                  console.log(`[agentbeats] swap detected → cursor now holds '${slotPreviousItem}' (slot's previous item)`);
-                } else {
-                  plan.cursorItemSignature = { meanR: 0, meanG: 0, meanB: 0 };
-                  console.log(`[agentbeats] swap detected → cursor holds something (slot's previous item unknown)`);
-                }
+                // to the slot's previous contents.
+                plan.cursorItemSignature = { meanR: 0, meanG: 0, meanB: 0, item: slotPreviousItem };
+                console.log(`[agentbeats] swap detected → cursor now holds '${slotPreviousItem}' (slot's previous item)`);
               } else {
-                // change === "empty→filled" — clean place into an empty slot.
+                // empty→filled (clean place into an empty slot), OR a
+                // false "swapped" label that was actually a clean place
+                // (slotMemory says the slot was empty).
                 if (intentKind === "place_all") {
                   // Whole stack dropped, cursor empty.
                   plan.cursorItemSignature = null;
