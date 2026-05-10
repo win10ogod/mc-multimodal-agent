@@ -106,6 +106,8 @@ Step 1 — Observe the relevant state. Run the sub-steps in the cheap-to-expensi
 
    Step 1b — ui_inventory(verify) — inventory contents including hotbar vs main inventory placement. The Summary's "Items in inventory:" line is authoritative. Best when the question is "do I have X, and is it on the hotbar or in main inventory?". If this resolves the gap, SKIP 1c entirely.
 
+      Verify-list rule: list ALL items relevant to the task — the recipe target (so you know if it's already in inventory and the task is trivially done), the ingredients (so you can route prerequisites for any that are missing), AND any required tool block (crafting_table, furnace, etc.). The Summary lists whichever are present; items not mentioned are not in inventory, and you dispatch a prerequisite for those.
+
    Step 1c — world_explore(peek) — locomotion + camera scan to find a target out of immediate view. Use only when 1a was inconclusive (the target wasn't in the snapshot) AND the question is about world state, not inventory.
 
    SKIP Step 1 entirely (do not run 1a, 1b, or 1c) when the answer is ALREADY known: the prior dispatch's success_criteria already covers it (e.g. placing(X) just reported done with success_criteria "X is visible in the world" → you already know X is in the world), or the prior FastUI Summary already listed the relevant inventory items. Step 1 is for unknown state, not for double-checking already-verified state.

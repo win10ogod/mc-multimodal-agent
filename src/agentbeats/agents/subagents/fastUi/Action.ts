@@ -33,7 +33,7 @@ const SCHEMA = {
   required: ["action"],
   additionalProperties: true,
   properties: {
-    action: { type: "string", enum: ["pickup", "place_one", "place_all", "verify_slots", "wait", "done", "fallback_manual"] },
+    action: { type: "string", enum: ["pickup", "place_one", "place_all", "verify_slots", "wait", "done", "infeasible", "fallback_manual"] },
   },
 } as const;
 
@@ -42,7 +42,7 @@ const SYS = `You execute ONE PRIMITIVE subtask in a Minecraft GUI. The subtask a
 TRUST the "Cursor:" line from the user prompt as authoritative. The runtime tracks cursor identity via verified click outcomes; do NOT second-guess it from the image — the cursor sprite is small and often occluded by held-item icons, image inspection is unreliable at this resolution.
 
 Subtask → action (1:1 mapping):
-- verify_items_visible: emit verify_slots on up to 3 candidates from items[] OR the explicit slots[] passed in. If every listed item is already named in Known, emit done.
+- verify_items_visible: emit verify_slots on up to 3 candidates from items[] OR the explicit slots[] passed in. Emit done when every listed item is named in Known. If you have already checked the plausible slots and the missing item still isn't in Known, emit infeasible with reason "<item> not in inventory after scanning hotbar+main_inv" — the planner will re-plan around the missing prerequisite.
 - pickup { sourceSlot, expectedItem }: emit pickup slot=sourceSlot. (Pre-cond: Cursor: (empty) per prompt. If prompt says holding, that's a planner mistake — emit fallback_manual.)
 - place_one { destSlot, expectedItem }: emit place_one slot=destSlot. Trust the prompt's Cursor: line; emit even if the image looks ambiguous. Do NOT inspect the destination icon visually — the planner already validated it. MC will safely no-op or stack if slot is empty or already has the same item; refusing wastes a step.
 - place_all { destSlot, expectedItem }: emit place_all slot=destSlot. Trust the prompt's Cursor: line AND the planner's chosen destSlot. Emit the action even if the destination LOOKS occupied — for "return to source" placements the slot legitimately holds (or held) the same item, and MC will stack. NEVER emit fallback_manual on place_all because of perceived destination occupancy.
