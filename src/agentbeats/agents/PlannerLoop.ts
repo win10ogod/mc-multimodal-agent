@@ -30,18 +30,18 @@ const DISPATCH_TOOL_DEF = {
     parameters: {
       type: "object",
       properties: {
-        kind: { type: "string", enum: ["ui_inventory", "world_explore", "mining", "combat", "placing"] },
+        kind: { type: "string", enum: ["ui_inventory", "world_explore", "mining", "combat", "placing", "find_and_use_block"] },
         description: { type: "string" },
         success_criteria: { type: "string" },
         target: {
           type: "string",
           description:
-            "Structured target identifier (snake_case Minecraft id, e.g. 'crafting_table'). REQUIRED when kind='placing' so the runtime can verify the equipped hotbar slot. Optional / ignored for other kinds.",
+            "Structured target identifier (snake_case Minecraft id, e.g. 'crafting_table'). REQUIRED when kind='placing' (verifies the equipped hotbar slot) or kind='find_and_use_block' (the block to find and right-click). Optional / ignored for other kinds.",
         },
         gui_target: {
           type: "string",
           description:
-            "For kind='ui_inventory': which GUI to interact with. Omit or use 'player_inventory' for the default 2x2 inventory (opened with the inventory key). Use a block id (e.g. 'crafting_table', 'furnace', 'chest') when the recipe requires the placed block's GUI — the runtime will align the camera to centre that block on the crosshair and right-click it to open. The placed block MUST already be in front of the agent (a prior placing(<block>) dispatch is the typical setup); if not visible the subagent reports target_ui_not_in_view.",
+            "For kind='ui_inventory': which GUI is currently open. Omit or use 'player_inventory' for the default 2x2 inventory. Use a block id (e.g. 'crafting_table', 'furnace', 'chest') when operating a placed block's GUI — that GUI must ALREADY be open (typically via a prior find_and_use_block dispatch). The runtime no longer auto-opens the GUI from this field; if the GUI isn't open, dispatch find_and_use_block(target=<block>) first.",
         },
       },
       required: ["kind", "description", "success_criteria"],

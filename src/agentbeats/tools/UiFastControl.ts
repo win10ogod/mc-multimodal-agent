@@ -199,8 +199,13 @@ function compileCursorMove(
 // --- Task-text -> recipe lookup ------------------------------------------
 
 const TARGET_PATTERNS: RegExp[] = [
-  /craft(?:\s+(?:a|the|to|some|an))?\s+([a-z][a-z_\s]+?)(?:\s+(?:from|using|with|for)\b|\.|$)/i,
-  /craft\s+([a-z][a-z_\s]+)/i,
+  // Craft / smelt / brew / enchant — capture the target item name
+  // and stop at the first prepositional verb. "to" is a stop-word
+  // because tasks often say "craft an enchanting table to enchant
+  // your items" — without "to" in the stop list the capture
+  // greedily eats the rest of the sentence and produces garbage.
+  /(?:craft|smelt|brew|enchant)(?:\s+(?:a|the|some|an))?\s+([a-z][a-z_\s]+?)(?:\s+(?:from|using|with|for|to|on|at|in|into)\b|\.|$)/i,
+  /(?:craft|smelt|brew|enchant)\s+([a-z][a-z_\s]+?)(?:\s|\.|$)/i,
 ];
 
 function normalizeItemName(raw: string): string {
@@ -474,7 +479,7 @@ export type PendingClick = {
   /** Kind of click for logging + cleanup-loop guard. */
   kind?: "click" | "cleanup" | "auto_return";
   /** Probe action this click was derived from. */
-  actionKind?: "pickup" | "place_one" | "place_all" | "take";
+  actionKind?: "pickup" | "place_one" | "place_all";
   /** Item name to record at this click's slot on a CV-matched verify
    *  for place_one/place_all clicks. Set at chain-build time from the
    *  source slot's SlotMemory entry. The CV-matched verify is the
@@ -644,6 +649,15 @@ export type ClosedLoopCraftPlan = {
    *  Cleared after a successful chain-end so the Planner can pick
    *  the next [ ] on its next turn. */
   activeChecklistIdx: number;
+  /** Per-subtask set of slot indices the runtime has already OCR'd
+   *  for the active verify_items_visible. Reset on any non-verify
+   *  probed action (a real action breaks the verify streak). The
+   *  verify_slots handler skips re-OCR for slots already in the
+   *  tracker, surfaces "already known" notes via recent_history,
+   *  and force-marks the subtask done when every newly requested
+   *  slot is already in the tracker — i.e. the LLM is just
+   *  re-asking about slots it already saw. */
+  verifyCheckedSlots: Set<number>;
   /** Set true on a chain-end where source slot was role==="result".
    *  The runtime fires the Planner agent on the next entry to update
    *  the checklist + judge completion. */
@@ -665,6 +679,12 @@ export type ClosedLoopCraftPlan = {
     phase: "servo" | "hover_settle" | "read";
     servoSteps: number;
     hoverFrames: number;
+    /** When set and the verify concludes "still holding" (tooltip
+     *  suppressed), set cursorItemSignature to {item: "unknown"}.
+     *  Used by ambiguous place_all swap into an unknown slot: cursor
+     *  was tentatively cleared, but if OCR proves still-holding the
+     *  swap was real and we picked up something we can't identify. */
+    markUnknownOnHold?: boolean;
   } | null;
 };
 
@@ -793,6 +813,23 @@ export function servoCursorStep(opts: {
  *  click + verify machinery takes over generically. The probe sees
  *  the raw taskText so it can reason about whatever the goal is. */
 export function planClosedLoopCraft(taskText: string): ClosedLoopCraftPlan {
+  // Auto-lookup recipe at session init. The legacy probeNextCraftAction
+  // used to populate recipeOverride via a "recipe_lookup" action emitted
+  // by the closed-loop probe LLM. With that path removed, the FastUI
+  // Action subagent can no longer emit recipe_lookup (its enum is
+  // pickup/place_one/place_all/verify_slots/wait/done/fallback_manual),
+  // so we have to do the lookup eagerly. parseTargetItem returns null
+  // for tasks that aren't "craft X" / "smelt X" / etc.; in that case
+  // recipeOverride stays null and the FastUI Planner falls back to its
+  // non-recipe branch.
+  let recipeOverride: RecipeInfo | null = null;
+  try {
+    const target = parseTargetItem(taskText);
+    if (target) {
+      const r = lookupRecipe(target);
+      if (r) recipeOverride = r;
+    }
+  } catch { /* leave recipeOverride=null */ }
   return {
     taskText,
     cursor: CURSOR_OPEN_CENTER,
@@ -820,9 +857,10 @@ export function planClosedLoopCraft(taskText: string): ClosedLoopCraftPlan {
     lastProbeCursor: null,
     recentMatchedPickup: false,
     initialSlotBaselines: new Map(),
-    recipeOverride: null,
+    recipeOverride,
     checklist: [],
     activeChecklistIdx: -1,
+    verifyCheckedSlots: new Set<number>(),
     judgeAfterChain: false,
     cursorVerifyJob: null,
   };

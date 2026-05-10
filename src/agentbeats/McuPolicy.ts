@@ -39,6 +39,7 @@ import { createWorldExplorer } from "./agents/subagents/WorldExplorer";
 import { createMining } from "./agents/subagents/Mining";
 import { createCombat } from "./agents/subagents/Combat";
 import { createPlacing } from "./agents/subagents/Placing";
+import { createFindAndUseBlock } from "./agents/subagents/FindAndUseBlock";
 
 type McuInitPayload = {
   type: "init";
@@ -596,6 +597,7 @@ export class McuVisualPolicy {
         mining: createMining(worldDeps),
         combat: createCombat(worldDeps),
         placing: createPlacing(worldDeps),
+        find_and_use_block: createFindAndUseBlock(worldDeps),
       };
     }
     const subagents = this.subagents;
