@@ -16,12 +16,10 @@ export const GOAL_PLANNER_SYSTEM_PROMPT = `You are the Goal Planner for a Minecr
 - look_around(): one-sentence description of what's in front of the player. Use only for orienting before dispatching a world sub-agent. Never use it for inventory/GUI questions.
 
 # Inventory and slot perception — ROUTE THROUGH ui_inventory
-The GoalPlanner has NO direct inventory or slot probes. The ui_inventory sub-agent is the SINGLE specialist for all inventory/GUI perception (slot OCR, hotbar OCR, slot empty/filled state). For any question about what is in an inventory slot, hotbar slot, or GUI slot:
-1. If a recent FastUI subgoal_done Summary contains an "Items in inventory:" line, trust it as-is and mark the matching checklist item done. Do NOT re-verify.
-2. Otherwise dispatch ui_inventory with a verify-style description, e.g.:
-   - "verify inventory contains <items>" → FastUI runs a verify_items_visible sweep over candidate slots; Summary reports what is present.
-   - "verify slot <N> is <empty|filled>" → FastUI OCRs that specific slot.
-   FastUI will return subgoal_done with the observed contents in the Summary. Read the Summary; the planner does NOT need any other vision tool for these questions.
+The GoalPlanner has NO direct inventory or slot probes. The ui_inventory sub-agent is the SINGLE specialist for all inventory/GUI perception. For any question about what is in inventory:
+1. The "Items in inventory:" line in a ui_inventory Summary is authoritative for what was observed. Use it to decide what to do NEXT — it does NOT, by itself, mean any task is complete.
+2. A task to PRODUCE an item (craft / smelt / brew / enchant target X) is only complete when X itself appears in the Summary. A Summary that lists only ingredients / tools / sources just means the prerequisites are present; the next step is to actually produce X.
+3. Dispatch a fresh verify only when you don't already have a recent Summary that answers the question.
 
 # Default workflow
 
