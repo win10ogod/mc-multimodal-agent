@@ -276,27 +276,22 @@ export async function runClosedLoopStep(
     const liveLayout = detectGuiLayout(payload.obs, plan.layoutHint ?? undefined);
     if (!liveLayout) {
       console.log(`[agentbeats] closed-loop: inventory window no longer visible at step=${step}; resetting session`);
-      // DEBUG: save the raw obs frame so we can see what the runtime
-      // actually saw at the moment it gave up. Useful for distinguishing
-      // (a) GUI never opened (right-click missed), (b) GUI opened then
-      // closed, (c) GUI is open but the detector failed to recognize it.
-      try {
-        if (deps.debugDir && payload.obs) {
-          // eslint-disable-next-line @typescript-eslint/no-require-imports
-          const fs = require("node:fs");
-          // eslint-disable-next-line @typescript-eslint/no-require-imports
-          const pathMod = require("node:path");
-          const ts = Date.now();
-          const cleaned = payload.obs.startsWith("data:image/")
-            ? payload.obs.replace(/^data:image\/[a-z]+;base64,/, "")
-            : payload.obs;
-          const fname = pathMod.join(deps.debugDir, `gui_lost_step${step}_${ts}.jpg`);
-          fs.writeFileSync(fname, Buffer.from(cleaned, "base64"));
-          console.log(`[agentbeats] gui_lost dump: ${fname}`);
-        }
-      } catch (e) {
-        console.warn(`[agentbeats] gui_lost dump failed: ${e instanceof Error ? e.message : String(e)}`);
-      }
+      // DEBUG: emit a gui_lost event so the debug dashboard renders the
+      // raw obs frame at the moment the runtime gave up. Useful for
+      // distinguishing (a) GUI never opened (right-click missed),
+      // (b) GUI opened then closed, (c) GUI is open but the detector
+      // failed to recognize it. Routed through recordDebug so the
+      // image lands in the same imageFile-indexed events.jsonl that
+      // local_tests/debug_dashboard.mjs already renders.
+      const cleanedObs = payload.obs?.startsWith("data:image/")
+        ? payload.obs.replace(/^data:image\/[a-z]+;base64,/, "")
+        : payload.obs;
+      void deps.recordDebug("gui_lost", {
+        step,
+        iteration: plan.iteration,
+        layoutHint: plan.layoutHint ?? null,
+        reason: "detectGuiLayout returned null after WBO/closed-loop entry — GUI not detected on the frame the closed-loop saw",
+      }, cleanedObs, "jpg");
       plan.sessionLayout = null;
       plan.layoutHint = null;
       plan.pendingClick = null;

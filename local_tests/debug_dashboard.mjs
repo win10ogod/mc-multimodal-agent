@@ -217,6 +217,15 @@ function summarize(row) {
         ].filter(Boolean),
       };
     }
+    case "gui_lost": {
+      return {
+        title: `[gui_lost] step=${d.step ?? "?"} iter=${d.iteration ?? "?"} layoutHint=${d.layoutHint ?? "(none)"}`,
+        body: [
+          d.reason ?? "",
+          "→ closed-loop reset session, plan.done=true",
+        ].filter(Boolean),
+      };
+    }
     default:
       return { title: `[${row.type}]`, body: [JSON.stringify(row.data ?? {}).slice(0, 200)] };
   }
