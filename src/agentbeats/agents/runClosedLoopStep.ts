@@ -1133,27 +1133,6 @@ export async function runClosedLoopStep(
             // Planner re-judge at the top of the body will tick the
             // checklist and dispatch the next subtask.
             return { kind: "act", action: defaultMcuAction(), holdSteps: 1 };
-          } else if (probed.action === "infeasible") {
-            // Sub-agent reports the active subtask cannot complete
-            // given current state (e.g. verify scan finished without
-            // finding a requested item, runtime-detectable precondition
-            // miss). Distinct from `done` (success) and `fallback_manual`
-            // (manual takeover). Mark the subtask done with the reason
-            // surfaced to recent_history, arm a Planner re-judge so the
-            // Planner can see the gap and route a prerequisite. The
-            // checklist item is marked done so the Planner doesn't
-            // re-dispatch the same infeasible step on its next turn —
-            // the recent_history line is what tells it WHY.
-            const reason = probed.reason ?? "infeasible";
-            const activeItem = plan.checklist[plan.activeChecklistIdx];
-            if (activeItem) {
-              activeItem.done = true;
-              console.log(`[agentbeats] subtask infeasible: '${activeItem.id}' (${(activeItem.task as { kind?: string })?.kind}) reason="${reason}"; arming Planner re-judge`);
-            }
-            plan.judgeAfterChain = true;
-            state.closedLoopHistory.unshift(`infeasible ${activeItem?.id ?? "?"}: ${reason}`);
-            state.closedLoopHistory = state.closedLoopHistory.slice(0, 5);
-            return { kind: "act", action: defaultMcuAction(), holdSteps: 1 };
           } else if (probed.action === "fallback_manual") {
             const blockedReason = probed.reason ?? "fallback_manual";
             console.log(`[agentbeats] closed-loop probe says fallback_manual reason=${blockedReason} -- escalating to GoalPlanner`);
