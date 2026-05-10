@@ -1962,6 +1962,34 @@ export async function runClosedLoopStep(
                 // place_one with empty→filled: cursor still holds (stack-1).
                 // No cursorItemSignature change needed.
               }
+              // CURSOR-EMPTY VERIFY (post place_one): always fire after a
+              // confirmed place_one. The verify diff can't tell whether the
+              // held stack is exhausted (cursor empty after the LAST item)
+              // or still holds (stack-1). The cost of one OCR tooltip per
+              // place_one is far less than the cost of a phantom "clear
+              // cursor" place_one inserted by the planner that accidentally
+              // PICKS UP the item we just placed (observed in
+              // craft_enchantment seq=73). Held items suppress MC slot
+              // tooltips, so a readable tooltip on the just-filled
+              // destination slot proves cursor is empty.
+              const placedForVerify = placedItem ?? plan.cursorItemSignature?.item;
+              if (
+                intentKind === "place_one"
+                && placedForVerify
+                && !plan.cursorVerifyJob
+                && changedSlotLayout
+              ) {
+                plan.cursorVerifyJob = {
+                  knownSlotIdx: changedSlotIdx,
+                  target: { x: changedSlotLayout.cx, y: changedSlotLayout.cy },
+                  slotName: changedSlotLayout.name,
+                  expectedItem: placedForVerify,
+                  phase: "servo",
+                  servoSteps: 0,
+                  hoverFrames: 0,
+                };
+                console.log(`[agentbeats] post-place_one cursor-verify queued: hover ${changedSlotLayout.name ?? changedSlotIdx} expect tooltip="${placedForVerify}" if cursor empty`);
+              }
             }
             // Bonus side-effect changes (e.g. result slot auto-fills
             // when the last ingredient is placed and the recipe
