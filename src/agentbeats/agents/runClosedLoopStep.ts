@@ -205,19 +205,31 @@ export async function runClosedLoopStep(
         cp.done = true;
         // Surface what the player is now carrying so the GoalPlanner can
         // mark the right checklist item without re-inspecting the world.
-        // We deliberately report items by NAME + COUNT only — no slot
-        // indices, no pixel positions, no UI-specific raster IDs. Slot
-        // numbering depends on which GUI is open (2x2 vs 3x3 vs chest
-        // vs furnace), and the GoalPlanner doesn't care about that —
-        // it only needs to know "<item> is now in your inventory".
-        const counts = new Map<string, number>();
+        // Report items by NAME + COUNT, grouped into "in hotbar" and
+        // "in main inventory" buckets. NEVER include slot indices —
+        // slot numbering depends on which GUI is open (2x2 vs 3x3 vs
+        // chest vs furnace), and the GoalPlanner doesn't see slots.
+        // It only needs to reason about location at the abstraction
+        // level "is this in the hotbar (ready to equip) vs in main
+        // inventory (needs to be moved to hotbar first)".
+        const layoutSlots = (cp.sessionLayout as ReturnType<typeof detectGuiLayout> | null)?.slots ?? [];
+        const hotbarCounts = new Map<string, number>();
+        const mainCounts = new Map<string, number>();
         for (const e of cp.slotMemory.snapshot()) {
           if (!e.item || e.item === "empty" || e.item === "unknown") continue;
-          counts.set(e.item, (counts.get(e.item) ?? 0) + 1);
+          let role = "main_inv";
+          let bestD = Infinity;
+          for (const s of layoutSlots) {
+            const d = Math.hypot(s.cx - e.x, s.cy - e.y);
+            if (d < bestD) { bestD = d; role = s.role ?? "main_inv"; }
+          }
+          const bucket = role === "hotbar" ? hotbarCounts : mainCounts;
+          bucket.set(e.item, (bucket.get(e.item) ?? 0) + 1);
         }
-        const itemsStr = counts.size > 0
-          ? [...counts.entries()].sort((a, b) => a[0].localeCompare(b[0])).map(([k, v]) => v > 1 ? `${k}×${v}` : k).join(", ")
-          : "(none observed)";
+        const fmt = (m: Map<string, number>) => m.size > 0
+          ? [...m.entries()].sort((a, b) => a[0].localeCompare(b[0])).map(([k, v]) => v > 1 ? `${k}×${v}` : k).join(", ")
+          : "(none)";
+        const itemsStr = `hotbar: ${fmt(hotbarCounts)}; main inventory: ${fmt(mainCounts)}`;
         const recipeTarget = cp.recipeOverride?.target ?? null;
         const summary = recipeTarget
           ? `FastUI subgoal complete: ${recipeTarget} now in inventory (task=${state.taskText || "?"}). Items in inventory: ${itemsStr}`
