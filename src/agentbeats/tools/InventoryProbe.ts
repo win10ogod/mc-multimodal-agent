@@ -175,38 +175,16 @@ export async function vlmVerifySlotState(opts: {
   }
 }
 
+/** Single-step intent the FastUI Action subagent emits. Each variant
+ *  is one click (or a deterministic noop / done / batch-OCR). The
+ *  legacy probe schema's `move` / `put` / `recipe_lookup` / `take`
+ *  variants are gone — see InventoryProbe.ts header for the rationale.
+ */
 export type CraftAction =
-  // High-level atomic operations the VLM should prefer:
-  | { action: "move"; from: number; to: number; count?: "one" | "all"; reason?: string }
-  | { action: "put"; slot: number; reason?: string }   // dump whole cursor stack into slot
-  /** Batch inventory inspection. Runtime hovers each listed slot in turn,
-   *  runs TooltipOCR on each tooltip frame, and writes results to the
-   *  per-session SlotMemory keyed by absolute pixel position. The main
-   *  probe is NOT called between hovers — one probe LLM call requested
-   *  the whole batch; the next probe runs only after every queued slot
-   *  has been read, and that probe sees all results in "Known slot
-   *  contents". Single-slot hover was removed because it produced one
-   *  full-probe round-trip per inspection, which dominated long-horizon
-   *  cost. Always batch. */
-  | { action: "verify_slots"; slots: number[]; reason?: string }
-  /** Sub-agent recipe query. Returns the recipe (ingredients +
-   *  inShape) for the given item id from minecraft-data and stores it
-   *  on the plan so subsequent probes show RECIPE/Placement plan
-   *  blocks based on this lookup. Use this ONCE at task start to
-   *  establish the target item, before placing anything. */
-  | { action: "recipe_lookup"; item: string; reason?: string }
-  /** Pure-noop wait. Used by Action agent for async-output GUIs
-   *  (smelting, brewing) where the next state change requires the
-   *  simulator to advance its internal timers (smelt cook time, brew
-   *  duration). Runtime emits defaultMcuAction with `holdSteps`
-   *  bumped, then re-probes. */
-  | { action: "wait"; holdSteps: number; reason?: string }
-  | { action: "done"; reason?: string }
-  | { action: "fallback_manual"; reason?: string }
-  // Low-level operations kept for backwards compatibility / fine-grained
-  // control if the VLM still emits them; new prompts steer toward
-  // move / put / done.
   | { action: "pickup"; slot: number; reason?: string }
   | { action: "place_one"; slot: number; reason?: string }
   | { action: "place_all"; slot: number; reason?: string }
-  | { action: "take"; slot: number; reason?: string };
+  | { action: "verify_slots"; slots: number[]; reason?: string }
+  | { action: "wait"; holdSteps: number; reason?: string }
+  | { action: "done"; reason?: string }
+  | { action: "fallback_manual"; reason?: string };

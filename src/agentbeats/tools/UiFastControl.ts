@@ -474,7 +474,7 @@ export type PendingClick = {
   /** Kind of click for logging + cleanup-loop guard. */
   kind?: "click" | "cleanup" | "auto_return";
   /** Probe action this click was derived from. */
-  actionKind?: "pickup" | "place_one" | "place_all" | "take";
+  actionKind?: "pickup" | "place_one" | "place_all";
   /** Item name to record at this click's slot on a CV-matched verify
    *  for place_one/place_all clicks. Set at chain-build time from the
    *  source slot's SlotMemory entry. The CV-matched verify is the
@@ -793,6 +793,23 @@ export function servoCursorStep(opts: {
  *  click + verify machinery takes over generically. The probe sees
  *  the raw taskText so it can reason about whatever the goal is. */
 export function planClosedLoopCraft(taskText: string): ClosedLoopCraftPlan {
+  // Auto-lookup recipe at session init. The legacy probeNextCraftAction
+  // used to populate recipeOverride via a "recipe_lookup" action emitted
+  // by the closed-loop probe LLM. With that path removed, the FastUI
+  // Action subagent can no longer emit recipe_lookup (its enum is
+  // pickup/place_one/place_all/verify_slots/wait/done/fallback_manual),
+  // so we have to do the lookup eagerly. parseTargetItem returns null
+  // for tasks that aren't "craft X" / "smelt X" / etc.; in that case
+  // recipeOverride stays null and the FastUI Planner falls back to its
+  // non-recipe branch.
+  let recipeOverride: RecipeInfo | null = null;
+  try {
+    const target = parseTargetItem(taskText);
+    if (target) {
+      const r = lookupRecipe(target);
+      if (r) recipeOverride = r;
+    }
+  } catch { /* leave recipeOverride=null */ }
   return {
     taskText,
     cursor: CURSOR_OPEN_CENTER,
@@ -820,7 +837,7 @@ export function planClosedLoopCraft(taskText: string): ClosedLoopCraftPlan {
     lastProbeCursor: null,
     recentMatchedPickup: false,
     initialSlotBaselines: new Map(),
-    recipeOverride: null,
+    recipeOverride,
     checklist: [],
     activeChecklistIdx: -1,
     judgeAfterChain: false,

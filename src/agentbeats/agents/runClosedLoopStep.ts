@@ -8,7 +8,6 @@ import {
 } from "../McuPrompt";
 import {
   servoCursorStep,
-  lookupRecipe,
   makeServoIntegrator,
 } from "../tools/UiFastControl";
 import { detectCursorWithExpectation, detectGuiLayout, detectGuiSlots, samplePatchFingerprint, samplePatchPixels, patchSimilarity } from "../tools/SlotDetector";
@@ -301,6 +300,23 @@ export async function runClosedLoopStep(
       plan.sessionLayout = liveLayout;
       plan.layoutHint = liveLayout.matchedLayoutId;
       console.log(`[agentbeats] closed-loop session locked: layout=${liveLayout.matchedLayoutId ?? "unknown"} slots=${liveLayout.slots.length}`);
+      // 3x3-vs-2x2 BLOCKED check. If we're locked into the player's
+      // 2x2 craft grid (4 craft cells) but the recipe needs a 3x3
+      // grid, this dispatch can never craft the target — the
+      // GoalPlanner needs to place a crafting_table and re-dispatch.
+      // Emit BLOCKED so the dispatcher routes back. (This used to live
+      // inside the legacy probeNextCraftAction's recipe_lookup handler;
+      // moved here so it fires regardless of which sub-agent path runs.)
+      const recipe = plan.recipeOverride;
+      if (recipe) {
+        const craftCells = liveLayout.slots.filter((s) => s.role === "craft_2x2" || s.role === "craft_3x3").length;
+        const need3x3 = (recipe.inShape && (recipe.inShape.length > 2 || recipe.inShape.some((row: (string | null)[]) => row.length > 2)))
+          || (!recipe.inShape && recipe.ingredients.reduce((sum: number, it: { count: number }) => sum + it.count, 0) > 4);
+        if (need3x3 && craftCells === 4) {
+          console.warn(`[agentbeats] ${recipe.target} needs a 3x3 grid but the open GUI is player_inventory (2x2). Reporting BLOCKED.`);
+          return { kind: "subgoal_failed", reason: `BLOCKED: need a crafting_table 3x3 GUI to craft ${recipe.target}` };
+        }
+      }
     }
     const layout = (plan.sessionLayout as ReturnType<typeof detectGuiLayout> | null) ?? liveLayout;
     if (!layout) {
@@ -1150,262 +1166,6 @@ export async function runClosedLoopStep(
               }
             }
             return { kind: "subgoal_failed", reason: `BLOCKED: ${blockedReason}` };
-          } else if (probed.action === "recipe_lookup") {
-            // Sub-agent recipe query: look up via minecraft-data,
-            // store on the plan for use in subsequent probes' RECIPE
-            // / Placement plan blocks. No clicks; just a state update
-            // and a noop frame so the agent re-probes with the new
-            // RECIPE context.
-            const r = lookupRecipe(probed.item);
-            if (r) {
-              plan.recipeOverride = r;
-              const ingStr = r.ingredients.map((it: { name: string; count: number }) => `${it.count}x ${it.name}`).join(" + ");
-              state.closedLoopHistory.unshift(`recipe_lookup '${probed.item}' -> ${r.target} (${ingStr})`);
-              state.closedLoopHistory = state.closedLoopHistory.slice(0, 5);
-              console.log(`[agentbeats] recipe_lookup '${probed.item}' resolved: ingredients=${ingStr} inShape=${r.inShape ? "yes" : "no"}`);
-              // Hard prerequisite check: a 3x3-shaped recipe (or
-              // shapeless with > 4 unique cells needed) cannot be
-              // crafted in the player_inventory's 2x2 grid. Report
-              // BLOCKED so the GoalPlanner places a crafting_table
-              // and re-dispatches inventory after.
-              const craftCells = layoutForProbe.slots.filter((s) => s.role === "craft_2x2" || s.role === "craft_3x3").length;
-              const need3x3 = (r.inShape && (r.inShape.length > 2 || r.inShape.some((row) => row.length > 2)))
-                || (!r.inShape && r.ingredients.reduce((sum, it) => sum + it.count, 0) > 4);
-              // Only fire when the open GUI has a 2x2 craft area (4 cells)
-              // — that's the player_inventory case where a 3x3 recipe
-              // can't fit. Other GUIs (chest=0, furnace=0, etc.) leave
-              // craftCells at 0 and we don't gate them with this check.
-              if (need3x3 && craftCells === 4) {
-                console.warn(`[agentbeats] ${r.target} needs a 3x3 grid but the open GUI is player_inventory (2x2). Reporting BLOCKED.`);
-                return { kind: "subgoal_failed", reason: `BLOCKED: need a crafting_table 3x3 GUI to craft ${r.target}` };
-              }
-              try {
-                const knownSlotsForPlanner = plan.slotMemory.snapshot()
-                  .filter((e) => e.item && e.item !== "empty")
-                  .map((e) => {
-                    const closest = layoutForProbe.slots.reduce<{ s: typeof layoutForProbe.slots[number] | null; d: number }>(
-                      (acc, s) => {
-                        const d = Math.hypot(s.cx - e.x, s.cy - e.y);
-                        return d < acc.d ? { s, d } : acc;
-                      },
-                      { s: null, d: Number.POSITIVE_INFINITY },
-                    );
-                    return { index: closest.s?.index ?? 0, name: closest.s?.name, item: e.item };
-                  });
-                const cursorHoldingItem = plan.cursorItemSignature
-              ? (plan.cursorItemSignature.item ? `(holding ${plan.cursorItemSignature.item})` : "(holding something)")
-              : null;
-                const { runPlanner } = await import("./subagents/fastUi/Planner");
-                const markedObs = markedObsForLLMs ?? payload.obs ?? "";
-                const layoutSlotsForPlanner = (plan.sessionLayout as { slots: Array<{ index: number; name?: string; role?: string }> } | null)?.slots ?? [];
-                const r0 = await runPlanner({ client: deps.client, model: deps.model, recordDebug: deps.recordDebug }, {
-                  taskText: state.taskText,
-                  subgoalDescription: currentSubgoalDescription,
-                  recipeInfo: r,
-                  knownSlots: knownSlotsForPlanner,
-                  layoutSlots: layoutSlotsForPlanner,
-                  cursorHolding: cursorHoldingItem,
-                  currentChecklist: [],
-                  trigger: "first",
-                  recentHistory: state.closedLoopHistory.slice(0, 3),
-                  obsBase64: markedObs,
-                });
-                plan.checklist = r0.checklist;
-                plan.activeChecklistIdx = r0.kind === "continue" ? r0.nextIdx : -1;
-              } catch (e) {
-                console.warn(`[fastui-planner] initial seed failed: ${e instanceof Error ? e.message : String(e)}`);
-              }
-              // Return a noop frame so the inventory stays open and the
-              // next observation enters with the freshly seeded checklist.
-              // Without this the body falls through to the VLM model
-              // decision path which would press 'inventory' (closing the
-              // GUI) and ruin the session.
-              return { kind: "act", action: defaultMcuAction(), holdSteps: 1 };
-            } else {
-              state.closedLoopHistory.unshift(`recipe_lookup '${probed.item}' -> NOT FOUND in minecraft-data`);
-              state.closedLoopHistory = state.closedLoopHistory.slice(0, 5);
-              console.warn(`[agentbeats] recipe_lookup '${probed.item}' not found; agent should retry with corrected id`);
-            }
-          } else if (probed.action === "move") {
-            // High-level atomic move: pickup `from` -> place at `to`
-            // -> auto-return remainder to `from` (when count=one).
-            // Build the click chain; first click goes to pendingClick,
-            // rest queue in plan.pendingChain and promote on verify.
-            const fromSlot = layoutForProbe.slots[probed.from];
-            const toSlot = layoutForProbe.slots[probed.to];
-            // No-swap invariant. ANY move (count=one or count=all)
-            // into a non-empty destination of a DIFFERENT item is a
-            // destructive swap that wrecks slotMemory tracking. Refuse
-            // unconditionally unless the destination is empty OR
-            // holds the same item as what the cursor would deposit.
-            // Source of truth in priority order:
-            //   (1) slotMemory at toSlot — if it names a known item,
-            //       trust it absolutely (OCR-confirmed or click-
-            //       verified placement).
-            //   (2) cursorItemSignature RGB vs destPatch RGB — fall-
-            //       back when slotMemory has no entry at toSlot but
-            //       the slot still looks filled.
-            //   (3) destPatch.stddev > 35 — last-resort "looks
-            //       filled" indicator.
-            // Skip the guard entirely for from==to (legit auto-return).
-            const fromMem = fromSlot ? plan.slotMemory.lookup(fromSlot.cx, fromSlot.cy) : null;
-            const toMem = toSlot ? plan.slotMemory.lookup(toSlot.cx, toSlot.cy) : null;
-            const cursorItemName = fromMem?.item; // what we'd deposit
-            const destPatch = (toSlot && fromSlot && fromSlot.name !== toSlot.name)
-              ? samplePatchFingerprint(payload.obs, toSlot.cx, toSlot.cy, 12)
-              : null;
-            const sigDist = (destPatch && plan.cursorItemSignature)
-              ? Math.hypot(
-                  destPatch.meanR - plan.cursorItemSignature.meanR,
-                  destPatch.meanG - plan.cursorItemSignature.meanG,
-                  destPatch.meanB - plan.cursorItemSignature.meanB,
-                )
-              : null;
-            const destKnownDifferent = !!(toMem && toMem.item !== "empty" && toMem.item !== "unknown" && cursorItemName && toMem.item !== cursorItemName);
-            // CV fallback fires only when slotMemory has NO entry at
-            // the destination AND we have an active cursor signature
-            // to compare against. Without a cursor signature the
-            // stddev test alone has way too many false positives
-            // (shadow borders between craft cells read as filled).
-            // If neither slotMemory nor cursor signature gives a
-            // definitive signal, PROCEED — the click verifier will
-            // catch any real post-place mismatch.
-            const destPatchSameItem = sigDist !== null && sigDist < 30;
-            const destPatchFilledDifferent = !!destPatch && destPatch.stddev > 35 && plan.cursorItemSignature !== null && !destPatchSameItem;
-            const destLooksFilled = destKnownDifferent || (!toMem && destPatchFilledDifferent);
-            if (deps.debugDir && destPatch && toSlot) {
-              void deps.recordDebug("pre_check_move", {
-                type: "pre_check_move",
-                iteration: plan.iteration,
-                step,
-                data: {
-                  from: { index: probed.from, name: fromSlot?.name },
-                  to: { index: probed.to, name: toSlot.name, cx: toSlot.cx, cy: toSlot.cy },
-                  count: probed.count,
-                  destPatch: { meanR: destPatch.meanR, meanG: destPatch.meanG, meanB: destPatch.meanB, stddev: destPatch.stddev },
-                  decision: destLooksFilled ? "REFUSE_FILLED" : "PROCEED",
-                },
-              });
-            }
-            if (!fromSlot || !toSlot) {
-              console.warn(`[agentbeats] move from=${probed.from} to=${probed.to}: slot(s) not in layout (have ${layoutForProbe.slots.length}); skipping`);
-            } else if (destLooksFilled) {
-              const reason = destKnownDifferent
-                ? `slotMemory says toSlot has ${toMem!.item} (cursor would deposit ${cursorItemName})`
-                : `CV says destination filled (stddev=${destPatch!.stddev.toFixed(1)})`;
-              console.warn(`[agentbeats] move to=${probed.to}(${toSlot.name ?? "?"}) refused: ${reason}; would trigger item swap. Re-judging.`);
-              state.closedLoopHistory.unshift(`refused move to=${probed.to}(${toSlot.name ?? "?"}) (${reason}; pick a visually empty slot)`);
-              state.closedLoopHistory = state.closedLoopHistory.slice(0, 5);
-              // Mark active subtask attempts++ and arm Planner re-
-              // judge so the next iter dispatches a different target
-              // slot. Returning a noop frame keeps the inventory
-              // open — falling through to the parent VLM here would
-              // press 'inventory' and close the GUI mid-craft.
-              const activeItem = plan.checklist[plan.activeChecklistIdx];
-              if (activeItem) activeItem.attempts = (activeItem.attempts ?? 0) + 1;
-              plan.judgeAfterChain = true;
-              return { kind: "act", action: defaultMcuAction(), holdSteps: 1 };
-            } else if (
-              plan.pickupSourceSlot
-              && plan.pickupSourceSlot.name
-              && toSlot.name === plan.pickupSourceSlot.name
-              && fromSlot.name !== plan.pickupSourceSlot.name
-            ) {
-              // Hard guard: VLM is asking to dump cursor contents into
-              // the slot we just refilled with the original ingredient
-              // via auto-return. This always triggers an item swap
-              // (e.g. crafted planks <-> log stack). Refuse and force
-              // the VLM to pick a different empty slot. Exception:
-              // a self-move (from==to) is the legit auto-return itself.
-              console.warn(`[agentbeats] move to=${probed.to}(${toSlot.name}) refused: that's the recorded pickup source slot which still holds the original ingredient -- placing here would swap items. Reprobe`);
-              state.closedLoopHistory.unshift(`refused move to=${probed.to}(${toSlot.name}) (would swap with returned ingredient stack)`);
-              state.closedLoopHistory = state.closedLoopHistory.slice(0, 5);
-            } else {
-              // Capture source slot's item name so we can record it
-              // at the destination on a CV-matched place verify --
-              // place_one from a 64-stack leaves source visually
-              // unchanged, so the pure-CV disappear scan can't tell
-              // the item moved. The matched-click verify is the CV
-              // evidence; the source memory entry is the identity.
-              const fromMem = plan.slotMemory.lookup(fromSlot.cx, fromSlot.cy);
-              // If the source is the recipe result slot, the recipe defines
-              // what's being taken — even though no OCR ever ran on the
-              // result slot. This lets the take destination get a correct
-              // slotMemory write on matched verify, which in turn makes
-              // Known show the target item and lets the next probe judge
-              // the task complete instead of looping take->take forever.
-              const placedItemName =
-                fromMem?.item
-                ?? (fromSlot.role === "result" && plan.recipeOverride ? plan.recipeOverride.target : undefined);
-              // Capture source's RGB fingerprint for CV-based placement
-              // tracking. Prefer slotMemory baseline (set at OCR-confirm
-              // time / first probe Pass A). Fallback to a fresh sample
-              // of the source slot at chain-build time. The destination
-              // verify will compare its post-fill fp against this.
-              const sourceFp = fromMem?.fingerprint
-                ?? samplePatchFingerprint(payload.obs, fromSlot.cx, fromSlot.cy, 6) ?? undefined;
-              const mkClick = (s: { index: number; name?: string; role?: string; cx: number; cy: number }, button: "attack" | "use", expectAfter: "should_empty" | "should_fill", actionKind: "pickup" | "place_one" | "place_all" | "take", kind: "click" | "auto_return", placedItemName?: string, sourceFp?: { meanR: number; meanG: number; meanB: number; stddev: number }): import("../tools/UiFastControl").PendingClick => ({
-                rasterIndex: s.index, slotName: s.name, slotRole: s.role,
-                frozenTarget: { x: s.cx, y: s.cy },
-                button, shift: false, expectAfter,
-                phase: "servo", retries: 0, kind, actionKind,
-                ...(placedItemName ? { placedItemName } : {}),
-                ...(sourceFp ? { sourceFp } : {}),
-              });
-              const chain: import("../tools/UiFastControl").PendingClick[] = [];
-              chain.push(mkClick(fromSlot, "attack", "should_empty", "pickup", "click", undefined, sourceFp));
-              if (probed.count === "all") {
-                chain.push(mkClick(toSlot, "attack", "should_fill", "place_all", "click", placedItemName, sourceFp));
-              } else {
-                chain.push(mkClick(toSlot, "use", "should_fill", "place_one", "click", placedItemName, sourceFp));
-                chain.push(mkClick(fromSlot, "attack", "should_fill", "place_all", "auto_return", undefined, sourceFp));
-              }
-              // Only record pickupSourceSlot when picking from a real
-              // ingredient source (hotbar/main_inv). Moves whose source
-              // is the result slot or a craft grid slot must NOT
-              // overwrite the recorded source -- that source is the
-              // slot we need to AVOID dumping crafted output into.
-              const fromIsIngredientSource =
-                fromSlot.role === "hotbar" || fromSlot.role === "main_inv";
-              if (fromIsIngredientSource) {
-                plan.pickupSourceSlot = { index: fromSlot.index, name: fromSlot.name };
-                console.log(`[agentbeats] recorded pickupSourceSlot=${fromSlot.index} (${fromSlot.name ?? "?"}) for move`);
-              }
-              plan.pendingClick = chain.shift()!;
-              plan.pendingChain = chain;
-              plan.servoSteps = 0;
-              state.closedLoopHistory.unshift(`move ${fromSlot.name ?? probed.from} -> ${toSlot.name ?? probed.to} (count=${probed.count ?? "one"})`);
-              state.closedLoopHistory = state.closedLoopHistory.slice(0, 5);
-              console.log(`[agentbeats] closed-loop probe iter=${plan.iteration}: move from=${probed.from}(${fromSlot.name ?? "?"}) to=${probed.to}(${toSlot.name ?? "?"}) count=${probed.count ?? "one"} reason=${probed.reason ?? ""}; chain=${chain.length + 1} clicks`);
-            }
-          } else if (probed.action === "put") {
-            const dest = layoutForProbe.slots[probed.slot];
-            // Same swap guard as for move count=all: refuse if dest looks filled.
-            if (dest) {
-              const putPatch = samplePatchFingerprint(payload.obs, dest.cx, dest.cy, 12);
-              if (putPatch && putPatch.stddev > 35) {
-                console.warn(`[agentbeats] put slot=${probed.slot}(${dest.name ?? "?"}) refused: destination looks FILLED (stddev=${putPatch.stddev.toFixed(1)} > 35); would trigger an item swap. Reprobe`);
-                state.closedLoopHistory.unshift(`refused put slot=${probed.slot}(${dest.name ?? "?"}) (destination already has an item; pick a visually empty slot)`);
-                state.closedLoopHistory = state.closedLoopHistory.slice(0, 5);
-                // Skip building the click; fall through to next obs which reprobes.
-                return { kind: "act", action: defaultMcuAction(), holdSteps: 1 };
-              }
-            }
-            if (!dest) {
-              console.warn(`[agentbeats] put slot=${probed.slot}: not in layout; skipping`);
-            } else {
-              plan.pendingClick = {
-                rasterIndex: dest.index, slotName: dest.name, slotRole: dest.role,
-                frozenTarget: { x: dest.cx, y: dest.cy },
-                button: "attack", shift: false, expectAfter: "should_fill",
-                phase: "servo", retries: 0, kind: "click", actionKind: "place_all",
-              };
-              plan.pendingChain = [];
-              plan.servoSteps = 0;
-              state.closedLoopHistory.unshift(`put -> ${dest.name ?? probed.slot}`);
-              state.closedLoopHistory = state.closedLoopHistory.slice(0, 5);
-              console.log(`[agentbeats] closed-loop probe iter=${plan.iteration}: put slot=${probed.slot}(${dest.name ?? "?"}) reason=${probed.reason ?? ""}`);
-            }
           } else if (probed.action === "verify_slots") {
             // Guard: MC suppresses slot tooltips while the cursor
             // holds an item. Trust the runtime-tracked
@@ -1522,58 +1282,11 @@ export async function runClosedLoopStep(
               console.warn(`[agentbeats] probe asked for pickup at slot ${probed.slot} but cursor holds ${plan.cursorItemSignature.item} (per tracked state); refusing -- will reprobe`);
               state.closedLoopHistory.unshift(`refused pickup slot=${probed.slot} (cursor holding ${plan.cursorItemSignature.item})`);
               state.closedLoopHistory = state.closedLoopHistory.slice(0, 5);
-            } else if (probed.action === "take" && plan.cursorItemSignature?.item) {
-              console.warn(`[agentbeats] probe asked for take at slot ${probed.slot} but cursor holds ${plan.cursorItemSignature.item} (per tracked state); refusing -- will reprobe`);
-              state.closedLoopHistory.unshift(`refused take slot=${probed.slot} (cursor holding ${plan.cursorItemSignature.item})`);
-              state.closedLoopHistory = state.closedLoopHistory.slice(0, 5);
             } else {
               if (probed.action === "pickup"
                   && (probedSlot.role === "hotbar" || probedSlot.role === "main_inv")) {
                 plan.pickupSourceSlot = { index: probed.slot, name: probedSlot.name };
-                console.log(`[agentbeats] recorded pickupSourceSlot=${probed.slot} (${probedSlot.name ?? "?"}) for legacy pickup`);
-              }
-              // Pre-take auto-return: "take" requires an empty cursor
-              // (otherwise it does nothing in MC). If we have a
-              // recorded pickup source, schedule a place_all back to
-              // it FIRST. Next probe will re-issue take when result
-              // slot is still filled and cursor is now empty.
-              // Putting auto-return here (just in front of crafting)
-              // instead of after every place_one keeps multi-slot
-              // recipes working: leftover stays in the cursor across
-              // multiple place_one calls until the recipe is ready.
-              if (probed.action === "take"
-                  && plan.pickupSourceSlot
-                  && plan.pickupSourceSlot.name
-                  && plan.cursorItemSignature?.item) {
-                const ret = layoutForProbe.slots.find((s) => s.name === plan.pickupSourceSlot!.name);
-                if (ret) {
-                  console.log(`[agentbeats] PRE-TAKE AUTO_RETURN: scheduling place_all back to ${ret.name} (raster=${ret.index}) before take`);
-                  plan.pendingClick = {
-                    rasterIndex: ret.index,
-                    slotName: ret.name,
-                    slotRole: ret.role,
-                    frozenTarget: { x: ret.cx, y: ret.cy },
-                    button: "attack",
-                    shift: false,
-                    expectAfter: "should_fill",
-                    phase: "servo",
-                    retries: 0,
-                    kind: "auto_return",
-                    actionKind: "place_all",
-                  };
-                  plan.servoSteps = 0;
-                  state.closedLoopHistory.unshift(`auto_return -> ${ret.name} (before take)`);
-                  state.closedLoopHistory = state.closedLoopHistory.slice(0, 5);
-                  return { kind: "act", action: defaultMcuAction(), holdSteps: 1 };
-                }
-                // Original pickup slot is no longer in the layout
-                // (e.g. layout reset, slot rearranged). Skip the take
-                // and surface to the LLM so it picks a fallback dump
-                // slot for the leftover via the next probe.
-                console.warn(`[agentbeats] PRE-TAKE AUTO_RETURN: original source slot "${plan.pickupSourceSlot.name}" not in current layout; skipping take so next probe can choose a fallback dump slot`);
-                state.closedLoopHistory.unshift(`auto_return blocked: source ${plan.pickupSourceSlot.name} not in layout; please place_all leftover into any empty main_inv slot before take`);
-                state.closedLoopHistory = state.closedLoopHistory.slice(0, 5);
-                return { kind: "act", action: defaultMcuAction(), holdSteps: 1 };
+                console.log(`[agentbeats] recorded pickupSourceSlot=${probed.slot} (${probedSlot.name ?? "?"}) for pickup`);
               }
               // Click-mode sentinel: place_all with empty expectedItem
               // is a button click (e.g. enchant offer, trade offer,
@@ -1611,7 +1324,7 @@ export async function runClosedLoopStep(
                 phase: "servo",
                 retries: 0,
                 kind: "click",
-                actionKind: probed.action as "pickup" | "place_one" | "place_all" | "take",
+                actionKind: probed.action as "pickup" | "place_one" | "place_all",
                 ...(placedItemName ? { placedItemName } : {}),
               };
               plan.servoSteps = 0;
