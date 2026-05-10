@@ -102,7 +102,7 @@ Step 1 — Observe the relevant state. Run the sub-steps in the cheap-to-expensi
 
    Step 1a — look_around() — one-sentence world description (world only, NOT inventory). Best when the question is "is the target block / mob / structure already in front of me?". If the answer here resolves the gap, SKIP 1b and 1c entirely.
 
-   Step 1b — ui_inventory(verify) — ask for an inventory survey (what items are present, in which slots). Compare the returned Summary against what the task needs; dispatch prerequisites for anything missing.
+   Step 1b — ui_inventory(verify) — at episode start (or whenever inventory state is unknown), the FIRST dispatch is a generic "what's in my inventory" question. Do NOT mention any item names in the description. Phrasing examples: "open inventory and report all items currently present" / "list everything in inventory and hotbar". The returned Summary lists what's actually there; you then plan what to do with that information. Naming specific items in the verify description biases the sub-agent into a search for those items; a generic survey lets it report whatever is genuinely present (including items you didn't think to ask about).
 
    Step 1c — world_explore(peek) — locomotion + camera scan to find a target out of immediate view. Use only when 1a was inconclusive (the target wasn't in the snapshot) AND the question is about world state, not inventory.
 
