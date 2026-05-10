@@ -91,8 +91,28 @@ export async function dispatchObservation(
   // through to the regular closed-loop step. Once the opener reports done,
   // the next observation should see the GUI open and closedLoopStep takes
   // over normally. On fail (target_ui_not_in_view) escalate to the planner.
-  // Decrement cooldown each frame; skip opener creation while non-zero.
-  if (state.worldBlockOpenerCooldown > 0) state.worldBlockOpenerCooldown -= 1;
+  //
+  // Cooldown handling: after WBO returns done it sets the cooldown so we
+  // actively wait for MC to render the just-opened block GUI. The wait is
+  // not a fixed sleep — each frame we recheck guiOpen; the moment it turns
+  // true we drop the cooldown to 0 and fall through to closedLoopStep on
+  // the same frame. If guiOpen never turns true within the budget, the
+  // counter expires and closedLoopStep runs anyway (it will then bail
+  // with "inventory window no longer visible" and the planner will pick
+  // up the failure via target_ui_not_in_view recovery).
+  //
+  // The previous implementation only blocked WBO re-creation during the
+  // cooldown but let runClosedLoopStep run, which would CV-detect "no
+  // GUI" before MC had even rendered the GUI and reset the session,
+  // permanently losing the just-opened crafting_table.
+  if (state.worldBlockOpenerCooldown > 0) {
+    if (guiOpen) {
+      state.worldBlockOpenerCooldown = 0;
+    } else {
+      state.worldBlockOpenerCooldown -= 1;
+      return NOOP_ONE;
+    }
+  }
   if (
     current.kind === "ui_inventory"
     && current.gui_target
