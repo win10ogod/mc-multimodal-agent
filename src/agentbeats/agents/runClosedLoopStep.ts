@@ -1912,24 +1912,50 @@ export async function runClosedLoopStep(
                 plan.slotMemory.record(changedSlotLayout.cx, changedSlotLayout.cy, itemToRecord, plan.iteration, fp, newPatch ?? undefined);
                 console.log(`[agentbeats] place confirmed: ${slotLabel} item=${itemToRecord}`);
               }
-              // Decide swap-vs-clean-place using slotMemory as ground
-              // truth, not the classifier's "swapped" label. The classifier
-              // labels "swapped" when isPatchFilled(before)=true AND
-              // isPatchFilled(after)=true, but isPatchFilled has false
-              // positives on actually-empty slots (cursor sprite drift,
-              // hover highlight, render noise can push fg pixel count
-              // above its threshold). slotMemory is OCR-confirmed and
-              // authoritative — trust it.
+              // Decide swap-vs-stack-vs-clean-place using slotMemory as
+              // ground truth, not the classifier's "swapped" label. The
+              // classifier emits "swapped" whenever both before AND after
+              // are isPatchFilled — that covers three distinct MC outcomes:
+              //   1. real swap (cursor item ≠ slot item) → cursor takes
+              //      on slot's previous item.
+              //   2. stack (cursor item === slot item) → cursor keeps
+              //      identity, count decrements; for place_all the whole
+              //      stack merges and cursor goes empty.
+              //   3. classifier false-positive (slot was actually empty
+              //      per slotMemory; isPatchFilled noise on the before
+              //      patch) → treat as clean empty→filled.
               const slotWasGenuinelyHeld = slotPreviousItem
                 && slotPreviousItem !== "empty"
                 && slotPreviousItem !== "unknown";
-              const wasReallySwap = change === "swapped" && slotWasGenuinelyHeld;
-              if (wasReallySwap) {
+              const cursorItem = plan.cursorItemSignature?.item;
+              const isStack = change === "swapped"
+                && slotWasGenuinelyHeld
+                && cursorItem
+                && slotPreviousItem === cursorItem;
+              const isRealSwap = change === "swapped"
+                && slotWasGenuinelyHeld
+                && cursorItem
+                && slotPreviousItem !== cursorItem;
+              if (isRealSwap) {
                 // MC swap: cursor's old item went into the slot, slot's
-                // old item is now on the cursor. Update cursorItemSignature
-                // to the slot's previous contents.
+                // old item is now on the cursor.
                 plan.cursorItemSignature = { meanR: 0, meanG: 0, meanB: 0, item: slotPreviousItem };
-                console.log(`[agentbeats] swap detected → cursor now holds '${slotPreviousItem}' (slot's previous item)`);
+                console.log(`[agentbeats] swap detected → cursor now holds '${slotPreviousItem}' (slot's previous item; placed item went into slot)`);
+              } else if (isStack) {
+                // Cursor's item stacked onto the slot's existing same item.
+                // Identity unchanged. For place_all the whole cursor stack
+                // merges into the slot → cursor empty. For place_one a
+                // single item moves over; cursor still holds (count-1).
+                if (intentKind === "place_all") {
+                  plan.cursorItemSignature = null;
+                  state.closedLoopHistory.unshift(`stack_merge place_all ${cursorItem} → ${slotLabel}; cursor cleared`);
+                  state.closedLoopHistory = state.closedLoopHistory.slice(0, 5);
+                  console.log(`[agentbeats] stack detected (place_all same-item) → cursor cleared (whole stack merged into ${slotLabel})`);
+                } else {
+                  state.closedLoopHistory.unshift(`stack_one ${cursorItem} → ${slotLabel}; cursor still holds ${cursorItem}`);
+                  state.closedLoopHistory = state.closedLoopHistory.slice(0, 5);
+                  console.log(`[agentbeats] stack detected (place_one same-item) → cursor keeps holding '${cursorItem}' (count-1; ${slotLabel} now has one more)`);
+                }
               } else {
                 // empty→filled (clean place into an empty slot), OR a
                 // false "swapped" label that was actually a clean place
