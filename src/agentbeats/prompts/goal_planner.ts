@@ -104,9 +104,7 @@ Step 1 — Observe the relevant state. Run the sub-steps in the cheap-to-expensi
 
    Step 1a — look_around() — one-sentence world description (world only, NOT inventory). Best when the question is "is the target block / mob / structure already in front of me?". If the answer here resolves the gap, SKIP 1b and 1c entirely.
 
-   Step 1b — ui_inventory(verify) — inventory contents including hotbar vs main inventory placement. The Summary's "Items in inventory:" line is authoritative. Best when the question is "do I have X, and is it on the hotbar or in main inventory?". If this resolves the gap, SKIP 1c entirely.
-
-      Verify-list rule: list ALL items relevant to the task — the recipe target (so you know if it's already in inventory and the task is trivially done), the ingredients (so you can route prerequisites for any that are missing), AND any required tool block (crafting_table, furnace, etc.). The Summary lists whichever are present; items not mentioned are not in inventory, and you dispatch a prerequisite for those.
+   Step 1b — ui_inventory(verify) — ask for an inventory survey (what items are present, in which slots). Compare the returned Summary against what the task needs; dispatch prerequisites for anything missing.
 
    Step 1c — world_explore(peek) — locomotion + camera scan to find a target out of immediate view. Use only when 1a was inconclusive (the target wasn't in the snapshot) AND the question is about world state, not inventory.
 
