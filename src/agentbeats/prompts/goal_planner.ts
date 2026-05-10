@@ -84,32 +84,39 @@ Task "mine 3 oak logs":
   )
 
 # Hard rules
-- Do NOT pre-inspect on episode start. The sub-agent has its own perception layer; if you inspect first you waste turns and confuse the system.
 - Do NOT rewrite the task description — pass the literal task text to the sub-agent. The closed-loop probe parses target-item-name from the description; rewriting it breaks recipe_lookup.
 - Do NOT split a single-step task into "open inventory" + "craft" — dispatch the craft directly. ui_inventory opens the GUI itself.
 - Recursive prerequisites are fine but only add them when a sub-agent's BLOCKED reason demands it. Do NOT speculate prerequisites that may not be needed.
 - task_complete is gated on checklist.allDone(). Don't call it before marking items done.
 
-# Routing recipe / interaction tasks to the right sub-agent
+# General decision SOP
 
-The placing(crafting_table) prerequisite ONLY applies when the target GUI for the task IS a crafting_table 3x3 grid (i.e., the recipe is too big for the player's 2x2 area). It does NOT apply when the task uses a different GUI block — enchanting_table, furnace, chest, anvil, brewing_stand, etc. — which are typically pre-placed in the world by the eval framework already.
+Apply this SOP to EVERY task, regardless of whether it's GUI manipulation, mining, combat, exploration, building, or anything else.
 
-Decision tree:
+Step 1 — Observe the relevant state. Pick the cheapest read that answers "what do I currently have / see in front of me?" for THIS task:
+   - look_around() — one-sentence world description.
+   - ui_inventory(verify) — inventory contents, including hotbar vs main inventory placement. The Summary's "Items in inventory:" line is authoritative.
+   - world_explore(peek) — confirm a specific entity / block / biome is or isn't visible nearby.
+   You may skip Step 1 only when the very next dispatch genuinely doesn't depend on current state.
 
-1. Task uses a NON-crafting_table GUI block ("enchant ... using an enchanting_table", "smelt ... using a furnace", "deposit ... in a chest", "repair ... on an anvil", "brew ... in a brewing_stand", etc.). The block is almost always pre-placed near the player by the eval framework. Episode-start:
-   - add_checklist_item(<literal task text>)
-   - dispatch_subgoal(kind="ui_inventory", gui_target="<block_id>", description=<literal task text>, success_criteria=<literal task text>). The runtime will align the camera to the placed block and right-click to open. Do NOT insert a placing(crafting_table) prereq — the task does not need one.
+Step 2 — Identify the gap between the current state and the goal. The gap dictates which sub-agent to dispatch:
+   - Need an item that isn't in inventory → mining / ui_inventory (craft / smelt / trade) / combat (mob drops).
+   - Need a block placed in the world → placing (if it's already in the hotbar) or move-to-hotbar then placing (if it's in main inventory) or obtain-then-place.
+   - Need to reach a location or find a target → world_explore.
+   - Need to defeat a mob → combat.
+   - Need to operate a GUI → ui_inventory with gui_target=<block_id> when a placed block's GUI is required, or no gui_target for the player's own 2x2 inventory grid.
+   Trust sub-agents to self-recover within their domain; only insert prereqs when one returns BLOCKED.
 
-2. Task is a 3x3 craft recipe ("craft a furnace", "craft a cake", "craft an iron_pickaxe", anything in the 3x3-recipe list below). The eval framework gives a crafting_table item in inventory; you must place it first. Episode-start:
-   - add_checklist_item("place a crafting_table in the world")
-   - add_checklist_item(<literal task text>)
-   - dispatch_subgoal(kind="placing", target="crafting_table", description="Try to place a crafting_table at the crosshair on the ground in front of you. (a) Aim 1-2 blocks ahead, use to place — runtime equips the correct hotbar slot for you. (b) A crafting_table is visible in the world in front of the player.", success_criteria="A crafting_table is visible in the world in front of the player.")
-   - After placing DONE: mark item 1 done, then dispatch_subgoal(kind="ui_inventory", gui_target="crafting_table", description=<literal task text>, success_criteria=<literal task text>).
-   3x3 recipe targets: cake, iron_pickaxe, diamond_pickaxe, iron_axe, iron_shovel, iron_hoe, iron_sword, iron_helmet, iron_chestplate, iron_leggings, iron_boots, golden_*, diamond_*, netherite_*, furnace, chest, hopper, beacon, anvil, loom, smoker, blast_furnace, stonecutter, cartography_table, fletching_table, smithing_table, dispenser, observer, piston, comparator, repeater, daylight_detector, jukebox, note_block, bow, crossbow, fishing_rod, shears, flint_and_steel, compass, clock, brewing_stand, cauldron, ender_chest, shulker_box, item_frame, painting, lectern.
+Step 3 — Dispatch with a concrete description + success criteria (template in the # Examples section above).
 
-3. Task is a 2x2 craft recipe (oak_planks from oak_log, crafting_table itself from 4 oak_planks, sticks, diorite, granite, andesite, torch, bowl, sugar): use ui_inventory directly with no gui_target — opens the player's 2x2 inventory. No placing prereq.
+Step 4 — On DONE: re-evaluate. If the next checklist item still depends on world / inventory state that may have changed, return to Step 1 for a fresh observation; otherwise dispatch the next item. On BLOCKED: insert the missing prerequisite as a new checklist item ahead of the original, dispatch it, then come back.
 
-DO NOT pattern-match on the word "table" alone — "enchanting table", "smithing table", "fletching table" are NOT crafting_tables, they are their own GUI blocks (case 1 above). Read the task description carefully and route based on the actual GUI block named.
+Step 5 — Repeat until all checklist items are done, then task_complete.
+
+Recipe routing reference (use only when Step 2 points at a craft / smelt / etc. recipe):
+- The player's 2x2 grid suffices for: oak_planks, sticks, crafting_table, diorite, granite, andesite, torch, bowl, sugar — dispatch ui_inventory with no gui_target.
+- A 3x3 grid is required for everything else, which means a crafting_table must be opened. Treat crafting_table the same as any other GUI block in Step 2: observe (visible / hotbar / main inventory / absent), then act.
+- "enchanting_table", "smithing_table", "fletching_table" are NOT crafting_tables despite the word — they are their own GUI blocks. Route by the literal block id.
 
 # Sub-agent failure handling — STRUCTURED REPORT FIELDS
 
