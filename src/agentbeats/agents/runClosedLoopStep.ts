@@ -1896,6 +1896,12 @@ export async function runClosedLoopStep(
                 const id = identifyChangedSlot(newPatch, known);
                 if (id) placedItem = id.item;
               }
+              // Capture the slot's PREVIOUS item BEFORE we overwrite the
+              // slotMemory entry — needed below for the swap case to set
+              // cursor identity to what the slot used to hold.
+              const slotPreviousItem = changedSlotLayout
+                ? plan.slotMemory.lookup(changedSlotLayout.cx, changedSlotLayout.cy)?.item
+                : undefined;
               if (changedSlotLayout) {
                 // ALWAYS record — the slot is deterministically filled
                 // per the verify outcome. If we don't know the item,
@@ -1906,15 +1912,32 @@ export async function runClosedLoopStep(
                 plan.slotMemory.record(changedSlotLayout.cx, changedSlotLayout.cy, itemToRecord, plan.iteration, fp, newPatch ?? undefined);
                 console.log(`[agentbeats] place confirmed: ${slotLabel} item=${itemToRecord}`);
               }
-              // place_all deterministically empties the cursor (drops
-              // the whole stack). Don't gate on cursorChange detection —
-              // the BG-masked diff is too fragile to be load-bearing.
-              if (intentKind === "place_all") {
-                plan.cursorItemSignature = null;
-                console.log(`[agentbeats] place_all confirmed → cursor cleared`);
-              } else if (diff.cursorChange === "holding→empty") {
-                plan.cursorItemSignature = null;
-                console.log(`[agentbeats] cursor empty after place`);
+              if (change === "swapped") {
+                // MC swap: cursor's old item went into the slot, slot's
+                // old item is now on the cursor. Update cursorItemSignature
+                // to the slot's previous contents (if known) so subsequent
+                // dispatches see the correct held item. Applies to BOTH
+                // place_one and place_all — both swap when the dest slot
+                // already holds a different item.
+                if (slotPreviousItem && slotPreviousItem !== "empty" && slotPreviousItem !== "unknown") {
+                  plan.cursorItemSignature = { meanR: 0, meanG: 0, meanB: 0, item: slotPreviousItem };
+                  console.log(`[agentbeats] swap detected → cursor now holds '${slotPreviousItem}' (slot's previous item)`);
+                } else {
+                  plan.cursorItemSignature = { meanR: 0, meanG: 0, meanB: 0 };
+                  console.log(`[agentbeats] swap detected → cursor holds something (slot's previous item unknown)`);
+                }
+              } else {
+                // change === "empty→filled" — clean place into an empty slot.
+                if (intentKind === "place_all") {
+                  // Whole stack dropped, cursor empty.
+                  plan.cursorItemSignature = null;
+                  console.log(`[agentbeats] place_all confirmed → cursor cleared`);
+                } else if (diff.cursorChange === "holding→empty") {
+                  plan.cursorItemSignature = null;
+                  console.log(`[agentbeats] cursor empty after place`);
+                }
+                // place_one with empty→filled: cursor still holds (stack-1).
+                // No cursorItemSignature change needed.
               }
             }
             // Bonus side-effect changes (e.g. result slot auto-fills

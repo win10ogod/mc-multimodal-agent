@@ -199,8 +199,13 @@ function compileCursorMove(
 // --- Task-text -> recipe lookup ------------------------------------------
 
 const TARGET_PATTERNS: RegExp[] = [
-  /craft(?:\s+(?:a|the|to|some|an))?\s+([a-z][a-z_\s]+?)(?:\s+(?:from|using|with|for)\b|\.|$)/i,
-  /craft\s+([a-z][a-z_\s]+)/i,
+  // Craft / smelt / brew / enchant — capture the target item name
+  // and stop at the first prepositional verb. "to" is a stop-word
+  // because tasks often say "craft an enchanting table to enchant
+  // your items" — without "to" in the stop list the capture
+  // greedily eats the rest of the sentence and produces garbage.
+  /(?:craft|smelt|brew|enchant)(?:\s+(?:a|the|some|an))?\s+([a-z][a-z_\s]+?)(?:\s+(?:from|using|with|for|to|on|at|in|into)\b|\.|$)/i,
+  /(?:craft|smelt|brew|enchant)\s+([a-z][a-z_\s]+?)(?:\s|\.|$)/i,
 ];
 
 function normalizeItemName(raw: string): string {
