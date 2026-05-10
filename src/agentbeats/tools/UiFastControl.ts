@@ -644,6 +644,15 @@ export type ClosedLoopCraftPlan = {
    *  Cleared after a successful chain-end so the Planner can pick
    *  the next [ ] on its next turn. */
   activeChecklistIdx: number;
+  /** Per-subtask set of slot indices the runtime has already OCR'd
+   *  for the active verify_items_visible. Reset on any non-verify
+   *  probed action (a real action breaks the verify streak). The
+   *  verify_slots handler skips re-OCR for slots already in the
+   *  tracker, surfaces "already known" notes via recent_history,
+   *  and force-marks the subtask done when every newly requested
+   *  slot is already in the tracker — i.e. the LLM is just
+   *  re-asking about slots it already saw. */
+  verifyCheckedSlots: Set<number>;
   /** Set true on a chain-end where source slot was role==="result".
    *  The runtime fires the Planner agent on the next entry to update
    *  the checklist + judge completion. */
@@ -840,6 +849,7 @@ export function planClosedLoopCraft(taskText: string): ClosedLoopCraftPlan {
     recipeOverride,
     checklist: [],
     activeChecklistIdx: -1,
+    verifyCheckedSlots: new Set<number>(),
     judgeAfterChain: false,
     cursorVerifyJob: null,
   };

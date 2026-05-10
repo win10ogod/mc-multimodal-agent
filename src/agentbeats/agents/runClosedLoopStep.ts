@@ -1094,6 +1094,11 @@ export async function runClosedLoopStep(
             });
           }
           plan.iteration += 1;
+          // Reset the verify-slot tracker on any non-verify_slots
+          // probed action — a real action breaks the streak.
+          if (probed && probed.action !== "verify_slots") {
+            plan.verifyCheckedSlots.clear();
+          }
           if (!probed) {
             // Probe failed to return an action — invalidate the SoM
             // session so the next frame redetects (some slots may have
@@ -1167,6 +1172,59 @@ export async function runClosedLoopStep(
             }
             return { kind: "subgoal_failed", reason: `BLOCKED: ${blockedReason}` };
           } else if (probed.action === "verify_slots") {
+            // Slot tracker — skip re-OCR on slots already checked this
+            // verify-streak. Filter the requested slots into "new" and
+            // "already-checked" buckets. If the new bucket is empty, the
+            // Action LLM is just re-asking about slots it already saw —
+            // force-mark the active subtask done with a "no more
+            // interesting spots" reason. For the already-checked slots,
+            // surface their known item via recent_history so the next
+            // Action call sees "slot N already known: item; skipped
+            // re-check" and stops asking.
+            const requestedSlots = (probed.slots ?? []).slice();
+            const alreadyChecked: number[] = [];
+            const newSlots: number[] = [];
+            for (const idx of requestedSlots) {
+              if (plan.verifyCheckedSlots.has(idx)) alreadyChecked.push(idx);
+              else newSlots.push(idx);
+            }
+            if (alreadyChecked.length > 0) {
+              const layoutForNote = (plan.sessionLayout as ReturnType<typeof detectGuiLayout> | null) ?? null;
+              const notes = alreadyChecked.map((idx) => {
+                const sl = layoutForNote?.slots[idx];
+                const mem = sl ? plan.slotMemory.lookup(sl.cx, sl.cy) : null;
+                const item = mem?.item ?? "(empty / unknown)";
+                return `slot ${idx} already checked → ${item}`;
+              });
+              state.closedLoopHistory.unshift(`already_checked: ${notes.join("; ")}; please avoid re-checking the same slot in a row`);
+              state.closedLoopHistory = state.closedLoopHistory.slice(0, 5);
+              console.log(`[agentbeats] verify_slots: ${alreadyChecked.length}/${requestedSlots.length} slots already checked this subtask: ${alreadyChecked.join(",")}`);
+            }
+            if (newSlots.length === 0) {
+              // Every requested slot has already been OCR'd in this
+              // verify-streak. The Action keeps re-asking about slots
+              // it's already seen — treat as scan-complete and let the
+              // Planner re-judge with what we found.
+              const activeItem = plan.checklist[plan.activeChecklistIdx];
+              const reason = `Agent keep checking same slot, the job is marked as done as there no more interesting spot the verify`;
+              if (activeItem) {
+                activeItem.done = true;
+                console.warn(`[agentbeats] verify scan-complete: ${reason}; force-marking subtask '${activeItem.id}' done`);
+              }
+              plan.judgeAfterChain = true;
+              plan.verifyCheckedSlots.clear();
+              state.closedLoopHistory.unshift(`verify_scan_complete ${activeItem?.id ?? "?"}: ${reason}`);
+              state.closedLoopHistory = state.closedLoopHistory.slice(0, 5);
+              return { kind: "act", action: defaultMcuAction(), holdSteps: 1 };
+            }
+            // Track the new slots as "checked" upfront. Even if OCR
+            // fails for one of them, the Action LLM has been told
+            // about it and shouldn't re-ask.
+            for (const idx of newSlots) plan.verifyCheckedSlots.add(idx);
+            // Replace probed.slots with only the new (non-redundant)
+            // subset so the queue logic below only OCRs slots we
+            // haven't already covered.
+            (probed as { slots: number[] }).slots = newSlots;
             // Guard: MC suppresses slot tooltips while the cursor
             // holds an item. Trust the runtime-tracked
             // cursorItemSignature (set on confirmed pickup, cleared
