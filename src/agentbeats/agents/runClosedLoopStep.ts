@@ -432,6 +432,15 @@ export async function runClosedLoopStep(
             // outer planner gets a feedback line and can decide what to
             // do next.
             console.warn(`[cursor-verify] tooltip="${tooltipItem}" expected="${job.expectedItem}" — cursor probably STILL holding (tooltip suppressed by held item); leaving slotMemory and cursorItemSignature unchanged`);
+            // Ambiguous place_all swap path: we tentatively cleared cursor
+            // when the place_all returned "swapped" against an unknown slot.
+            // OCR now proves cursor still holds something — restore signature
+            // to "unknown" so the planner stops thinking the cursor is empty
+            // (it can't pick up new items without first dumping this).
+            if (job.markUnknownOnHold && !plan.cursorItemSignature?.item) {
+              plan.cursorItemSignature = { meanR: 0, meanG: 0, meanB: 0, item: "unknown" };
+              console.log(`[cursor-verify] cursor set to 'unknown' — ambiguous place_all swap proven real (we picked up something we can't identify)`);
+            }
             state.closedLoopHistory.unshift(`cursor-verify: OCR(${job.slotName ?? job.knownSlotIdx}) returned "${tooltipItem}" (expected "${job.expectedItem}"); cursor likely still holding ${plan.cursorItemSignature?.item ?? "(?)"} — slot memory preserved.`);
             state.closedLoopHistory = state.closedLoopHistory.slice(0, 5);
           }
@@ -1973,9 +1982,14 @@ export async function runClosedLoopStep(
               // tooltips, so a readable tooltip on the just-filled
               // destination slot proves cursor is empty.
               const placedForVerify = placedItem ?? plan.cursorItemSignature?.item;
+              const ambiguousPlaceAllSwap =
+                intentKind === "place_all"
+                && change === "swapped"
+                && !slotWasGenuinelyHeld; // slot was empty/unknown
               if (
-                intentKind === "place_one"
+                (intentKind === "place_one" || ambiguousPlaceAllSwap)
                 && placedForVerify
+                && placedForVerify !== "unknown"
                 && !plan.cursorVerifyJob
                 && changedSlotLayout
               ) {
@@ -1987,8 +2001,9 @@ export async function runClosedLoopStep(
                   phase: "servo",
                   servoSteps: 0,
                   hoverFrames: 0,
+                  ...(ambiguousPlaceAllSwap ? { markUnknownOnHold: true } : {}),
                 };
-                console.log(`[agentbeats] post-place_one cursor-verify queued: hover ${changedSlotLayout.name ?? changedSlotIdx} expect tooltip="${placedForVerify}" if cursor empty`);
+                console.log(`[agentbeats] post-${intentKind} cursor-verify queued: hover ${changedSlotLayout.name ?? changedSlotIdx} expect tooltip="${placedForVerify}" if cursor empty${ambiguousPlaceAllSwap ? " (mark unknown on hold)" : ""}`);
               }
             }
             // Bonus side-effect changes (e.g. result slot auto-fills

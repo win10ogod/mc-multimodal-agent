@@ -679,6 +679,12 @@ export type ClosedLoopCraftPlan = {
     phase: "servo" | "hover_settle" | "read";
     servoSteps: number;
     hoverFrames: number;
+    /** When set and the verify concludes "still holding" (tooltip
+     *  suppressed), set cursorItemSignature to {item: "unknown"}.
+     *  Used by ambiguous place_all swap into an unknown slot: cursor
+     *  was tentatively cleared, but if OCR proves still-holding the
+     *  swap was real and we picked up something we can't identify. */
+    markUnknownOnHold?: boolean;
   } | null;
 };
 
