@@ -93,9 +93,17 @@ function buildActionUserText(input: ActionInput): string {
     const role = s.role ?? "other";
     (byRole[role] ??= []).push(s.index);
   }
-  // Order roles so the most action-relevant ones come first.
-  const roleOrder = ["craft_2x2", "craft_3x3", "result", "hotbar", "main_inv", "offhand", "armor", "other"];
-  const roleLines = roleOrder
+  // Order action-relevant roles first; then list every remaining role
+  // (enchant_item / enchant_button / brewing_* / anvil_* / smith_* /
+  // trade_* / chest_storage / furnace_* / etc.) so widget slot indices
+  // always reach the Action LLM. Without the catch-all suffix, the
+  // sub-agent fell back with "requested slot N doesn't exist" because
+  // roles outside the priority list never appeared in its prompt.
+  const priorityRoles = ["craft_2x2", "craft_3x3", "result", "hotbar", "main_inv", "offhand", "armor"];
+  const remainingRoles = Object.keys(byRole)
+    .filter((r) => !priorityRoles.includes(r))
+    .sort();
+  const roleLines = [...priorityRoles, ...remainingRoles]
     .filter((r) => byRole[r])
     .map((r) => `  ${r}: ${summarizeRange(byRole[r])}`);
   const cursorBlock = input.cursorHolding ?? "(empty)";

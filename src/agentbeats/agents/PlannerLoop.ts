@@ -1,8 +1,15 @@
 import type OpenAI from "openai";
 import type { EpisodeState, Subgoal } from "./SubAgent";
 import { GOAL_PLANNER_SYSTEM_PROMPT } from "../prompts/goal_planner";
-import { inspectInventoryTool } from "./plannerTools/InspectInventoryTool";
-import { verifySlotsTool } from "./plannerTools/VerifySlotsTool";
+// Inspection tools that did their own VLM probes (inspect_inventory,
+// verify_slots) have been removed: inventory and slot state are now
+// reported back to the GoalPlanner exclusively through the FastUI
+// sub-agent (the authoritative slot-OCR source). The GoalPlanner
+// dispatches kind=ui_inventory with description="verify ..." when it
+// needs a fresh inventory or slot read; FastUI returns subgoal_done
+// with the observed contents in the Summary. This keeps the GoalPlanner
+// focused on orchestration and routes all inventory perception through
+// a single specialist.
 import { lookAroundTool } from "./plannerTools/LookAroundTool";
 import { addChecklistItemTool, markChecklistItemTool, readChecklistTool } from "./plannerTools/ChecklistTools";
 
@@ -11,7 +18,7 @@ export type PlannerLoopResult =
   | { kind: "done" }
   | { kind: "error"; reason: string };
 
-const READ_TOOLS = [inspectInventoryTool, verifySlotsTool, lookAroundTool];
+const READ_TOOLS = [lookAroundTool];
 
 const DISPATCH_TOOL_DEF = {
   type: "function" as const,
@@ -84,9 +91,10 @@ export async function runPlannerLoop(
         reportLine +
         `\nREFLECT before your next move:\n` +
         `1. Call read_checklist.\n` +
-        `2. If success, VERIFY the result with inspect_inventory or verify_slots BEFORE marking done.\n` +
-        `3. If failure starts with "BLOCKED:" or has report fields with a "code", insert prerequisite checklist items, then dispatch the first prerequisite.\n` +
-        `4. After the checklist reflects reality, either dispatch the next pending item or call task_complete (only if every item is done).`,
+        `2. If success and the Summary contains an authoritative inventory line (e.g. "Items in inventory: X, Y, Z" — emitted by FastUI subgoal_done): trust it directly and mark the matching checklist item done. Do NOT re-probe.\n` +
+        `3. If you need a fresh inventory/slot read (no recent FastUI Summary, or you need to confirm a specific slot is empty/filled): dispatch ui_inventory(description="verify ...") — FastUI is the only inventory observer; the GoalPlanner does not have its own probes.\n` +
+        `4. If failure starts with "BLOCKED:" or has report fields with a "code", insert prerequisite checklist items, then dispatch the first prerequisite.\n` +
+        `5. After the checklist reflects reality, either dispatch the next pending item or call task_complete (only if every item is done).`,
     });
     state.pendingReflection = null;
   } else if (state.plannerMessages.length === 0) {
@@ -95,8 +103,6 @@ export async function runPlannerLoop(
   }
 
   const stateBoundTools = [
-    inspectInventoryTool,
-    verifySlotsTool,
     lookAroundTool,
     addChecklistItemTool(state),
     markChecklistItemTool(state),
@@ -150,6 +156,28 @@ export async function runPlannerLoop(
       }
       if (fname === "dispatch_subgoal") {
         const sg = fargs as Subgoal;
+        // Reject malformed dispatches before they reach the dispatcher.
+        // The planner LLM occasionally emits a tool call whose description
+        // is just "Task:" (the user-message prefix), an empty string, or
+        // something else too short to act on. Letting that through means
+        // the dispatcher routes a meaningless subgoal and the agent
+        // wanders randomly until the eval times out. Better to push an
+        // error tool result back into the conversation and let the LLM
+        // re-issue the call with a concrete description.
+        const desc = (sg.description ?? "").trim();
+        const isMalformed =
+          !sg.kind
+          || desc.length < 10
+          || desc === "Task:"
+          || /^Task:\s*$/i.test(desc)
+          || desc.toLowerCase() === "task";
+        if (isMalformed) {
+          const content = `error: dispatch_subgoal REJECTED — description is empty or malformed (got "${desc}"). Re-issue the call with a CONCRETE description (≥ 10 chars, plain language) that tells the sub-agent (a) what to try and (b) the success criteria. Do NOT echo the "Task:" prefix from the user message.`;
+          state.plannerMessages.push({ role: "tool", tool_call_id: tc.id as string, content });
+          console.warn(`[planner] DISPATCH REJECTED ${sg.kind ?? "?"} <- "${desc}" (description too short or malformed)`);
+          await log("planner_tool", { hop, name: fname, args: fargs, result: content, ok: false });
+          continue;
+        }
         // OpenAI's chat API requires every assistant tool_call to be answered
         // by a tool-role message before the next assistant/user turn. Without
         // this synthetic ack, the saved plannerMessages becomes malformed

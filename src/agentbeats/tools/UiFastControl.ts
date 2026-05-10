@@ -453,8 +453,13 @@ export type PendingClick = {
   frozenTarget: { x: number; y: number };
   button: "attack" | "use";
   shift?: boolean;
-  /** Verification post-click. */
-  expectAfter: "should_empty" | "should_fill";
+  /** Verification post-click. "should_change" is for button clicks
+   *  (place_all with expectedItem=""): no slot transition is required,
+   *  but the destSlot's patch fingerprint must differ from prePatch
+   *  (e.g. enchant offer level text disappears after selection).
+   *  Cursor state is not constrained — click works whether cursor is
+   *  empty or holding something. */
+  expectAfter: "should_empty" | "should_fill" | "should_change";
   /** State machine phase for this click:
    *   "servo"      — moving cursor toward target slot
    *   "fired"      — click was just emitted, waiting one frame to settle

@@ -56,46 +56,89 @@ export type WorldBlockOpenerResult =
   | WorldBlockOpenerDone
   | WorldBlockOpenerFail;
 
-type Direction = "left" | "right" | "up" | "down" | "centered" | "not_visible";
+// (Legacy "Direction" type removed — alignment is now bbox-based via
+// vlmBbox; see BboxResult below.)
 
 type InnerPhase = "align" | "settle" | "done";
 
+// Frame is 640x360; centre (crosshair) is at (320, 180).
+const FRAME_W = 640;
+const FRAME_H = 360;
+const CROSSHAIR_X = 320;
+const CROSSHAIR_Y = 180;
+// Default MC FOV is ~70 deg horizontal at 16:9. Pixels per degree both
+// axes when the rendered FOV is square-pixel-correct.
+const DEG_PER_PX = 70 / FRAME_W;
+// Per-tick camera delta is clipped to ±10 deg by the encoder. Anything
+// larger gets truncated, so we deliberately cap requested deltas here
+// to match that ceiling and emit successive frames if more rotation
+// is needed.
+const MAX_DELTA_PER_TICK_DEG = 10;
+// Tolerance for "centred" — pixel offset from crosshair below which we
+// assume use=1 will hit the target. ~60 px covers a 1-block face at
+// ~3-block reach.
+const CENTERED_TOLERANCE_PX = 60;
+// Total alignment budget. With 320-px max offset and 10 deg/tick cap
+// (~92 px/tick), worst-case alignment is ~4 ticks; budget of 12 gives
+// headroom for VLM lag + scan-then-align.
 const ALIGN_ITERATIONS = 16;
-const NOT_VISIBLE_LIMIT = 4;
-const CAMERA_STEP_DEG = 10;
-const SCAN_YAW_DEG = 20;
+// Scan pattern when VLM reports not_visible.
+//
+// Fishbone scan: yaw is the "spine" (8 stops every 45 deg around
+// the player), each stop emits a wide pitch sweep ("bone") covering
+// ±50 deg from horizon and back, then yaw rotates to the next stop.
+//
+// Per-direction cycle (25 ticks):
+//   ticks  0..4   pitch -10/tick  (up   — cumulative   0 → -50, look up 50 deg)
+//   ticks  5..9   pitch +10/tick  (down — cumulative -50 →   0, back to horizon)
+//   ticks 10..14  pitch +10/tick  (down — cumulative   0 → +50, look down 50 deg)
+//   ticks 15..19  pitch -10/tick  (up   — cumulative +50 →   0, back to horizon)
+//   ticks 20..24  yaw   +10/tick  (rotate +50 deg toward next direction)
+//
+// 25 ticks/direction × 8 directions = 200 ticks budget. Covers full
+// 360 deg yaw × ±50 deg pitch with the camera always returning to
+// horizon AT THE SAME yaw orientation (ticks 19) before rotating
+// yaw, so each yaw stop gets a complete vertical sweep.
+const CYCLE_LEN = 25;
+const NUM_DIRECTIONS = 8;
+const NOT_VISIBLE_LIMIT = CYCLE_LEN * NUM_DIRECTIONS;
+const SCAN_DELTA_DEG = 10;
 
-const SYSTEM_PROMPT = `You are a Minecraft world-camera alignment helper.
+const SYSTEM_PROMPT = `You are a Minecraft block-localiser.
 
-You are shown a Minecraft first-person frame at 640x360. The crosshair is at the centre of the image. The user gives you a TARGET block id (snake_case, e.g. "crafting_table").
+You are shown a Minecraft first-person frame at 640x360. A black "+" crosshair is drawn at the centre (pixel 320, 180). The user gives you a TARGET block id (snake_case, e.g. "crafting_table").
 
-Decide where the named block sits relative to the crosshair and return ONE direction:
-  "centered"     — the crosshair is on the target block face (or within ~1 block tolerance)
-  "left"         — the target is in view but to the left of the crosshair
-  "right"        — the target is in view but to the right of the crosshair
-  "up"           — the target is in view but above the crosshair
-  "down"         — the target is in view but below the crosshair
-  "not_visible"  — the target block is not visible anywhere on screen
+Find the named block IN THE WORLD (not on the hotbar / HUD / inventory icons). Pick the FIRST applicable response shape from the list below:
 
-Output ONLY JSON: {"direction": "<one of the values above>"}.
+  1. {"bbox": [x, y, w, h]}    — pixel rectangle of the target block face. x ∈ [0, 639], y ∈ [0, 359]; w and h are the block face's width/height in pixels. Use this when you can clearly see the block AND can place a tight rectangle around it (precision is helpful but does not need to be exact — a rough bbox is much better than refusing).
+  2. {"direction": "<side>"}    — when you can see the block but bbox coordinates would be a guess. <side> is one of: "centered" (on or very near the crosshair), "left", "right", "up", "down". Pick the direction the block sits relative to the crosshair.
+  3. {"found": false}           — ONLY if the target is genuinely absent from the entire frame after careful scanning.
 
-NEVER guess based on inventory icons or HUD. Only the in-world block matters.`;
+PREFER bbox over direction (more useful to the runtime), and PREFER direction over found:false. found:false is the LAST resort — almost-visible / corner-of-eye / partially-occluded counts as visible (return direction).
 
-async function vlmDirection(
+NEVER infer from icons in the hotbar/HUD; the player's inventory is irrelevant. Only the rendered 3D world matters.
+
+Output strict JSON only — one of the three shapes above, no markdown fences.`;
+
+type BboxResult =
+  | { kind: "bbox"; cx: number; cy: number; w: number; h: number }
+  | { kind: "not_visible" };
+
+async function vlmBbox(
   deps: WorldBlockOpenerDeps,
   frameB64: string,
   frameExt: "png" | "jpg",
   target: string,
-): Promise<Direction> {
+): Promise<BboxResult> {
   const mime = frameExt === "png" ? "image/png" : "image/jpeg";
   const url = `data:${mime};base64,${frameB64.replace(/^data:image\/[a-z]+;base64,/, "")}`;
-  const userText = `Target block: ${target}. Where is it relative to the crosshair? Reply JSON only.`;
+  const userText = `Target block: ${target}. Find it in the rendered world (ignore the hotbar/HUD). Reply JSON only.`;
   let raw = "";
   try {
     const resp = await deps.client.chat.completions.create({
       model: deps.model,
       temperature: 0,
-      max_completion_tokens: 32,
+      max_completion_tokens: 80,
       messages: [
         { role: "system", content: SYSTEM_PROMPT },
         {
@@ -110,22 +153,64 @@ async function vlmDirection(
     raw = resp.choices?.[0]?.message?.content ?? "";
   } catch (e) {
     console.warn(`[world-block-opener] VLM call failed: ${e instanceof Error ? e.message : String(e)}`);
-    return "not_visible";
+    return { kind: "not_visible" };
   }
   const cleaned = raw.trim().replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "");
   try {
     const obj = JSON.parse(cleaned) as Record<string, unknown>;
-    const d = String(obj.direction ?? "").toLowerCase();
-    if (d === "left" || d === "right" || d === "up" || d === "down" || d === "centered" || d === "not_visible") {
-      return d as Direction;
+    if (Array.isArray(obj.bbox) && obj.bbox.length >= 4) {
+      const [x, y, w, h] = obj.bbox.map((v) => Number(v));
+      if (Number.isFinite(x) && Number.isFinite(y) && Number.isFinite(w) && Number.isFinite(h) && w > 0 && h > 0) {
+        // Clamp + compute centre. The VLM occasionally over-shoots the
+        // frame bounds; clamping keeps downstream pixel-offset math safe.
+        const clampedX = Math.max(0, Math.min(FRAME_W - 1, x));
+        const clampedY = Math.max(0, Math.min(FRAME_H - 1, y));
+        const clampedW = Math.max(1, Math.min(FRAME_W - clampedX, w));
+        const clampedH = Math.max(1, Math.min(FRAME_H - clampedY, h));
+        return {
+          kind: "bbox",
+          cx: clampedX + clampedW / 2,
+          cy: clampedY + clampedH / 2,
+          w: clampedW,
+          h: clampedH,
+        };
+      }
     }
-  } catch { /* fall through */ }
-  return "not_visible";
+    if (obj.found === false) return { kind: "not_visible" };
+    // Direction fallback: when the model picks the coarse-direction
+    // shape ({"direction":"<left|right|up|down|centered>"}), synthesise
+    // a bbox at the canonical edge centre for that direction. The
+    // alignment math then derives a camera delta from it like any
+    // bbox — yields the same nudge per tick, just with less precision.
+    // Better than refusing alignment when the model can see the
+    // target but is unsure about exact pixels.
+    const d = String(obj.direction ?? "").toLowerCase();
+    const W = 32, H = 32; // synthetic block-face size for the offset math
+    if (d === "centered") return { kind: "bbox", cx: CROSSHAIR_X, cy: CROSSHAIR_Y, w: W, h: H };
+    if (d === "left")     return { kind: "bbox", cx: 50,  cy: CROSSHAIR_Y, w: W, h: H };
+    if (d === "right")    return { kind: "bbox", cx: FRAME_W - 50, cy: CROSSHAIR_Y, w: W, h: H };
+    if (d === "up")       return { kind: "bbox", cx: CROSSHAIR_X, cy: 30, w: W, h: H };
+    if (d === "down")     return { kind: "bbox", cx: CROSSHAIR_X, cy: FRAME_H - 30, w: W, h: H };
+    if (d === "not_visible") return { kind: "not_visible" };
+  } catch {
+    /* fall through */
+  }
+  // Unparseable response — treat as not_visible to escalate to scan.
+  return { kind: "not_visible" };
 }
 
-function camAct(yaw: number, pitch: number): McuEnvAction {
+// McuEnvAction.camera is [delta_pitch, delta_yaw] per the system prompt
+// and the cameraX/cameraY split in toCompactMcuAgentActionPayload —
+// camera[0] is pitch (positive = look DOWN), camera[1] is yaw (positive
+// = turn RIGHT). Earlier this helper stored [yaw, pitch], which made
+// every "yaw right" alignment emit as "pitch down" — the camera
+// progressively tilted at the floor while the VLM kept reporting
+// the target was still to the right (because the table was now
+// off-screen above-right of the crosshair). Same bug pattern as the
+// historical Placing.camAction defect.
+function camAct(pitch: number, yaw: number): McuEnvAction {
   const a = defaultMcuAction();
-  a.camera = [yaw, pitch];
+  a.camera = [pitch, yaw];
   return a;
 }
 
@@ -192,38 +277,81 @@ export class WorldBlockOpener {
     const frameB64 = augmented ?? obsBase64;
     const frameExt: "png" | "jpg" = augmented ? "png" : "jpg";
 
-    const direction = await vlmDirection(this.deps, frameB64, frameExt, this.target);
+    const result = await vlmBbox(this.deps, frameB64, frameExt, this.target);
     this.alignIter += 1;
-    console.log(
-      `[world-block-opener] align iter=${this.alignIter} target=${this.target} direction=${direction} not_visible_streak=${this.consecutiveNotVisible}`,
-    );
-    recordDebug(this.target, { phase: "align", iter: this.alignIter, direction, consecutiveNotVisible: this.consecutiveNotVisible }, frameB64, frameExt);
 
-    if (direction === "centered") {
-      this.innerPhase = "settle";
-      console.log(`[world-block-opener] CENTERED → use=1 target=${this.target}`);
-      return { kind: "act", action: useAct(), holdSteps: 2 };
-    }
-
-    if (direction === "not_visible") {
+    if (result.kind === "not_visible") {
       this.consecutiveNotVisible += 1;
+      console.log(
+        `[world-block-opener] align iter=${this.alignIter} target=${this.target} not_visible_streak=${this.consecutiveNotVisible}`,
+      );
+      recordDebug(
+        this.target,
+        { phase: "align", iter: this.alignIter, direction: "not_visible", consecutiveNotVisible: this.consecutiveNotVisible },
+        frameB64,
+        frameExt,
+      );
       if (this.consecutiveNotVisible >= NOT_VISIBLE_LIMIT) {
         console.log(`[world-block-opener] FAIL target_ui_not_in_view target=${this.target}`);
         return this.fail("target_ui_not_in_view");
       }
-      // Scan: emit a wider yaw step to look around for the target.
-      return { kind: "act", action: camAct(SCAN_YAW_DEG, 0), holdSteps: 2 };
+      // Fishbone scan: yaw is the spine (8 stops every 45 deg around
+      // the player). At each yaw stop, do a full ±50 deg pitch sweep
+      // (4 legs of 5 ticks each: up, down, down, up — net 0) so the
+      // camera returns to horizon at the same yaw orientation before
+      // rotating to the next direction. Counter increments BEFORE
+      // phase compute, so subtract 1 to make the first call land on
+      // phase 0 (the first up-tick).
+      const phase = (this.consecutiveNotVisible - 1) % CYCLE_LEN;
+      let pitchDelta = 0;
+      let yawDelta = 0;
+      if      (phase < 5)        pitchDelta = -SCAN_DELTA_DEG; // up:    0 → -50
+      else if (phase < 10)       pitchDelta = +SCAN_DELTA_DEG; // down: -50 →   0
+      else if (phase < 15)       pitchDelta = +SCAN_DELTA_DEG; // down:   0 → +50
+      else if (phase < 20)       pitchDelta = -SCAN_DELTA_DEG; // up:   +50 →   0
+      else                       yawDelta   = +SCAN_DELTA_DEG; // yaw: rotate +50 deg next dir
+      return { kind: "act", action: camAct(pitchDelta, yawDelta), holdSteps: 2 };
     }
 
-    // Direction is one of left/right/up/down — reset the not_visible streak.
+    // Bbox returned — compute pixel offset from crosshair, convert to
+    // camera deltas. Target visible: reset the not_visible streak.
     this.consecutiveNotVisible = 0;
-    let yaw = 0;
-    let pitch = 0;
-    if (direction === "left") yaw = -CAMERA_STEP_DEG;
-    else if (direction === "right") yaw = CAMERA_STEP_DEG;
-    else if (direction === "up") pitch = -CAMERA_STEP_DEG;
-    else if (direction === "down") pitch = CAMERA_STEP_DEG;
-    return { kind: "act", action: camAct(yaw, pitch), holdSteps: 2 };
+    const dx = result.cx - CROSSHAIR_X;
+    const dy = result.cy - CROSSHAIR_Y;
+    const offsetPx = Math.hypot(dx, dy);
+    console.log(
+      `[world-block-opener] align iter=${this.alignIter} target=${this.target} bbox_centre=(${Math.round(result.cx)},${Math.round(result.cy)}) offset=${Math.round(offsetPx)}px`,
+    );
+    recordDebug(
+      this.target,
+      {
+        phase: "align",
+        iter: this.alignIter,
+        direction: "bbox",
+        bbox: { cx: result.cx, cy: result.cy, w: result.w, h: result.h },
+        offsetPx,
+      },
+      frameB64,
+      frameExt,
+    );
+
+    if (offsetPx <= CENTERED_TOLERANCE_PX) {
+      this.innerPhase = "settle";
+      console.log(`[world-block-opener] CENTERED (offset=${Math.round(offsetPx)}px) → use=1 target=${this.target}`);
+      return { kind: "act", action: useAct(), holdSteps: 2 };
+    }
+
+    // Convert pixel offsets to per-tick camera deltas, clipped to the
+    // encoder's ±10 deg/tick budget. Sign convention: positive dx
+    // (target right of crosshair) → positive yaw (turn right);
+    // positive dy (target below crosshair) → positive pitch (look
+    // down). Both match the engine's [delta_pitch, delta_yaw]
+    // convention enforced by camAct.
+    const yawRaw = dx * DEG_PER_PX;
+    const pitchRaw = dy * DEG_PER_PX;
+    const yaw = Math.max(-MAX_DELTA_PER_TICK_DEG, Math.min(MAX_DELTA_PER_TICK_DEG, yawRaw));
+    const pitch = Math.max(-MAX_DELTA_PER_TICK_DEG, Math.min(MAX_DELTA_PER_TICK_DEG, pitchRaw));
+    return { kind: "act", action: camAct(pitch, yaw), holdSteps: 2 };
   }
 
   private fail(code: "target_ui_not_in_view" | "align_exhausted"): WorldBlockOpenerFail {

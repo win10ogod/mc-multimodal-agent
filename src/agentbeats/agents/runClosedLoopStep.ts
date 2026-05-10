@@ -44,6 +44,15 @@ export async function runClosedLoopStep(
 ): Promise<SubAgentStep> {
   const { context: state, payload, step } = input;
 
+  // The current subgoal's description is the immediate intent the
+  // GoalPlanner asked FastUI to handle this dispatch (e.g. "craft
+  // enchanting_table" vs "verify inventory contains <items>" vs
+  // "fill furnace with raw_iron and coal"). Distinct from
+  // state.taskText, which is the EPISODE-level goal set once at init.
+  // Surfaced so the FastUI Planner can branch on per-dispatch intent
+  // (verify-only / organize / craft / smelt / etc.).
+  const currentSubgoalDescription = input.episode.subgoals[input.episode.idx]?.description;
+
   // VLM-driven early stop: when the model previously set task_done=true,
   // do not call it again for the rest of the episode. Emit a dummy
   // no-op action each step. The benchmark cannot be early-ended by
@@ -122,24 +131,25 @@ export async function runClosedLoopStep(
 
   // Compute the SoM-labeled image ONCE per obs and share it between
   // the Planner re-judge and the Action dispatch — both see the same
-  // pixels with the same yellow badges. Layout is RE-DETECTED fresh
-  // every obs so dynamic panel changes (recipe-book opens, etc.) are
-  // immediately reflected in the slot list both LLMs see.
+  // pixels with the same yellow badges. Layout is LOCKED at
+  // session_lock (when the GUI first opens with cursor at park spot —
+  // the only frame guaranteed to be free of tooltip occlusion /
+  // dimmed-bg artefacts). Re-detecting per-obs here used to corrupt
+  // the locked layout when the cursor was hovering an item. Reuse the
+  // locked layout for SoM marking; if none yet (first obs of a new
+  // GUI session), detect once just for marking — session_lock below
+  // writes the authoritative copy.
   let markedObsForLLMs: string | null = null;
   if (state.closedLoopCraft && payload.obs) {
     try {
       const { markInventoryFrame } = await import("../tools/SlotMarker");
-      const freshLayout = detectGuiLayout(payload.obs, state.closedLoopCraft.layoutHint ?? undefined);
-      if (freshLayout) {
-        // Refresh sessionLayout each obs so Planner + Action always see
-        // the current panel composition (including newly-revealed
-        // template anchors like recipe_book_button or recipe entries).
-        state.closedLoopCraft.sessionLayout = freshLayout;
-        state.closedLoopCraft.layoutHint = freshLayout.matchedLayoutId;
+      const lockedLayout = state.closedLoopCraft.sessionLayout;
+      const layoutForMark = lockedLayout
+        ?? detectGuiLayout(payload.obs, state.closedLoopCraft.layoutHint ?? undefined);
+      if (layoutForMark) {
+        const marked = markInventoryFrame(payload.obs, layoutForMark as any);
+        markedObsForLLMs = `data:image/png;base64,${marked.pngBase64}`;
       }
-      const layoutForMark = freshLayout ?? state.closedLoopCraft.sessionLayout;
-      const marked = markInventoryFrame(payload.obs, layoutForMark as any);
-      markedObsForLLMs = `data:image/png;base64,${marked.pngBase64}`;
     } catch { /* fall back to raw */ }
   }
 
@@ -173,6 +183,7 @@ export async function runClosedLoopStep(
       const layoutSlotsForPlanner = (cp.sessionLayout as { slots: Array<{ index: number; name?: string; role?: string }> } | null)?.slots ?? [];
       const rj = await runPlanner({ client: deps.client, model: deps.model, recordDebug: deps.recordDebug }, {
         taskText: state.taskText,
+        subgoalDescription: currentSubgoalDescription,
         recipeInfo: cp.recipeOverride,
         knownSlots: knownSlotsForPlanner,
         layoutSlots: layoutSlotsForPlanner,
@@ -184,9 +195,36 @@ export async function runClosedLoopStep(
       });
       cp.checklist = rj.checklist;
       if (rj.kind === "all_done") {
+        // FastUI Planner all_done means the GUI checklist is complete
+        // (e.g., the requested item is now in inventory). It does NOT
+        // mean the whole episode is done — multi-task evals chain
+        // multiple subgoals (place table → craft → place result → …)
+        // and the top-level GoalPlanner is the only thing that can
+        // judge overall completion. Mark the closed-loop plan done
+        // to silence the post-action re-judge gate, but propagate
+        // subgoal_done normally so Dispatcher records pendingReflection
+        // and the GoalPlanner re-evaluates the checklist on the next obs.
         cp.done = true;
-        state.earlyStop = true;
-        return { kind: "subgoal_done", summary: `FastUI Planner all_done` };
+        // Surface what the player is now carrying so the GoalPlanner can
+        // mark the right checklist item without re-inspecting the world.
+        // We deliberately report items by NAME + COUNT only — no slot
+        // indices, no pixel positions, no UI-specific raster IDs. Slot
+        // numbering depends on which GUI is open (2x2 vs 3x3 vs chest
+        // vs furnace), and the GoalPlanner doesn't care about that —
+        // it only needs to know "<item> is now in your inventory".
+        const counts = new Map<string, number>();
+        for (const e of cp.slotMemory.snapshot()) {
+          if (!e.item || e.item === "empty" || e.item === "unknown") continue;
+          counts.set(e.item, (counts.get(e.item) ?? 0) + 1);
+        }
+        const itemsStr = counts.size > 0
+          ? [...counts.entries()].sort((a, b) => a[0].localeCompare(b[0])).map(([k, v]) => v > 1 ? `${k}×${v}` : k).join(", ")
+          : "(none observed)";
+        const recipeTarget = cp.recipeOverride?.target ?? null;
+        const summary = recipeTarget
+          ? `FastUI subgoal complete: ${recipeTarget} now in inventory (task=${state.taskText || "?"}). Items in inventory: ${itemsStr}`
+          : `FastUI subgoal complete (task=${state.taskText || "?"}). Items in inventory: ${itemsStr}`;
+        return { kind: "subgoal_done", summary };
       }
       cp.activeChecklistIdx = rj.nextIdx;
       // CURSOR INVARIANT GUARD: if cursor holds an item but the next
@@ -632,20 +670,14 @@ export async function runClosedLoopStep(
         }
         plan.parkSteps = 0;
         } // end skipNextPark gate
-        // Re-SOM only NOW, just before calling the VLM. Within an
-        // in-flight click sequence the layout stays stable (we keep
-        // using the locked session); fresh detection only matters at
-        // the moment the VLM is about to make a new decision.
-        let layoutForProbe = layout;
-        {
-          const fresh = detectGuiLayout(payload.obs, plan.layoutHint ?? undefined);
-          if (fresh) {
-            plan.sessionLayout = fresh;
-            plan.layoutHint = fresh.matchedLayoutId;
-            layoutForProbe = fresh;
-            console.log(`[agentbeats] re-detected SoM for fresh probe: ${fresh.matchedLayoutId ?? "unknown"} slots=${fresh.slots.length}`);
-          }
-        }
+        // Layout is LOCKED at session_lock and reused throughout servo.
+        // Re-detecting here used to overwrite sessionLayout with a
+        // degraded bbox whenever the cursor was hovering an item
+        // (tooltip overlay breaks findWindowBBox). The locked layout
+        // captured at park spot is authoritative; the servo just reads
+        // pixels through it. UI-mutating actions return control to the
+        // Planner, which re-locks from a clean park frame.
+        const layoutForProbe = layout;
         // CV cursor-holding detection. Sample the held-item region
         // (renders below-right of the cursor tip in MC), not the
         // cursor arrow itself, so cursor-sprite pixels aren't part
@@ -1154,6 +1186,7 @@ export async function runClosedLoopStep(
                 const layoutSlotsForPlanner = (plan.sessionLayout as { slots: Array<{ index: number; name?: string; role?: string }> } | null)?.slots ?? [];
                 const r0 = await runPlanner({ client: deps.client, model: deps.model, recordDebug: deps.recordDebug }, {
                   taskText: state.taskText,
+                  subgoalDescription: currentSubgoalDescription,
                   recipeInfo: r,
                   knownSlots: knownSlotsForPlanner,
                   layoutSlots: layoutSlotsForPlanner,
@@ -1528,17 +1561,31 @@ export async function runClosedLoopStep(
                 state.closedLoopHistory = state.closedLoopHistory.slice(0, 5);
                 return { kind: "act", action: defaultMcuAction(), holdSteps: 1 };
               }
-              const expectAfter: "should_empty" | "should_fill" =
-                (probed.action === "place_one" || probed.action === "place_all") ? "should_fill" : "should_empty";
+              // Click-mode sentinel: place_all with empty expectedItem
+              // is a button click (e.g. enchant offer, trade offer,
+              // recipe-book toggle) — no slot transition expected, no
+              // cursor-state requirement. Verify by patch fingerprint
+              // change at the destSlot (e.g. enchant offer level text
+              // disappears after click).
+              const activeTask = plan.checklist[plan.activeChecklistIdx]?.task as { kind?: string; expectedItem?: string } | undefined;
+              const isButtonClick = probed.action === "place_all"
+                && activeTask?.kind === "place_all"
+                && activeTask.expectedItem === "";
+              const expectAfter: "should_empty" | "should_fill" | "should_change" =
+                isButtonClick ? "should_change"
+                : (probed.action === "place_one" || probed.action === "place_all") ? "should_fill"
+                : "should_empty";
               // Record what item the cursor is about to drop. Verify
               // uses this to write slotMemory[dest] = item on confirmed
               // placement — without it, the place verify can't identify
               // the placed item and slotMemory loses the destination
               // entry, leaving the next planner call blind to a slot
-              // we just deterministically filled.
-              const placedItemName = (probed.action === "place_one" || probed.action === "place_all")
-                ? plan.cursorItemSignature?.item
-                : undefined;
+              // we just deterministically filled. Skip for button clicks.
+              const placedItemName = isButtonClick
+                ? undefined
+                : (probed.action === "place_one" || probed.action === "place_all")
+                  ? plan.cursorItemSignature?.item
+                  : undefined;
               plan.pendingClick = {
                 rasterIndex: probed.slot,
                 slotName: probedSlot.name,
@@ -1924,6 +1971,57 @@ export async function runClosedLoopStep(
           const { takeLayoutSnapshot, diffSnapshots, classifyOutcome, identifyChangedSlot } = await import("../tools/SnapshotDiff");
           const postSnap = takeLayoutSnapshot(payload.obs, layout!, cursor, plan.iteration, plan.parkEmptyCursorPatch, plan.lastProbeCursor);
           const preSnap = plan.lastParkSnapshot;
+          // Button-click verify (place_all with expectedItem=""): no
+          // slot transition is expected. Confirm by sampling the
+          // destSlot's patch fingerprint and comparing to prePatch —
+          // a successful click visibly changes the button (e.g.
+          // enchant offer level text disappears).
+          if (pc.expectAfter === "should_change") {
+            const postPatch = samplePatchFingerprint(payload.obs, pc.frozenTarget.x, pc.frozenTarget.y, 6);
+            const dr = postPatch && pc.prePatch ? Math.abs(postPatch.meanR - pc.prePatch.meanR) : 0;
+            const dg = postPatch && pc.prePatch ? Math.abs(postPatch.meanG - pc.prePatch.meanG) : 0;
+            const db = postPatch && pc.prePatch ? Math.abs(postPatch.meanB - pc.prePatch.meanB) : 0;
+            const dStd = postPatch && pc.prePatch ? Math.abs(postPatch.stddev - pc.prePatch.stddev) : 0;
+            const meanDelta = (dr + dg + db) / 3;
+            const changed = postPatch !== null && pc.prePatch !== undefined && (meanDelta > 12 || dStd > 8);
+            console.log(`[agentbeats] verify ${pc.slotName ?? pc.rasterIndex} click: meanDelta=${meanDelta.toFixed(1)} dStd=${dStd.toFixed(1)} -> ${changed ? "CHANGED" : "no_op"}`);
+            plan.lastParkSnapshot = postSnap;
+            if (changed) {
+              state.closedLoopHistory.unshift(`click slot=${pc.rasterIndex}(${pc.slotName ?? "?"}) OK (visual change)`);
+              state.closedLoopHistory = state.closedLoopHistory.slice(0, 5);
+              if (plan.activeChecklistIdx >= 0
+                  && plan.activeChecklistIdx < plan.checklist.length
+                  && !plan.checklist[plan.activeChecklistIdx].done) {
+                const active = plan.checklist[plan.activeChecklistIdx];
+                if ((active.task as { kind?: string })?.kind === "place_all") {
+                  active.done = true;
+                  console.log(`[agentbeats] auto-tick checklist[${plan.activeChecklistIdx}] (${active.id}, click) done`);
+                }
+              }
+              if (plan.pendingChain.length === 0) plan.judgeAfterChain = true;
+              const next = plan.pendingChain.shift();
+              if (next) {
+                next.phase = "servo";
+                next.retries = 0;
+                plan.pendingClick = next;
+                plan.servoSteps = 0;
+              } else {
+                plan.pendingClick = null;
+              }
+              return { kind: "act", action: defaultMcuAction(), holdSteps: 1 };
+            }
+            // No change detected. Retry up to 2 times before giving up.
+            pc.retries += 1;
+            if (pc.retries >= 3) {
+              state.closedLoopHistory.unshift(`click slot=${pc.rasterIndex}(${pc.slotName ?? "?"}) failed (no visual change after 3 tries)`);
+              state.closedLoopHistory = state.closedLoopHistory.slice(0, 5);
+              plan.pendingClick = null;
+              plan.judgeAfterChain = true;
+              return { kind: "act", action: defaultMcuAction(), holdSteps: 1 };
+            }
+            pc.phase = "servo";
+            return { kind: "act", action: defaultMcuAction(), holdSteps: 1 };
+          }
           if (!preSnap) {
             console.warn(`[agentbeats] verify: no pre-snapshot available — accepting click and capturing post as new baseline`);
             plan.lastParkSnapshot = postSnap;
