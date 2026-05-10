@@ -33,7 +33,7 @@ const SCHEMA = {
   required: ["action"],
   additionalProperties: true,
   properties: {
-    action: { type: "string", enum: ["pickup", "place_one", "place_all", "verify_slots", "wait", "done", "fallback_manual"] },
+    action: { type: "string", enum: ["pickup", "place_one", "place_all", "verify_slots", "wait", "done", "infeasible", "fallback_manual"] },
   },
 } as const;
 
@@ -56,6 +56,7 @@ Rules:
 - After a pickup or place, if the image shows a slot that contradicts Known, emit verify_slots on the affected slots.
 - If an expected ingredient is missing from Known, scan hotbar/main_inv visually and emit verify_slots on the 3 most likely slots — do NOT fallback_manual.
 - fallback_manual is RESERVED for: (1) the prompt is contradictory (e.g. pickup but Cursor says holding), (2) the requested slot doesn't exist in layout_slots, (3) genuinely no safe action exists. Visual ambiguity about a destination is NOT grounds for fallback_manual.
+- infeasible is for: the subtask cannot complete given the observable state, and the planner needs to re-plan around the gap. General — applies to ANY subtask kind, not just verify. Examples: verify_items_visible scanned the plausible slots and a requested item is genuinely absent; pickup's sourceSlot doesn't actually hold expectedItem after scanning; place_*'s destSlot is occupied by a conflicting item that can't safely stack. Always include a concrete reason (what's missing / what blocks progress). DO NOT emit infeasible on the first attempt on a subtask — give it at least two attempts so a single noisy frame doesn't trigger an early bail; check recent_history's attempts count before emitting infeasible.
 
 Output strict JSON, one action only:
   { "action": "pickup",     "slot": N }   // cursor empty: left-click slot N to grab whole stack
@@ -64,6 +65,7 @@ Output strict JSON, one action only:
   { "action": "verify_slots", "slots": [N,...] }
   { "action": "wait", "holdSteps": N }
   { "action": "done" }
+  { "action": "infeasible", "reason": "<what's missing or what blocks progress>" }
   { "action": "fallback_manual", "reason": "..." }`;
 
 let ACTION_CALL_SEQ = 0;
