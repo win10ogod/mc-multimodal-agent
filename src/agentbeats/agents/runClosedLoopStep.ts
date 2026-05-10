@@ -236,7 +236,24 @@ export async function runClosedLoopStep(
           : `FastUI subgoal complete (task=${state.taskText || "?"}). Items in inventory: ${itemsStr}`;
         return { kind: "subgoal_done", summary };
       }
-      cp.activeChecklistIdx = rj.nextIdx;
+      // Trust the planner's checklist edits but NEVER its nextIdx — observed:
+      // the planner re-judge sometimes returns nextIdx pointing past still-
+      // pending steps (e.g. mid-recipe place_one steps still pending, but
+      // nextIdx jumps to a later place_all "return to source" or a verify
+      // probe). Action faithfully executes whatever the dispatcher feeds it,
+      // so the wrong subtask runs (e.g. EMIT place_all back to source while
+      // 2 place_one cells of the same ingredient are still empty).
+      // Always pick the EARLIEST not-done step instead.
+      const earliestPending = rj.checklist.findIndex((c) => !c.done);
+      if (earliestPending !== -1 && earliestPending !== rj.nextIdx) {
+        const skipped = rj.checklist.slice(earliestPending, rj.nextIdx)
+          .filter((c) => !c.done)
+          .map((c) => `${c.id}/${(c.task as { kind?: string } | undefined)?.kind ?? "?"}`);
+        if (skipped.length > 0) {
+          console.warn(`[fastui-planner] OVERRIDE nextIdx ${rj.nextIdx}->${earliestPending}: planner tried to skip pending steps [${skipped.join(", ")}]`);
+        }
+      }
+      cp.activeChecklistIdx = earliestPending !== -1 ? earliestPending : rj.nextIdx;
       // CURSOR INVARIANT GUARD: if cursor holds an item but the next
       // not-done step is pickup/take_result/verify_items_visible, the
       // planner LLM violated the cursor invariant. Auto-insert a
