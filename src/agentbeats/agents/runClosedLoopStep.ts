@@ -1133,29 +1133,6 @@ export async function runClosedLoopStep(
             // Planner re-judge at the top of the body will tick the
             // checklist and dispatch the next subtask.
             return { kind: "act", action: defaultMcuAction(), holdSteps: 1 };
-          } else if (probed.action === "infeasible") {
-            // General termination report from the Action sub-agent:
-            // the active subtask cannot complete given current state
-            // (verify scan completed without finding an item; pickup
-            // source slot doesn't hold expected; place dest occupied
-            // by conflicting item; etc.). Distinct from `done` (success)
-            // and `fallback_manual` (manual takeover).
-            //
-            // Mark the subtask done with the reason in recent_history
-            // so the Planner sees WHY on its next re-judge and can
-            // route a prerequisite. The done flag prevents the same
-            // subtask from being re-dispatched immediately; the reason
-            // is what tells the Planner to re-plan instead of skip.
-            const reason = probed.reason ?? "infeasible";
-            const activeItem = plan.checklist[plan.activeChecklistIdx];
-            if (activeItem) {
-              activeItem.done = true;
-              console.log(`[agentbeats] subtask infeasible: '${activeItem.id}' (${(activeItem.task as { kind?: string })?.kind}) reason="${reason}"; arming Planner re-judge`);
-            }
-            plan.judgeAfterChain = true;
-            state.closedLoopHistory.unshift(`infeasible ${activeItem?.id ?? "?"}: ${reason}`);
-            state.closedLoopHistory = state.closedLoopHistory.slice(0, 5);
-            return { kind: "act", action: defaultMcuAction(), holdSteps: 1 };
           } else if (probed.action === "fallback_manual") {
             const blockedReason = probed.reason ?? "fallback_manual";
             console.log(`[agentbeats] closed-loop probe says fallback_manual reason=${blockedReason} -- escalating to GoalPlanner`);

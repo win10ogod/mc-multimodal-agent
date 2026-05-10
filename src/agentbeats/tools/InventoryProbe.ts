@@ -187,5 +187,4 @@ export type CraftAction =
   | { action: "verify_slots"; slots: number[]; reason?: string }
   | { action: "wait"; holdSteps: number; reason?: string }
   | { action: "done"; reason?: string }
-  | { action: "infeasible"; reason: string }
   | { action: "fallback_manual"; reason?: string };
